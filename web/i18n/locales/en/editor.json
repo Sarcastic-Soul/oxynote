@@ -319,9 +319,9 @@
 					"add-above-block": "Add Above",
 					"add-below-block": "Add Below",
 					"block-types": {
-						"code": "Code",
+						"code": "Code Block",
 						"metrics": "Live Metrics",
-						"diagram": "Diagram"
+						"diagram": "Mermaid Diagram"
 					}
 				},
 				"metric-block": {
@@ -535,9 +535,9 @@
 		"split-documentation": {
 			"left-side-bottom-action-button": "Add Parameters",
 			"right-side-bottom-action-buttons": {
-				"code": "Code",
+				"code": "Code Block",
 				"metrics": "Live Metrics",
-				"diagram": "Diagram"
+				"diagram": "Mermaid Diagram"
 			},
 			"bottom-action-trigger-label": "Add Block"
 		},

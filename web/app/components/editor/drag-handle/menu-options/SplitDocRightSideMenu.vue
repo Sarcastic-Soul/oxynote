@@ -44,7 +44,7 @@ const blockTypes = computed(
 			label: t(
 				"editor.drag-handle.options.split-doc-right-side.block-types.code",
 			),
-			icon: BLOCK_ICONS.codeBlockTitle,
+			icon: BLOCK_ICONS.codeBlock,
 		},
 		{
 			value: "metrics",

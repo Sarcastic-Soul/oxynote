@@ -22,7 +22,7 @@ const buttons = computed(
 			text: t(
 				"editor.split-documentation.right-side-bottom-action-buttons.code",
 			),
-			icon: "lucide:code",
+			icon: BLOCK_ICONS.codeBlock,
 			shortcut: SHORTCUT_ACTIONS.addCodeBlockToSplitDocRightSide,
 		},
 		{

@@ -62,7 +62,7 @@ describe("<SplitDocumentationRightSideBlock>", { concurrent: false }, () => {
 		expect(root.attributes("data-diff-status")).toBe("removed")
 	})
 
-	it("offers all three add actions while editing is possible", async ({
+	it("offers all three add actions with their block icons while editing is possible", async ({
 		expect,
 	}) => {
 		const wrapper = await mountRightSide()
@@ -73,6 +73,11 @@ describe("<SplitDocumentationRightSideBlock>", { concurrent: false }, () => {
 			expect.stringContaining(t(ADD_CODE_BUTTON)),
 			expect.stringContaining(t(ADD_METRICS_BUTTON)),
 			expect.stringContaining(t(ADD_DIAGRAM_BUTTON)),
+		])
+		expect(menuEntryIcons()).toEqual([
+			BLOCK_ICONS.codeBlock,
+			BLOCK_ICONS.metricBlock,
+			BLOCK_ICONS.mermaidBlock,
 		])
 		expect(actionsHidden(wrapper)).toBe(false)
 	})
@@ -219,8 +224,22 @@ async function chooseAddAction(wrapper: VueWrapper, label: string) {
 	await nextTick()
 }
 
-function menuEntryTexts(): string[] {
+function menuEntries(): HTMLElement[] {
 	return Array.from(
 		document.body.querySelectorAll<HTMLElement>("[role='menuitem']"),
-	).map((entry) => entry.textContent)
+	)
+}
+
+function menuEntryTexts(): string[] {
+	return menuEntries().map((entry) => entry.textContent)
+}
+
+function menuEntryIcons(): string[] {
+	return menuEntries().flatMap((entry) => {
+		const cls = Array.from(
+			entry.querySelector(".iconify")?.classList ?? [],
+		).find((c) => c.startsWith("i-"))
+
+		return cls ? [cls.slice("i-".length)] : []
+	})
 }

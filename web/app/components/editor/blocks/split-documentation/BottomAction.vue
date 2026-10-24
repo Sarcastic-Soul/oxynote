@@ -73,30 +73,32 @@ function handleClick(id: T) {
 					{{ t("editor.split-documentation.bottom-action-trigger-label") }}
 				</ShadcnUiButton>
 			</ShadcnUiDropdownMenuTrigger>
-			<ShadcnUiDropdownMenuContent side="bottom" align="center">
+			<ShadcnUiDropdownMenuContent side="bottom" align="center" loop>
 				<ShadcnUiDropdownMenuItem
 					v-for="button in props.buttons"
 					:key="button.id"
 					@click="handleClick(button.id)"
 				>
-					<Icon :name="button.icon ?? 'lucide:circle-plus'" />
-					<span>{{ button.text }}</span>
-					<ShadcnUiKbdGroup v-if="button.shortcut" class="ml-auto pl-4">
-						<template
-							v-for="(val, index) in extractShortcutKeys(
-								shortcutByOS(button.shortcut.keyboardKey, osType),
-							)"
-							:key="index"
-						>
-							<ShadcnUiKbd v-if="!val.connector">{{ val.key }}</ShadcnUiKbd>
-							<span
-								v-else-if="val.connector === 'sequence'"
-								class="text-xs text-muted-foreground"
+					<div class="flex w-full items-center gap-1">
+						<Icon :name="button.icon ?? 'lucide:circle-plus'" />
+						<span>{{ button.text }}</span>
+						<ShadcnUiKbdGroup v-if="button.shortcut" class="ml-auto pl-4">
+							<template
+								v-for="(val, index) in extractShortcutKeys(
+									shortcutByOS(button.shortcut.keyboardKey, osType),
+								)"
+								:key="index"
 							>
-								{{ t("shortcuts.connector") }}
-							</span>
-						</template>
-					</ShadcnUiKbdGroup>
+								<ShadcnUiKbd v-if="!val.connector">{{ val.key }}</ShadcnUiKbd>
+								<span
+									v-else-if="val.connector === 'sequence'"
+									class="text-xs text-muted-foreground"
+								>
+									{{ t("shortcuts.connector") }}
+								</span>
+							</template>
+						</ShadcnUiKbdGroup>
+					</div>
 				</ShadcnUiDropdownMenuItem>
 			</ShadcnUiDropdownMenuContent>
 		</ShadcnUiDropdownMenu>
