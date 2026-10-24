@@ -1,34 +1,16 @@
 import { mountSuspended } from "@nuxt/test-utils/runtime"
-import { beforeEach, describe, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, it, vi } from "vitest"
 import DisableReviewabilityModal from "./DisableReviewabilityModal.vue"
 import { clearTeleportedOverlays, t, teleportedButton } from "./test-helpers"
 
-function mountModal(target: (() => Promise<void>) | null) {
-	return mountSuspended(DisableReviewabilityModal, {
-		props: { modelValue: target },
-	})
-}
-
-// the dialog body is teleported into <body>, so it is the only place the
-// modal's own markup can be read from
-function dialog() {
-	return document.body.querySelector("[data-slot='dialog-content']")
-}
-
 // the dialog body is teleported into the shared <body> and the disable flow
 // is driven by the global fake timers, so these tests cannot interleave
-// t() reaches for the nuxt app context, so the label can only be
-// resolved inside a test — not once at module scope
-function confirmButton() {
-	return teleportedButton(
-		t(
-			"editor.navbar.document-options.review-workflow.disable-confirm-modal.confirm-button",
-		),
-	)
-}
-
 describe("<DisableReviewabilityModal>", { concurrent: false }, () => {
 	beforeEach(clearTeleportedOverlays)
+
+	afterEach(() => {
+		vi.useRealTimers()
+	})
 
 	it("stays closed while there is no pending target", async ({ expect }) => {
 		await mountModal(null)
@@ -103,3 +85,25 @@ describe("<DisableReviewabilityModal>", { concurrent: false }, () => {
 		expect(wrapper.emitted("update:modelValue")?.at(-1)).toEqual([null])
 	})
 })
+
+function mountModal(target: (() => Promise<void>) | null) {
+	return mountSuspended(DisableReviewabilityModal, {
+		props: { modelValue: target },
+	})
+}
+
+// the dialog body is teleported into <body>, so it is the only place the
+// modal's own markup can be read from
+function dialog() {
+	return document.body.querySelector("[data-slot='dialog-content']")
+}
+
+// t() needs the nuxt app context, so the label is resolved inside a test
+// and not once at module scope
+function confirmButton() {
+	return teleportedButton(
+		t(
+			"editor.navbar.document-options.review-workflow.disable-confirm-modal.confirm-button",
+		),
+	)
+}
