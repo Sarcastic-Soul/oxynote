@@ -1,5 +1,5 @@
-import type { VueWrapper } from "@vue/test-utils"
-import { beforeEach, describe, it } from "vitest"
+import { enableAutoUnmount, type VueWrapper } from "@vue/test-utils"
+import { afterEach, beforeEach, describe, it } from "vitest"
 import BottomAction from "./BottomAction.vue"
 import {
 	clearTeleportedOverlays,
@@ -17,28 +17,15 @@ const SHORTCUT = {
 
 const PARAMS_KEY = "editor.split-documentation.left-side-bottom-action-button"
 const CODE_KEY =
-	"editor.split-documentation.right-side-bottom-action-buttons.add-code"
+	"editor.split-documentation.right-side-bottom-action-buttons.code"
 const METRICS_KEY =
-	"editor.split-documentation.right-side-bottom-action-buttons.add-metrics"
+	"editor.split-documentation.right-side-bottom-action-buttons.metrics"
 const TRIGGER_KEY = "editor.split-documentation.bottom-action-trigger-label"
 
-function openDropdown(wrapper: VueWrapper) {
-	return wrapper.get("[data-slot='dropdown-menu-trigger']").trigger("click")
-}
+enableAutoUnmount(afterEach)
 
-function mountAction(buttons: Record<string, unknown>[]) {
-	return mountUnderTooltipProvider(BottomAction, { props: { buttons } })
-}
-
-// the emitted button-click payloads, in the order they were emitted.
-// findComponent cannot type a generic component, so the wrapper is
-// asserted
-function clicks(wrapper: VueWrapper): unknown[] {
-	const action = wrapper.findComponent(BottomAction) as unknown as VueWrapper
-
-	return (action.emitted("button-click") ?? []).map((args) => args[0])
-}
-
+// the menu is teleported into the shared <body> and the host os lives in
+// a nuxt useState singleton, so these tests cannot interleave
 describe("<SplitDocumentationBottomAction>", { concurrent: false }, () => {
 	beforeEach(clearTeleportedOverlays)
 
@@ -70,37 +57,82 @@ describe("<SplitDocumentationBottomAction>", { concurrent: false }, () => {
 		expect(clicks(wrapper)).toEqual(["params"])
 	})
 
-	it("shows a single trigger for two or more entries", async ({ expect }) => {
+	it("shows a single closed menu trigger for two or more entries", async ({
+		expect,
+	}) => {
 		const wrapper = await mountAction([
 			{ id: "code", text: t(CODE_KEY), icon: "lucide:code" },
 			{ id: "metrics", text: t(METRICS_KEY) },
 		])
 
 		expect(wrapper.findAll("button")).toHaveLength(1)
-		expect(wrapper.text()).toContain(t(TRIGGER_KEY))
+		expect(wrapper.text()).toBe(t(TRIGGER_KEY))
+		expect(renderedIconNames(wrapper)).toEqual(["mingcute:add-circle-line"])
+		expect(menuLabels()).toEqual([])
 	})
 
-	it("lists every entry once the trigger is opened", async ({ expect }) => {
+	it("lists every entry with its icon once the menu is opened", async ({
+		expect,
+	}) => {
 		const wrapper = await mountAction([
 			{ id: "code", text: t(CODE_KEY), icon: "lucide:code" },
 			{ id: "metrics", text: t(METRICS_KEY) },
 		])
 
-		await openDropdown(wrapper)
+		await openMenu(wrapper)
 
-		expect(menuItem(t(CODE_KEY))).not.toBeNull()
-		expect(menuItem(t(METRICS_KEY))).not.toBeNull()
+		expect(menuLabels()).toEqual([t(CODE_KEY), t(METRICS_KEY)])
+		expect(menuIconNames()).toEqual(["lucide:code", "lucide:circle-plus"])
 	})
 
-	it("reports a click on a later button with its own id", async ({
+	// the suite runs as a non-mac host, so an entry prints the keys of the
+	// "other" variant, one <kbd> each
+	it("spells out the shortcut of each menu entry that has one", async ({
+		expect,
+	}) => {
+		const wrapper = await mountAction([
+			{ id: "code", text: t(CODE_KEY), shortcut: SHORTCUT },
+			{ id: "metrics", text: t(METRICS_KEY) },
+		])
+
+		await openMenu(wrapper)
+
+		expect(shortcutKeys(t(CODE_KEY))).toEqual(["Ctrl", "K"])
+		expect(shortcutKeys(t(METRICS_KEY))).toEqual([])
+	})
+
+	it("writes the connector only between the keys of a sequence", async ({
+		expect,
+	}) => {
+		const wrapper = await mountAction([
+			{
+				id: "code",
+				text: t(CODE_KEY),
+				shortcut: {
+					keyboardKey: { macOS: "G Shift+I", other: "G Shift+I" },
+					i18nKey: null,
+				},
+			},
+			{ id: "metrics", text: t(METRICS_KEY) },
+		])
+
+		await openMenu(wrapper)
+
+		expect(
+			menuItem(t(CODE_KEY)).querySelector("kbd[data-slot='kbd-group']")
+				?.textContent,
+		).toBe(`G${t("shortcuts.connector")}ShiftI`)
+	})
+
+	it("reports a click on a later menu entry with its own id", async ({
 		expect,
 	}) => {
 		const wrapper = await mountAction([
 			{ id: "code", text: t(CODE_KEY) },
 			{ id: "metrics", text: t(METRICS_KEY) },
 		])
+		await openMenu(wrapper)
 
-		await openDropdown(wrapper)
 		menuItem(t(METRICS_KEY)).click()
 		await nextTick()
 
@@ -143,3 +175,48 @@ describe("<SplitDocumentationBottomAction>", { concurrent: false }, () => {
 		expect(event.defaultPrevented).toBe(false)
 	})
 })
+
+function mountAction(buttons: Record<string, unknown>[]) {
+	return mountUnderTooltipProvider(BottomAction, { props: { buttons } })
+}
+
+// the emitted button-click payloads, in the order they were emitted.
+// findComponent cannot type a generic component, so the wrapper is
+// asserted
+function clicks(wrapper: VueWrapper): unknown[] {
+	const action = wrapper.findComponent(BottomAction) as unknown as VueWrapper
+
+	return (action.emitted("button-click") ?? []).map((args) => args[0])
+}
+
+function openMenu(wrapper: VueWrapper) {
+	return wrapper.get("[data-slot='dropdown-menu-trigger']").trigger("click")
+}
+
+// the open menu is teleported into <body>, so its entries cannot be read
+// through the wrapper
+function menuEntries(): HTMLElement[] {
+	return Array.from(
+		document.body.querySelectorAll<HTMLElement>("[role='menuitem']"),
+	)
+}
+
+function menuLabels(): string[] {
+	return menuEntries().map((entry) => entry.textContent.trim())
+}
+
+function menuIconNames(): string[] {
+	return menuEntries().flatMap((entry) => {
+		const cls = Array.from(
+			entry.querySelector(".iconify")?.classList ?? [],
+		).find((c) => c.startsWith("i-"))
+
+		return cls ? [cls.slice("i-".length)] : []
+	})
+}
+
+function shortcutKeys(label: string): string[] {
+	return Array.from(
+		menuItem(label).querySelectorAll("kbd[data-slot='kbd-group'] kbd"),
+	).map((key) => key.textContent)
+}

@@ -535,10 +535,11 @@
 		"split-documentation": {
 			"left-side-bottom-action-button": "Add Parameters",
 			"right-side-bottom-action-buttons": {
-				"add-code": "Add Code",
-				"add-metrics": "Add Metrics",
-				"add-diagram": "Add Diagram"
-			}
+				"code": "Code",
+				"metrics": "Live Metrics",
+				"diagram": "Diagram"
+			},
+			"bottom-action-trigger-label": "Add Block"
 		},
 		"metrics": {
 			"labels": {

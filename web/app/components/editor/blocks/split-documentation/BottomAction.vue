@@ -15,6 +15,11 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n({ useScope: "global" })
+const { osType } = useDetectHost()
+
+const singleButton = computed(() =>
+	props.buttons.length === 1 ? props.buttons[0] : undefined,
+)
 
 function handleClick(id: T) {
 	emit("button-click", id)
@@ -39,28 +44,32 @@ function handleClick(id: T) {
 		"
 	>
 		<ShortcutTooltip
-			v-if="props.buttons.length === 1"
+			v-if="singleButton"
 			side="bottom"
-			:shortcut="props.buttons[0]?.shortcut"
+			:shortcut="singleButton.shortcut"
 		>
 			<ShadcnUiButton
 				variant="dim"
 				size="custom"
 				class="gap-1 text-2sm opacity-0 transition-opacity group-hover/right-side-extra-action:opacity-100 supports-[hover:none]:opacity-100"
-				@click="handleClick(props.buttons[0]!.id)"
+				@click="handleClick(singleButton.id)"
 			>
-				<Icon :name="props.buttons[0]?.icon ?? 'lucide:circle-plus'" />
-				{{ props.buttons[0]?.text }}
+				<Icon :name="singleButton.icon ?? 'lucide:circle-plus'" />
+				{{ singleButton.text }}
 			</ShadcnUiButton>
 		</ShortcutTooltip>
 		<ShadcnUiDropdownMenu v-else>
 			<ShadcnUiDropdownMenuTrigger as-child>
+				<!--
+					the open menu is teleported out of the row, so hovering it
+					does not keep the row hovered
+				-->
 				<ShadcnUiButton
 					variant="dim"
 					size="custom"
-					class="gap-1 text-2sm opacity-0 transition-opacity group-hover/right-side-extra-action:opacity-100 supports-[hover:none]:opacity-100"
+					class="gap-1 text-2sm opacity-0 transition-opacity group-hover/right-side-extra-action:opacity-100 data-[state=open]:opacity-100 supports-[hover:none]:opacity-100"
 				>
-					<Icon name="lucide:circle-plus" />
+					<Icon name="mingcute:add-circle-line" />
 					{{ t("editor.split-documentation.bottom-action-trigger-label") }}
 				</ShadcnUiButton>
 			</ShadcnUiDropdownMenuTrigger>
@@ -72,6 +81,22 @@ function handleClick(id: T) {
 				>
 					<Icon :name="button.icon ?? 'lucide:circle-plus'" />
 					<span>{{ button.text }}</span>
+					<ShadcnUiKbdGroup v-if="button.shortcut" class="ml-auto pl-4">
+						<template
+							v-for="(val, index) in extractShortcutKeys(
+								shortcutByOS(button.shortcut.keyboardKey, osType),
+							)"
+							:key="index"
+						>
+							<ShadcnUiKbd v-if="!val.connector">{{ val.key }}</ShadcnUiKbd>
+							<span
+								v-else-if="val.connector === 'sequence'"
+								class="text-xs text-muted-foreground"
+							>
+								{{ t("shortcuts.connector") }}
+							</span>
+						</template>
+					</ShadcnUiKbdGroup>
 				</ShadcnUiDropdownMenuItem>
 			</ShadcnUiDropdownMenuContent>
 		</ShadcnUiDropdownMenu>
