@@ -74,6 +74,7 @@ const activeBranchMode = computed(() => {
 
 	return activeBranch.default ? "main" : "draft"
 })
+const pendingReviewabilityDisable = ref<(() => Promise<void>) | null>(null)
 
 if (import.meta.client) {
 	watchImmediate(height, (v) => {
@@ -83,8 +84,6 @@ if (import.meta.client) {
 		)
 	})
 }
-
-const pendingReviewabilityDisable = ref<(() => Promise<void>) | null>(null)
 
 function requestToggleReviewability() {
 	if (isReviewable.value) {

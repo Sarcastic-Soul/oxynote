@@ -1,3 +1,4 @@
+import { enableAutoUnmount } from "@vue/test-utils"
 import { afterEach, beforeEach, describe, it, vi } from "vitest"
 import { toast } from "vue-sonner"
 import {
@@ -88,6 +89,10 @@ function menuItemTexts() {
 // app-wide singletons every mount in the file shares, and the menus are
 // teleported into the shared <body>
 describe("<DocumentHeader>", { concurrent: false }, () => {
+	// the reviewability modal stays mounted and patches its teleported
+	// dialog after the test
+	enableAutoUnmount(afterEach)
+
 	beforeEach(() => {
 		clearQueryCache()
 		vi.mocked(toast.custom).mockReset()
@@ -487,6 +492,11 @@ describe("<DocumentHeader>", { concurrent: false }, () => {
 			`http://test.local/auth-realtime/api/documents/${DOC_ID}/branches/${DRAFT_BRANCH}`,
 			() => ({}),
 		)
+		const updated = mockEndpoint(
+			"PUT",
+			`http://test.local/auth-realtime/api/documents/${DOC_ID}/branches/${MAIN_BRANCH}`,
+			() => ({}),
+		)
 		const wrapper = await mountHeader()
 		await openOptionsMenu(wrapper)
 
@@ -502,7 +512,8 @@ describe("<DocumentHeader>", { concurrent: false }, () => {
 		).click()
 		await nextTick()
 
-		expect(deleted).toHaveLength(0)
+		expect.soft(deleted).toHaveLength(0)
+		expect.soft(updated).toHaveLength(0)
 	})
 
 	it("warns when the reviewability change fails", async ({ expect }) => {
