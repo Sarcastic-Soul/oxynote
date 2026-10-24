@@ -19,9 +19,9 @@ auth-realtime: [auth-realtime/AGENTS.md](auth-realtime/AGENTS.md).
   (`OXYNOTE_AUTH_REALTIME_BACKEND_URL`).
 - `datagen/`: separate Go module synthesising demo Postgres/MariaDB content.
 
-Go builds go through goreleaser: `make build` in `server/core` and `datagen`
-runs `goreleaser release --snapshot --clean`, producing `bin/` and the
-`ghcr.io/oxynote/{core,datagen}:dev` images the dev compose stack consumes.
+Go builds go through goreleaser (`make build` in `server/core` and
+`datagen`), producing `bin/` and the `ghcr.io/oxynote/{core,datagen}:dev`
+images the dev compose stack consumes.
 datagen shares core's test/lint workflow with its own copy of the
 golangci-lint profile; its `pgdemo`/`mariademo` suites start throwaway
 containers.
@@ -39,8 +39,7 @@ GitHub and Slack callback URLs point at `:8080/core/api/apps/...`.
 
 - `/api/...`: session-authed via auth-realtime's `/api/auth/get-session`
   (`SERVER_AUTH_BETTER_AUTH_URL`). `GET /api/capabilities` reports one
-  boolean per optional service (`github`, `slack`, `changeDetection`),
-  snapshotted at boot from each client's `Configured()`, plus `aiAssistant`
+  boolean per optional service, snapshotted at boot, plus `aiAssistant`
   (`status` + `model`).
 - `/api/x/...`: no auth; auth-realtime fetches/stores branch content here
   (`/x/documents/{id}/branches`, `/x/documents/{id}/branch/{branchId}`),
@@ -55,13 +54,9 @@ GitHub and Slack callback URLs point at `:8080/core/api/apps/...`.
   request is validated against `GET /api/internal/mcp/session` (JWKS +
   consent row, so revocation 401s immediately) and scoped by
   `documents:read`/`documents:write`/`data-sources:read`.
-- `/api/ws` topics (`wetsocks/wsserver`): `change@document-tree`,
-  `change@tag-tree`,
-  `change@documents.{documentId}.comments|metadata|reviewers|maintainers|tags|hooks`,
-  `post@slack.messages`, `creation@notifications`, `ping@version`. Binders
-  are `Handler.BindXxx` under `internal/server/internal/...`.
-
-The README lists the public routes; update it when changing handlers.
+- `/api/ws` topics (`wetsocks/wsserver`) are registered in `router.go` as
+  `<event>@<domain.path>`; binders are `Handler.BindXxx` under
+  `internal/server/internal/...`.
 
 ## Document storage / Hocuspocus
 
@@ -96,11 +91,10 @@ The README lists the public routes; update it when changing handlers.
 ## Database
 
 Postgres 18. Migrations are embedded from `core/internal/db/migrations/` and
-applied by `db.New` (`rubenv/sql-migrate`). **Until the first release there
-is only `001_initial.sql` and schema changes go into it in place**;
-afterwards, add `NNN_<name>.sql`. An existing dev volume keeps the old
-schema, so reset it with `docker compose -p oxynote -f
-docker/docker-compose.dev.yaml down -v` after editing.
+applied by `db.New` (`rubenv/sql-migrate`). **The system is live: every
+schema change is a new `NNN_<name>.sql`; an applied migration is never
+edited.** A dev volume behind on migrations can be reset with `docker
+compose -p oxynote -f docker/docker-compose.dev.yaml down -v`.
 
 **Core migrations own the Better Auth tables** (snake_case columns matching
 the `fields` mappings in `auth-realtime/src/auth.ts`).

@@ -1,7 +1,7 @@
 <script lang="ts" setup>
 import { ref } from "vue"
 import { useEditor as useTiptapEditor, EditorContent } from "@tiptap/vue-3"
-import { cn } from "@/lib/utils"
+import { cn } from "#layers/ui/app/lib/utils"
 import Document from "@tiptap/extension-document"
 import Paragraph from "@tiptap/extension-paragraph"
 import Text from "@tiptap/extension-text"
@@ -18,6 +18,13 @@ import HooksMenuContent from "./hooks/HookMenuContent.vue"
 import MaintainerList from "./MaintainerList.vue"
 import DocumentTagList from "./DocumentTagList.vue"
 import ReviewerList from "./ReviewerList.vue"
+import HookDiffMarker from "./hooks/HookDiffMarker.vue"
+import { blockChangeCount, diffHooks } from "./hooks/hook-diff"
+import {
+	HOOK_BAR_STATUS_CLASS,
+	HOOK_ICON_STATUS_CLASS,
+	hookGroupStatus,
+} from "./hooks/hook-status"
 import { showToastMessage } from "../toast"
 import {
 	DEFAULT_HIGHLIGHT_OVERLAY_PADDING,
@@ -31,7 +38,8 @@ enum ReviewableAction {
 }
 
 const props = defineProps<{
-	documentHooks: DocumentHook[]
+	activeBranchHooks: DocumentHook[]
+	targetBranchHooks?: DocumentHook[]
 	activeBranchYdoc: Y.Doc
 	activeBranchProvider: HocuspocusProvider
 	targetBranchProvider?: HocuspocusProvider | null | undefined
@@ -85,17 +93,20 @@ const showTitleDiff = computed(
 
 // a page with no hooks of its own has no status to show, which leaves the
 // handle its neutral colour rather than tinting it as healthy
-const hookStatus = computed(() => {
-	const hooks = props.documentHooks.filter((h) => h.blockId === null)
-	if (!hooks.length) {
-		return null
-	}
-
-	return hooks.some((h) => Number(h.score) === 0) ? "stale" : "fresh"
-})
+const hookStatus = computed(() =>
+	hookGroupStatus(props.activeBranchHooks.filter((h) => h.blockId === null)),
+)
+// the bar beside the title takes the same status as the hook icon
+const hookBarClass = computed(() =>
+	hookStatus.value && hookStatus.value !== "fresh"
+		? HOOK_BAR_STATUS_CLASS[hookStatus.value]
+		: null,
+)
 const hookMenuOpen = ref(false)
 const rootElem = useTemplateRef<HTMLElement>("name-editor-root")
+const nameLineElem = useTemplateRef<HTMLElement>("name-line")
 const hookHandleElem = useTemplateRef<HTMLElement>("hook-handle")
+const hoveringNameLine = useElementHover(nameLineElem)
 const hoveringHookHandle = useElementHover(hookHandleElem)
 // the menu hands focus back to the handle when it closes, also after an
 // outside click that never reaches the editor, so a plain focus would
@@ -104,15 +115,28 @@ const hoveringHookHandle = useElementHover(hookHandleElem)
 const { focused: keyboardFocusOnHookHandle } = useFocus(hookHandleElem, {
 	focusVisible: true,
 })
-const { isEditable } = useEditorMeta()
 const { isScrolling } = useWindowScroll()
 const { show: showHighlight, hide: hideHighlight } = useHighlightOverlay()
-// the hook handle edits the page's hooks, so it follows the same rule as
-// the block handles: gone while the page cannot be edited, and gone in
-// diff mode, where the title is a rendering of two branches rather than
-// an editor
-const isEditingDisabled = computed(
-	() => !isEditable.value || editorStore.reviewableDiffActive,
+// the changes to the page's own hooks, null while there are none to mark
+const titleHookChanges = computed(() => {
+	if (!editorStore.reviewableDiffActive || !props.targetBranchHooks) {
+		return null
+	}
+
+	const count = blockChangeCount(
+		diffHooks(props.activeBranchHooks, props.targetBranchHooks),
+		null,
+	)
+
+	return count.removed || count.added ? count : null
+})
+// the hook handle shows over the marker's spot, so the marker moves below
+// it whenever the handle is up
+const hookHandleShown = computed(
+	() =>
+		hoveringNameLine.value ||
+		keyboardFocusOnHookHandle.value ||
+		hookMenuOpen.value,
 )
 const selectedReviewableAction = ref<ReviewableAction>(
 	ReviewableAction.ApproveUnapprove,
@@ -390,19 +414,32 @@ async function executeReviewableAction() {
 		class="relative mt-[0.8rem] mb-2 w-[calc(100%-2.5rem)] lg:mt-8 lg:mb-5 lg:w-[calc(100%-6.25rem)]"
 	>
 		<div
-			v-show="hookStatus === 'stale'"
-			class="pointer-events-none absolute top-1/2 -left-5 h-full w-1.25 -translate-y-1/2 rounded-r-lg bg-hook-decoration in-data-compact-view:rounded-full lg:-left-12.5 lg:h-[calc(100%+2rem)]"
+			v-show="hookBarClass"
+			:class="
+				cn(
+					'pointer-events-none absolute top-1/2 -left-5 h-full w-1.25 -translate-y-1/2 rounded-r-lg in-data-compact-view:rounded-full lg:-left-12.5 lg:h-[calc(100%+2rem)]',
+					hookBarClass,
+				)
+			"
 		/>
+		<!--
+			the line reaches into the page margins on both sides, so hovering
+			them shows the hook handle the way a block's margins show its
+			drag handle
+		-->
 		<div
-			class="flex flex-col-reverse items-start gap-2 sm:flex-row sm:justify-between"
+			ref="name-line"
+			class="group/name-line relative flex flex-col-reverse items-start gap-2 before:absolute before:inset-y-0 before:right-full before:w-5 after:absolute after:inset-y-0 after:left-full after:w-5 sm:flex-row sm:justify-between lg:before:w-12.5 lg:after:w-12.5"
 		>
-			<div
-				class="group/name-row relative flex flex-1 items-start gap-2 text-foreground"
-			>
-				<ShadcnUiDropdownMenu
-					v-if="!isEditingDisabled"
-					@update:open="(v: boolean) => (hookMenuOpen = v)"
-				>
+			<div class="relative flex flex-1 items-start gap-2 text-foreground">
+				<HookDiffMarker
+					v-if="titleHookChanges"
+					class="absolute top-1.25 right-full pr-0.5 lg:pr-1.75"
+					:count="titleHookChanges"
+					:hook-status="hookStatus"
+					:lifted="hookHandleShown"
+				/>
+				<ShadcnUiDropdownMenu @update:open="(v: boolean) => (hookMenuOpen = v)">
 					<ShadcnUiDropdownMenuTrigger as-child>
 						<button
 							ref="hook-handle"
@@ -411,9 +448,9 @@ async function executeReviewableAction() {
 							:data-hovering="hoveringHookHandle ? '' : undefined"
 							:class="
 								cn(
-									'group/hook-handle absolute top-0.5 right-full flex h-7 items-center pr-1.5',
+									'group/hook-handle absolute top-0.5 right-full flex h-7 items-center pr-1 lg:pr-1.5',
 									'pointer-events-none opacity-0 transition-opacity duration-100',
-									'group-hover/name-row:pointer-events-auto group-hover/name-row:opacity-100',
+									'group-hover/name-line:pointer-events-auto group-hover/name-line:opacity-100',
 									'focus-visible:pointer-events-auto focus-visible:opacity-100',
 									'data-menu-open:pointer-events-auto data-menu-open:opacity-100',
 									'data-hovering:pointer-events-auto data-hovering:opacity-100',
@@ -421,11 +458,9 @@ async function executeReviewableAction() {
 							"
 						>
 							<span
-								:data-hook-status="hookStatus"
 								:class="
 									cn(
 										'flex h-5 w-3 cursor-pointer items-center justify-center rounded-sm text-foreground/50 lg:size-5.5 lg:rounded-md',
-										'data-[hook-status=fresh]:text-hook-status-fresh data-[hook-status=stale]:text-hook-status-stale',
 										'group-data-menu-open/hook-handle:bg-sidebar-accent/50 hover:bg-sidebar-accent/50 active:bg-sidebar-accent',
 									)
 								"
@@ -434,9 +469,13 @@ async function executeReviewableAction() {
 									the block handles fold their hook menu into the drag
 									handle where the gutter is too narrow for both, so the
 									title takes the same handle at the same width there and
-									keeps the hook button where the block ones do
+									keeps the hook button where the block ones do. The
+									dots take the block handles' backdrop too, since they
+									sit over the page's triggered hook bar
 								-->
-								<span class="relative h-5 w-3 overflow-hidden lg:hidden">
+								<span
+									class="relative h-5 w-3 overflow-hidden rounded-sm bg-background-translucent lg:hidden"
+								>
 									<Icon
 										name="mingcute:dots-line"
 										class="absolute top-1/2 left-1/2 size-5 -translate-x-1/2 -translate-y-1/2"
@@ -444,7 +483,13 @@ async function executeReviewableAction() {
 								</span>
 								<Icon
 									name="mingcute:leaf-line"
-									class="mt-0.25 hidden size-4.5 lg:block"
+									:data-hook-status="hookStatus"
+									:class="
+										cn(
+											'mt-0.25 hidden size-4.5 lg:block',
+											HOOK_ICON_STATUS_CLASS,
+										)
+									"
 								/>
 							</span>
 							<span class="sr-only">
@@ -454,7 +499,8 @@ async function executeReviewableAction() {
 					</ShadcnUiDropdownMenuTrigger>
 					<ShadcnUiDropdownMenuContent side="right" align="start" loop>
 						<HooksMenuContent
-							:document-hooks="documentHooks"
+							:active-branch-hooks="activeBranchHooks"
+							:target-branch-hooks="props.targetBranchHooks"
 							:node-id="null"
 							@open-settings="(v) => emit('open-settings', v)"
 						/>

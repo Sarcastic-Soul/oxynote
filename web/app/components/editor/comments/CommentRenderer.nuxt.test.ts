@@ -1,4 +1,4 @@
-import { mountSuspended } from "@nuxt/test-utils/runtime"
+import { mockNuxtImport, mountSuspended } from "@nuxt/test-utils/runtime"
 import { Editor as TiptapEditor, type Editor } from "@tiptap/core"
 import { ySyncPluginKey } from "@tiptap/y-tiptap"
 import {
@@ -61,6 +61,13 @@ vi.mock("vue-virtual-scroller", async () => {
 		}),
 	}
 })
+
+// happy-dom lays nothing out, so the popover never learns its height.
+// The tests set the height by hand.
+const popover = vi.hoisted(() => ({
+	height: null as unknown as { value: number },
+}))
+mockNuxtImport("useElementSize", () => () => ({ height: popover.height }))
 
 const DOCUMENT_ID = makeXid("doc")
 const BRANCH_ID = makeXid("branch")
@@ -255,6 +262,7 @@ describe("<CommentRenderer>", { concurrent: false }, () => {
 	beforeEach(() => {
 		clearTeleportedOverlays()
 		stubThemeColorContext()
+		popover.height = ref(0)
 		clearQueryCache()
 		useEditorMeta().setEditable(true)
 		useEditorStore().updateActiveDocumentId(DOCUMENT_ID)
@@ -333,6 +341,60 @@ describe("<CommentRenderer>", { concurrent: false }, () => {
 		)
 	})
 
+	it("scrolls a thread into view once it is drawn", async ({ expect }) => {
+		const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView")
+		const editor = textDoc("hello world")
+		const wrapper = await mountRenderer(editor)
+		await api(wrapper).addNewComment(0)
+		await flushPromises()
+
+		popover.height.value = 120
+		await flushPromises()
+
+		expect(scrollIntoView).toHaveBeenCalledExactlyOnceWith({
+			behavior: "smooth",
+			block: "nearest",
+		})
+		expect(scrollIntoView.mock.contexts[0]).toBe(
+			wrapper.find(".z-popover").element,
+		)
+	})
+
+	it("scrolls a thread into view again when its height changes", async ({
+		expect,
+	}) => {
+		const editor = textDoc("hello world")
+		const wrapper = await mountRenderer(editor)
+		await api(wrapper).addNewComment(0)
+		popover.height.value = 120
+		await flushPromises()
+		const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView")
+
+		popover.height.value = 200
+		await flushPromises()
+
+		expect(scrollIntoView).toHaveBeenCalledExactlyOnceWith({
+			behavior: "smooth",
+			block: "nearest",
+		})
+		expect(scrollIntoView.mock.contexts[0]).toBe(
+			wrapper.find(".z-popover").element,
+		)
+	})
+
+	it("leaves the page where it is while a thread is not drawn", async ({
+		expect,
+	}) => {
+		const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView")
+		const editor = textDoc("hello world")
+		const wrapper = await mountRenderer(editor)
+
+		await api(wrapper).addNewComment(0)
+		await flushPromises()
+
+		expect(scrollIntoView).not.toHaveBeenCalled()
+	})
+
 	it("opens nothing while the reader is not signed in", async ({ expect }) => {
 		seedAuthSession(null)
 		const editor = textDoc("hello world")
@@ -375,6 +437,29 @@ describe("<CommentRenderer>", { concurrent: false }, () => {
 		expect(wrapper.text()).toContain(
 			t("editor.comment-thread.title-reply-existing-thread"),
 		)
+	})
+
+	it("shows a comment from someone who is no longer a member as a deleted user", async ({
+		expect,
+	}) => {
+		const editor = textDoc("hello world")
+		editor.commands.addNodeComment(0, { nodeCommentId: COMMENT_ID })
+		seedComments([serverComment({ userId: null })])
+		const wrapper = await mountRenderer(editor)
+
+		await api(wrapper).selectComment({ textComment: false, id: COMMENT_ID })
+
+		// the thread list resolves asynchronously, and the avatar component
+		// loads on demand
+		await vi.waitFor(() => {
+			expect(wrapper.find("[data-slot='avatar-fallback'] img").exists()).toBe(
+				true,
+			)
+		}, WAIT_FOR_OPTIONS)
+		expect(
+			wrapper.get("[data-slot='avatar-fallback'] img").attributes("src"),
+		).toBe(defaultAvatar("deleted-user"))
+		expect(wrapper.text()).toContain(t("general.deleted-user"))
 	})
 
 	it("shows the thread of an existing text comment", async ({ expect }) => {

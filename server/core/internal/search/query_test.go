@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/blevesearch/bleve/v2/search/query"
+	"github.com/oxynote/oxynote/server/core/pkg/testutil"
 	"github.com/rs/xid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -25,7 +27,7 @@ const _longText = "the migration guide starts with the prerequisites and then wa
 func seedIndex(t *testing.T) (*Index, Scope) {
 	t.Helper()
 
-	idx := openIndex(t, indexPath(t), &stubSource{})
+	idx := openIndex(t, filepath.Join(t.TempDir(), "index"), &stubSource{})
 	t.Cleanup(func() { require.NoError(t, idx.Close()) })
 
 	main := Scope{
@@ -57,11 +59,16 @@ func seedIndex(t *testing.T) (*Index, Scope) {
 		"p3":      main.Block("p3", "paragraph", "production traffic hits the service after we deploy on monday"),
 		"p4":      main.Block("p4", "paragraph", "alpha beta"),
 		"p5":      main.Block("p5", "paragraph", "alpha only"),
-		"p6":      main.Block("p6", "paragraph", "kubernetes clusters"),
-		"p7":      main.Block("p7", "paragraph", "the endpoint answers 404 not found"),
-		"p8":      main.Block("p8", "paragraph", "run an a11y audit before launch"),
-		"p9":      main.Block("p9", "paragraph", "accessibility matters"),
-		"p10":     main.Block("p10", "paragraph", _longText),
+		"p6": func() Block {
+			b := main.Block("p6", "codeBlock", "kubernetes clusters")
+			b.Attrs = map[string]string{"language": "yaml"}
+
+			return b
+		}(),
+		"p7":  main.Block("p7", "paragraph", "the endpoint answers 404 not found"),
+		"p8":  main.Block("p8", "paragraph", "run an a11y audit before launch"),
+		"p9":  main.Block("p9", "paragraph", "accessibility matters"),
+		"p10": main.Block("p10", "paragraph", _longText),
 	}))
 
 	require.NoError(t, idx.ReplaceBranch(context.Background(), fork.BranchID, map[string]Block{
@@ -91,8 +98,9 @@ func Test_Index_SearchDocuments(t *testing.T) {
 			BranchID:       main.BranchID,
 			BranchName:     "main",
 			BranchDefault:  true,
-			Type:           "paragraph",
+			Type:           "codeBlock",
 			Text:           "<mark>kubernetes</mark> clusters",
+			Attrs:          map[string]string{"language": "yaml"},
 		},
 	})
 	require.NoError(t, err)
@@ -122,8 +130,9 @@ func Test_Index_SearchDocumentBlocks(t *testing.T) {
 			BranchID:       main.BranchID,
 			BranchName:     "main",
 			BranchDefault:  true,
-			Type:           "paragraph",
+			Type:           "codeBlock",
 			Text:           "kubernetes clusters",
+			Attrs:          map[string]string{"language": "yaml"},
 		},
 	}, blocks)
 
@@ -141,6 +150,47 @@ func Test_Index_SearchDocumentBlocks(t *testing.T) {
 	assert.Nil(t, blocks)
 }
 
+func Test_ValidateQuery(t *testing.T) {
+	cc := map[string]struct {
+		Query string
+		Err   error
+	}{
+		"Empty query":      {Err: ErrInvalidQuery},
+		"Overlong query":   {Query: strings.Repeat("a", MaxQueryLength+1), Err: ErrInvalidQuery},
+		"Query at the cap": {Query: strings.Repeat("é", MaxQueryLength)},
+		"Plain query":      {Query: "deploy"},
+	}
+
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			testutil.AssertEqualError(t, c.Err, ValidateQuery(c.Query))
+		})
+	}
+}
+
+func Test_validatePagedQuery(t *testing.T) {
+	cc := map[string]struct {
+		Query string
+		Err   error
+	}{
+		"Empty query":          {Err: ErrInvalidQuery},
+		"Short query":          {Query: " a ", Err: ErrInvalidQuery},
+		"Overlong query":       {Query: strings.Repeat("a", MaxQueryLength+1), Err: ErrInvalidQuery},
+		"Query at the minimum": {Query: "éa"},
+		"Plain query":          {Query: "deploy"},
+	}
+
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			testutil.AssertEqualError(t, c.Err, validatePagedQuery(c.Query))
+		})
+	}
+}
+
 func Test_Index_search(t *testing.T) {
 	t.Parallel()
 
@@ -152,7 +202,14 @@ func Test_Index_search(t *testing.T) {
 		Limit          int
 		Highlight      bool
 		Check          func(t *testing.T, blocks []Block)
+		Err            error
 	}{
+		"Overlong query": {
+			OrganizationID: "org-1",
+			Query:          strings.Repeat("a", MaxQueryLength+1),
+			Limit:          10,
+			Err:            ErrInvalidQuery,
+		},
 		"Stemming matches another form of the word": {
 			OrganizationID: "org-1",
 			Query:          "deploying",
@@ -330,7 +387,11 @@ func Test_Index_search(t *testing.T) {
 			t.Parallel()
 
 			blocks, err := idx.search(context.Background(), c.OrganizationID, c.Query, c.Limit, c.Highlight)
-			require.NoError(t, err)
+			testutil.AssertEqualError(t, c.Err, err)
+
+			if err != nil {
+				return
+			}
 
 			c.Check(t, blocks)
 		})
@@ -351,54 +412,73 @@ func blockTexts(blocks []Block) []string {
 func Test_Index_query(t *testing.T) {
 	t.Parallel()
 
-	idx := openIndex(t, indexPath(t), &stubSource{})
-	defer func() { require.NoError(t, idx.Close()) }()
+	idx := openIndex(t, filepath.Join(t.TempDir(), "index"), &stubSource{})
+	t.Cleanup(func() { require.NoError(t, idx.Close()) })
 
-	// a query with terms: the organization filter and the text disjunction
-	// are required, the boosts optional.
-	bq, ok := idx.query("org-1", "release notes").(*query.BooleanQuery)
-	require.True(t, ok)
+	cc := map[string]struct {
+		Query string
+		Check func(t *testing.T, bq *query.BooleanQuery)
+	}{
+		// the organization filter and the text disjunction are required,
+		// the boosts optional.
+		"Query with terms": {
+			Query: "release notes",
+			Check: func(t *testing.T, bq *query.BooleanQuery) {
+				must, ok := bq.Must.(*query.ConjunctionQuery)
+				require.True(t, ok)
+				require.Len(t, must.Conjuncts, 2)
 
-	must, ok := bq.Must.(*query.ConjunctionQuery)
-	require.True(t, ok)
-	require.Len(t, must.Conjuncts, 2)
+				org, ok := must.Conjuncts[0].(*query.TermQuery)
+				require.True(t, ok)
+				assert.Equal(t, "org-1", org.Term)
+				assert.Equal(t, _fieldOrganizationID, org.FieldVal)
 
-	org, ok := must.Conjuncts[0].(*query.TermQuery)
-	require.True(t, ok)
-	assert.Equal(t, "org-1", org.Term)
-	assert.Equal(t, _fieldOrganizationID, org.FieldVal)
+				text, ok := must.Conjuncts[1].(*query.DisjunctionQuery)
+				require.True(t, ok)
+				require.Len(t, text.Disjuncts, 2)
 
-	text, ok := must.Conjuncts[1].(*query.DisjunctionQuery)
-	require.True(t, ok)
-	require.Len(t, text.Disjuncts, 2)
+				phrase, ok := text.Disjuncts[0].(*query.PhraseQuery)
+				require.True(t, ok)
+				assert.Equal(t, []string{"releas", "note"}, phrase.Terms)
 
-	phrase, ok := text.Disjuncts[0].(*query.PhraseQuery)
-	require.True(t, ok)
-	assert.Equal(t, []string{"releas", "note"}, phrase.Terms)
+				terms, ok := text.Disjuncts[1].(*query.DisjunctionQuery)
+				require.True(t, ok)
+				assert.Len(t, terms.Disjuncts, 2)
 
-	terms, ok := text.Disjuncts[1].(*query.DisjunctionQuery)
-	require.True(t, ok)
-	assert.Len(t, terms.Disjuncts, 2)
+				should, ok := bq.Should.(*query.DisjunctionQuery)
+				require.True(t, ok)
+				assert.Len(t, should.Disjuncts, 3)
+			},
+		},
+		// a query the analyzer reduces to nothing matches nothing.
+		"Query without terms": {
+			Query: "...",
+			Check: func(t *testing.T, bq *query.BooleanQuery) {
+				must, ok := bq.Must.(*query.ConjunctionQuery)
+				require.True(t, ok)
 
-	should, ok := bq.Should.(*query.DisjunctionQuery)
-	require.True(t, ok)
-	assert.Len(t, should.Disjuncts, 3)
+				_, ok = must.Conjuncts[1].(*query.MatchNoneQuery)
+				assert.True(t, ok)
+			},
+		},
+	}
 
-	// a query the analyzer reduces to nothing matches nothing.
-	bq, ok = idx.query("org-1", "...").(*query.BooleanQuery)
-	require.True(t, ok)
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
 
-	must, ok = bq.Must.(*query.ConjunctionQuery)
-	require.True(t, ok)
+			bq, ok := idx.query("org-1", c.Query).(*query.BooleanQuery)
+			require.True(t, ok)
 
-	_, ok = must.Conjuncts[1].(*query.MatchNoneQuery)
-	assert.True(t, ok)
+			c.Check(t, bq)
+		})
+	}
 }
 
 func Test_Index_terms(t *testing.T) {
 	t.Parallel()
 
-	idx := openIndex(t, indexPath(t), &stubSource{})
+	idx := openIndex(t, filepath.Join(t.TempDir(), "index"), &stubSource{})
 	defer func() { require.NoError(t, idx.Close()) }()
 
 	// the terms are the analyzer's: lowercased and stemmed.
@@ -413,41 +493,62 @@ func Test_Index_terms(t *testing.T) {
 func Test_termsQuery(t *testing.T) {
 	t.Parallel()
 
-	// one term: fuzzy or prefix, and it has to match.
-	dq, ok := termsQuery([]string{"kuber"}).(*query.DisjunctionQuery)
-	require.True(t, ok)
-	require.Len(t, dq.Disjuncts, 1)
-	assert.InDelta(t, 1, dq.Min, 0)
+	cc := map[string]struct {
+		Terms []string
+		Check func(t *testing.T, dq *query.DisjunctionQuery)
+	}{
+		// fuzzy or prefix, and it has to match.
+		"One term": {
+			Terms: []string{"kuber"},
+			Check: func(t *testing.T, dq *query.DisjunctionQuery) {
+				require.Len(t, dq.Disjuncts, 1)
+				assert.InDelta(t, 1, dq.Min, 0)
 
-	last, ok := dq.Disjuncts[0].(*query.DisjunctionQuery)
-	require.True(t, ok)
-	require.Len(t, last.Disjuncts, 2)
+				last, ok := dq.Disjuncts[0].(*query.DisjunctionQuery)
+				require.True(t, ok)
+				require.Len(t, last.Disjuncts, 2)
 
-	fuzzy, ok := last.Disjuncts[0].(*query.FuzzyQuery)
-	require.True(t, ok)
-	assert.Equal(t, "kuber", fuzzy.Term)
+				fuzzy, ok := last.Disjuncts[0].(*query.FuzzyQuery)
+				require.True(t, ok)
+				assert.Equal(t, "kuber", fuzzy.Term)
 
-	prefix, ok := last.Disjuncts[1].(*query.PrefixQuery)
-	require.True(t, ok)
-	assert.Equal(t, "kuber", prefix.Prefix)
+				prefix, ok := last.Disjuncts[1].(*query.PrefixQuery)
+				require.True(t, ok)
+				assert.Equal(t, "kuber", prefix.Prefix)
+			},
+		},
+		// the first two fuzzy only, the last also a prefix, and all but one
+		// have to match.
+		"Several terms": {
+			Terms: []string{"deploy", "releas", "note"},
+			Check: func(t *testing.T, dq *query.DisjunctionQuery) {
+				require.Len(t, dq.Disjuncts, 3)
+				assert.InDelta(t, 2, dq.Min, 0)
 
-	// three terms: the first two fuzzy only, the last also a prefix, and
-	// all but one have to match.
-	dq, ok = termsQuery([]string{"deploy", "releas", "note"}).(*query.DisjunctionQuery)
-	require.True(t, ok)
-	require.Len(t, dq.Disjuncts, 3)
-	assert.InDelta(t, 2, dq.Min, 0)
+				fuzzy, ok := dq.Disjuncts[0].(*query.FuzzyQuery)
+				require.True(t, ok)
+				assert.Equal(t, "deploy", fuzzy.Term)
 
-	fuzzy, ok = dq.Disjuncts[0].(*query.FuzzyQuery)
-	require.True(t, ok)
-	assert.Equal(t, "deploy", fuzzy.Term)
+				last, ok := dq.Disjuncts[2].(*query.DisjunctionQuery)
+				require.True(t, ok)
 
-	last, ok = dq.Disjuncts[2].(*query.DisjunctionQuery)
-	require.True(t, ok)
+				prefix, ok := last.Disjuncts[1].(*query.PrefixQuery)
+				require.True(t, ok)
+				assert.Equal(t, "note", prefix.Prefix)
+			},
+		},
+	}
 
-	prefix, ok = last.Disjuncts[1].(*query.PrefixQuery)
-	require.True(t, ok)
-	assert.Equal(t, "note", prefix.Prefix)
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			dq, ok := termsQuery(c.Terms).(*query.DisjunctionQuery)
+			require.True(t, ok)
+
+			c.Check(t, dq)
+		})
+	}
 }
 
 func Test_Index_decodeHit(t *testing.T) {
@@ -513,6 +614,16 @@ func Test_Index_decodeHit(t *testing.T) {
 			Fields: fields(documentID.String(), branchID.String()),
 			Result: block,
 		},
+		"Successful decoding with attributes": func() tcase {
+			ff := fields(documentID.String(), branchID.String())
+			ff[_fieldAttrs+".language"] = "go"
+			ff[_fieldAttrs+".dataSourceId"] = "ds1"
+
+			res := block
+			res.Attrs = map[string]string{"language": "go", "dataSourceId": "ds1"}
+
+			return tcase{Fields: ff, Result: res}
+		}(),
 	}
 
 	for cn, c := range cc {

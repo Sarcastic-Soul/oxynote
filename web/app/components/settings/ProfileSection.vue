@@ -3,8 +3,8 @@ import { toTypedSchema } from "@vee-validate/zod"
 import { useForm } from "vee-validate"
 import * as z from "zod"
 // for some reason this isn't auto imported
-import { FormField as ShadcnUiFormField } from "@/components/shadcn/ui/form"
-import { cn } from "~/lib/utils"
+import { FormField as ShadcnUiFormField } from "#layers/ui/app/components/shadcn/ui/form"
+import { cn } from "#layers/ui/app/lib/utils"
 import { showToastMessage } from "../toast"
 
 const emit = defineEmits<{
@@ -223,7 +223,11 @@ function handleAvatarClick() {
 							:alt="$t('settings.profile.image-alt')"
 						/>
 						<ShadcnUiAvatarFallback>
-							{{ extractInitials(form.values.username || "", 2) }}
+							<LazyDefaultAvatar
+								kind="user"
+								:seed="sessionUser?.id || ''"
+								:name="sessionUser?.name"
+							/>
 						</ShadcnUiAvatarFallback>
 						<div
 							:data-loading="loading === 'avatar' ? '' : undefined"

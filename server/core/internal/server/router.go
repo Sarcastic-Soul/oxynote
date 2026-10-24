@@ -15,12 +15,6 @@ import (
 )
 
 const (
-	// _userImageLocationFormat is the URL format for user images.
-	_userImageLocationFormat = "/api/users/%s/image"
-
-	// _organizationLogoLocation is the URL path for organization logos.
-	_organizationLogoLocation = "/api/organizations/logo"
-
 	// _requestTimeout bounds the processing of a single HTTP request.
 	_requestTimeout = 30 * time.Second
 
@@ -49,6 +43,12 @@ func (s *Server) wsRouter() *wsserver.Router {
 	binderFn("change@tag-tree",
 		func(tpc wsserver.Topic) {
 			s.handlers.tag.BindTreeChange(tpc)
+		},
+	)
+
+	binderFn("change@variables",
+		func(tpc wsserver.Topic) {
+			s.handlers.variable.BindChange(tpc)
 		},
 	)
 
@@ -121,7 +121,9 @@ func (s *Server) httpRouter() chi.Router {
 		// The MCP surface authenticates with OAuth bearer tokens
 		// through its own middleware, so it mounts outside the
 		// cookie-session subtree.
-		sr.Mount("/mcp", s.handlers.mcp)
+		if s.handlers.mcp != nil {
+			sr.Mount("/mcp", s.handlers.mcp)
+		}
 
 		// Third parties deliver here, so this subtree has to stay
 		// reachable through the front door — unlike /x below.
@@ -230,7 +232,6 @@ func (s *Server) router() chi.Router {
 			ssr.Delete("/", s.handlers.github.DisconnectOrganization)
 			ssr.Get("/install", s.handlers.github.FetchInstall)
 			ssr.Get("/connect", s.handlers.github.ConnectOrganization)
-			ssr.Get("/issues", s.handlers.github.FetchIssues)
 			ssr.Route("/repositories", func(sssr chi.Router) {
 				sssr.Get("/", s.handlers.github.FetchRepositories)
 				sssr.Route("/{repository}", func(ssssr chi.Router) {
@@ -241,6 +242,8 @@ func (s *Server) router() chi.Router {
 		})
 	})
 
+	// the image and logo routes are mounted on user.ImagePathFormat and
+	// org.LogoPath: the rows store those paths.
 	r.Route("/users", func(sr chi.Router) {
 		sr.Put("/image", s.handlers.user.UploadUserImage)
 		sr.Get("/{userId}/image", s.handlers.user.RetrieveUserImage)
@@ -304,6 +307,8 @@ func (s *Server) router() chi.Router {
 
 	r.Route("/documents", func(sr chi.Router) {
 		sr.Get("/search", s.handlers.document.SearchDocuments)
+		sr.Get("/search/legacy", s.handlers.document.SearchDocumentsLegacy)
+		sr.Get("/recent", s.handlers.document.FetchRecentlyViewedDocuments)
 		sr.Post("/", s.handlers.document.CreateDocument)
 		sr.Route("/{documentId}", func(ssr chi.Router) {
 			ssr.Use(s.handlers.document.RequireDocumentAccess)
@@ -315,6 +320,8 @@ func (s *Server) router() chi.Router {
 				sssr.Get("/", s.handlers.document.FetchDocumentBranches)
 				sssr.Route("/{branchId}", func(ssssr chi.Router) {
 					ssssr.Put("/review-approve", s.handlers.document.UpdateBranchReviewApproval)
+					ssssr.Post("/views", s.handlers.document.RecordDocumentBranchView)
+					ssssr.Get("/search", s.handlers.document.SearchDocumentBranch)
 					ssssr.Post("/blocks/{blockUid}/run", s.handlers.block.RunBlock)
 					ssssr.Route("/reviewers", func(sssssr chi.Router) {
 						sssssr.Get("/", s.handlers.document.FetchBranchReviewers)
@@ -367,8 +374,30 @@ func (s *Server) router() chi.Router {
 		})
 	})
 
+	r.Route("/variables", func(sr chi.Router) {
+		sr.Post("/", s.handlers.variable.CreateVariable)
+		sr.Route("/tree", func(ssr chi.Router) {
+			ssr.Get("/", s.handlers.variable.FetchVariableTree)
+			ssr.Put("/", s.handlers.variable.UpdateVariableTree)
+		})
+		sr.Route("/groups", func(ssr chi.Router) {
+			ssr.Post("/", s.handlers.variable.CreateVariableGroup)
+			ssr.Put("/tree", s.handlers.variable.UpdateVariableGroupTree)
+			ssr.Put("/{groupId}", s.handlers.variable.UpdateVariableGroup)
+			ssr.Delete("/{groupId}", s.handlers.variable.DeleteVariableGroup)
+		})
+		sr.Route("/{variableId}", func(ssr chi.Router) {
+			ssr.Put("/", s.handlers.variable.UpdateVariable)
+			ssr.Delete("/", s.handlers.variable.DeleteVariable)
+			ssr.Put("/default", s.handlers.variable.SetVariableDefault)
+			ssr.Put("/value", s.handlers.variable.SetVariableValue)
+			ssr.Delete("/value", s.handlers.variable.ResetVariableValue)
+		})
+	})
+
 	r.Route("/tags", func(sr chi.Router) {
 		sr.Post("/", s.handlers.tag.CreateTag)
+		sr.Put("/{tagId}", s.handlers.tag.UpdateTag)
 		sr.Put("/{tagId}/visibility", s.handlers.tag.SetTagVisibility)
 		sr.Delete("/{tagId}", s.handlers.tag.DeleteTag)
 		sr.Route("/tree", func(ssr chi.Router) {

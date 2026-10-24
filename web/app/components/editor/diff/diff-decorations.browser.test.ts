@@ -3,6 +3,7 @@ import { Editor, Node } from "@tiptap/core"
 import Document from "@tiptap/extension-document"
 import Heading from "@tiptap/extension-heading"
 import HorizontalRule from "@tiptap/extension-horizontal-rule"
+import Link from "@tiptap/extension-link"
 import { TaskItem, TaskList } from "@tiptap/extension-list"
 import Paragraph from "@tiptap/extension-paragraph"
 import Text from "@tiptap/extension-text"
@@ -43,7 +44,7 @@ const ImageBlockStub = Node.create({
 	},
 })
 
-function makeEditor(content: JSONContent, opaqueTypes?: string[]): Editor {
+function makeEditor(content: JSONContent): Editor {
 	const editor = new Editor({
 		element: document.createElement("div"),
 		injectCSS: false,
@@ -53,6 +54,7 @@ function makeEditor(content: JSONContent, opaqueTypes?: string[]): Editor {
 			Text,
 			Heading,
 			HorizontalRule,
+			Link,
 			TaskList,
 			TaskItem,
 			ImageBlockStub,
@@ -65,9 +67,7 @@ function makeEditor(content: JSONContent, opaqueTypes?: string[]): Editor {
 					IMAGE_BLOCK_NAME,
 				],
 			}),
-			opaqueTypes
-				? DiffDecorations.configure({ opaqueTypes })
-				: DiffDecorations,
+			DiffDecorations,
 		],
 	})
 
@@ -76,6 +76,19 @@ function makeEditor(content: JSONContent, opaqueTypes?: string[]): Editor {
 	editor.commands.setContent(content)
 
 	return editor
+}
+
+function linkParagraph(href: string): JSONContent {
+	return {
+		type: "paragraph",
+		content: [
+			{
+				type: "text",
+				text: "docs",
+				marks: [{ type: "link", attrs: { href } }],
+			},
+		],
+	}
 }
 
 function diffElements(editor: Editor): NodeListOf<Element> {
@@ -152,9 +165,7 @@ describe("DiffDecorations", () => {
 		editor.destroy()
 	})
 
-	it("marks a modified opaque node with the diff-modified class", ({
-		expect,
-	}) => {
+	it("leaves a modified horizontal rule undecorated", ({ expect }) => {
 		const editor = makeEditor(
 			doc({
 				type: "horizontalRule",
@@ -162,29 +173,7 @@ describe("DiffDecorations", () => {
 			}),
 		)
 
-		const hr = editor.view.dom.querySelector("hr")
-		expect(hr?.classList.contains("diff-modified")).toBe(true)
-
-		editor.destroy()
-	})
-
-	it("treats configured opaque types as whole-node modifications", ({
-		expect,
-	}) => {
-		const editor = makeEditor(
-			doc(
-				heading("new title", {
-					diffStatus: DiffStatus.Modified,
-					oldNode: heading("old title"),
-				}),
-			),
-			[Heading.name],
-		)
-
-		const h1 = editor.view.dom.querySelector("h1")
-		expect(h1?.classList.contains("diff-modified")).toBe(true)
-		expect(editor.view.dom.querySelector(".diff-text-added")).toBeNull()
-		expect(editor.view.dom.querySelector(".diff-text-removed")).toBeNull()
+		expect(diffElements(editor)).toHaveLength(0)
 
 		editor.destroy()
 	})
@@ -202,7 +191,7 @@ describe("DiffDecorations", () => {
 		editor.destroy()
 	})
 
-	it("highlights the whole task item when its checked state changed", ({
+	it("tints the checkbox of a task item whose checked state changed", ({
 		expect,
 	}) => {
 		const editor = makeEditor(
@@ -219,8 +208,8 @@ describe("DiffDecorations", () => {
 		)
 
 		const li = editor.view.dom.querySelector("li")
-		expect(li?.classList.contains("diff-overlay-anchor")).toBe(true)
-		expect(li?.querySelector("span.diff-overlay.diff-modified")).not.toBeNull()
+		expect(li?.classList.contains("diff-checkbox-changed")).toBe(true)
+		expect(editor.view.dom.querySelector(".diff-overlay")).toBeNull()
 
 		editor.destroy()
 	})
@@ -288,6 +277,29 @@ describe("DiffDecorations", () => {
 
 		// the widget sits between the surviving halves of the text
 		expect(p?.textContent).toBe("hello cruel world")
+
+		editor.destroy()
+	})
+
+	it("marks relinked text inside its link with the old target", ({
+		expect,
+	}) => {
+		const editor = makeEditor(
+			doc({
+				type: "paragraph",
+				attrs: {
+					diffStatus: DiffStatus.Modified,
+					oldNode: linkParagraph("https://a.test"),
+				},
+				content: linkParagraph("https://b.test").content,
+			}),
+		)
+
+		const spans = editor.view.dom.querySelectorAll("a span.diff-text-added")
+		expect(spans).toHaveLength(1)
+		expect(spans[0]?.textContent).toBe("docs")
+		expect(spans[0]?.getAttribute("data-old-href")).toBe("https://a.test")
+		expect(editor.view.dom.querySelector(".diff-text-removed")).toBeNull()
 
 		editor.destroy()
 	})

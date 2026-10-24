@@ -19,55 +19,38 @@ func allToolNames() []Name {
 	return []Name{
 		NameListDocuments,
 		NameGetDocument,
-		NameReadBlock,
 		NameListTags,
 		NameListHooks,
+		NameListVariables,
 		NameSearchDocuments,
 		NameListDataSources,
-		NameGetPrometheusMetadata,
-		NameListPrometheusLabelNames,
-		NameListPrometheusLabelValues,
+		NameGetDataSourceMetadata,
+		NameListPrometheusLabels,
 		NameListPrometheusSeries,
-		NameQueryPrometheus,
-		NameGetSQLMetadata,
-		NameGetSQLQueryLabels,
-		NameQuerySQL,
+		NameQueryDataSource,
 		NameCreateDocument,
 		NameDeleteDocument,
 		NameUpdateDocument,
-		NameInsertBlock,
-		NameReplaceBlock,
-		NameUpdateBlockText,
-		NameUpdateBlockAttrs,
+		NameInsertBlocks,
+		NameReplaceBlocks,
 		NameDeleteBlock,
 		NameMoveBlock,
 		NameCreateTag,
 		NameUpdateTag,
 		NameDeleteTag,
-		NameAssignTag,
-		NameUnassignTag,
-		NameMoveTag,
+		NameSetTagAssignment,
+		NameCreateVariableGroup,
+		NameUpdateVariableGroup,
+		NameDeleteVariableGroup,
+		NameCreateVariable,
+		NameUpdateVariable,
+		NameDeleteVariable,
+		NameSetVariableValue,
 		NameCreateHook,
 		NameUpdateHook,
-		NameResetHook,
 		NameDeleteHook,
 		NameReadToolOutput,
 	}
-}
-
-// adapter returns the eino adapter underneath a registry entry, gated
-// or not, so a test can reach the tool the registry wrapped.
-func adapter(t *testing.T, it registryTool) *einoTool {
-	t.Helper()
-
-	if c, ok := it.(*confirming); ok {
-		return c.einoTool
-	}
-
-	et, ok := it.(*einoTool)
-	require.True(t, ok, "the registry holds an unexpected %T", it)
-
-	return et
 }
 
 func Test_New(t *testing.T) {
@@ -88,17 +71,28 @@ func Test_New(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, string(name), info.Name)
 
-		tl := adapter(t, it).tl
-		tr := tl.Traits()
+		// the eino adapter sits under the gate when there is one.
+		et, ok := it.(*einoTool)
+		if c, gated := it.(*confirming); gated {
+			et, ok = c.einoTool, true
+		}
+
+		require.True(t, ok, "the registry holds an unexpected %T", it)
+
+		tl := et.tl
+		tr := tl.Info().Traits
 
 		// a write has to describe what it proposes, and nothing else
-		// has anything to propose. Every tool satisfies the interface,
-		// so this asks what a compiler cannot: that the summary is
-		// actually there.
-		sum, serr := tl.Summary(testInput(testDeps(stubDocumentDB(), nil, nil), name, requiredArgs(t, name)))
-		require.NoError(t, serr)
-		assert.Equal(t, tr.Write, sum.Summary != "",
-			"%s declares Write=%v but Summary=%q", name, tr.Write, sum.Summary)
+		// has anything to propose: this asks what a compiler cannot,
+		// that every write's summary is actually there.
+		s, summarizes := tl.(summarizer)
+		require.Equal(t, tr.Write, summarizes, "%s declares Write=%v but summarizer=%v", name, tr.Write, summarizes)
+
+		if summarizes {
+			sum, serr := s.Summary(testDeps(stubContentDB(nil), nil, nil).newInput(context.Background(), name, json.RawMessage(requiredArgs(t, name))))
+			require.NoError(t, serr)
+			assert.NotEmpty(t, sum.Summary, "%s has an empty summary", name)
+		}
 
 		// a destructive tool is a write first; nothing else can be
 		// destructive.
@@ -149,14 +143,32 @@ func Test_Set_Entries(t *testing.T) {
 	entries := s.Entries()
 	require.Len(t, entries, len(allToolNames()))
 
-	destructive := []Name{NameDeleteDocument, NameDeleteBlock, NameDeleteTag, NameDeleteHook}
+	overwrites := []Name{
+		NameReplaceBlocks,
+		NameUpdateVariable,
+		NameUpdateHook,
+	}
+
+	idempotent := []Name{
+		NameUpdateDocument,
+		NameUpdateTag,
+		NameSetTagAssignment,
+		NameUpdateVariableGroup,
+		NameUpdateVariable,
+		NameSetVariableValue,
+	}
+
+	destructive := []Name{
+		NameDeleteDocument,
+		NameDeleteBlock,
+		NameDeleteTag,
+		NameDeleteVariableGroup,
+		NameDeleteVariable,
+		NameDeleteHook,
+	}
 
 	for i, e := range entries {
-		assert.Equal(t, allToolNames()[i], e.Name)
-
-		// the entry carries the tool's own description, so a surface
-		// outside this package never has to ask the tool for it.
-		assert.Equal(t, e.Name, e.Info.Name)
+		assert.Equal(t, allToolNames()[i], e.Info.Name)
 
 		// every model-facing string follows the rules a description keeps
 		// on both surfaces: it says nothing about a confirmation flow,
@@ -192,26 +204,29 @@ func Test_Set_Entries(t *testing.T) {
 		walk(e.Info.Properties, "")
 
 		for path, text := range texts {
-			assert.NotEmpty(t, text, "%s: %s has no description", e.Name, path)
+			assert.NotEmpty(t, text, "%s: %s has no description", e.Info.Name, path)
 
 			for _, banned := range []string{"confirm", "approv", "\u2014", "organization"} {
-				assert.NotContains(t, strings.ToLower(text), banned, "%s: %s", e.Name, path)
+				assert.NotContains(t, strings.ToLower(text), banned, "%s: %s", e.Info.Name, path)
 			}
 		}
 
 		// the entry carries the tool without its confirmation gate,
 		// while the registry keeps the gated one for the chat loop.
 		_, gated := e.Tool.(*confirming)
-		assert.False(t, gated, "%s entry must be ungated", e.Name)
+		assert.False(t, gated, "%s entry must be ungated", e.Info.Name)
 
-		assert.Equal(t, slices.Contains(s.WriteNames(), string(e.Name)), e.Write, "%s write flag", e.Name)
-		assert.Equal(t, slices.Contains(destructive, e.Name), e.Destructive, "%s destructive flag", e.Name)
-		assert.Equal(t, e.Name == NameReadToolOutput, e.Internal, "%s internal flag", e.Name)
+		tr := e.Info.Traits
+		assert.Equal(t, slices.Contains(s.WriteNames(), string(e.Info.Name)), tr.Write, "%s write flag", e.Info.Name)
+		assert.Equal(t, slices.Contains(destructive, e.Info.Name), tr.Destructive, "%s destructive flag", e.Info.Name)
+		assert.Equal(t, slices.Contains(overwrites, e.Info.Name), tr.Overwrites, "%s overwrites flag", e.Info.Name)
+		assert.Equal(t, slices.Contains(idempotent, e.Info.Name), tr.Idempotent, "%s idempotent flag", e.Info.Name)
+		assert.Equal(t, e.Info.Name == NameReadToolOutput, tr.Internal, "%s internal flag", e.Info.Name)
 	}
 
 	// mutating the returned slice must not affect the registry.
-	entries[0].Name = "clobbered"
-	assert.Equal(t, allToolNames()[0], s.Entries()[0].Name)
+	entries[0].Info.Name = "clobbered"
+	assert.Equal(t, allToolNames()[0], s.Entries()[0].Info.Name)
 }
 
 func Test_Set_Entry(t *testing.T) {
@@ -258,10 +273,10 @@ func Test_Set_Entry(t *testing.T) {
 				return
 			}
 
-			assert.Equal(t, c.Result, e.Name)
+			assert.Equal(t, c.Result, e.Info.Name)
 
 			_, gated := e.Tool.(*confirming)
-			assert.False(t, gated, "%s entry must be ungated", e.Name)
+			assert.False(t, gated, "%s entry must be ungated", e.Info.Name)
 		})
 	}
 }
@@ -279,21 +294,23 @@ func Test_Set_WriteNames(t *testing.T) {
 		string(NameCreateDocument),
 		string(NameDeleteDocument),
 		string(NameUpdateDocument),
-		string(NameInsertBlock),
-		string(NameReplaceBlock),
-		string(NameUpdateBlockText),
-		string(NameUpdateBlockAttrs),
+		string(NameInsertBlocks),
+		string(NameReplaceBlocks),
 		string(NameDeleteBlock),
 		string(NameMoveBlock),
 		string(NameCreateTag),
 		string(NameUpdateTag),
 		string(NameDeleteTag),
-		string(NameAssignTag),
-		string(NameUnassignTag),
-		string(NameMoveTag),
+		string(NameSetTagAssignment),
+		string(NameCreateVariableGroup),
+		string(NameUpdateVariableGroup),
+		string(NameDeleteVariableGroup),
+		string(NameCreateVariable),
+		string(NameUpdateVariable),
+		string(NameDeleteVariable),
+		string(NameSetVariableValue),
 		string(NameCreateHook),
 		string(NameUpdateHook),
-		string(NameResetHook),
 		string(NameDeleteHook),
 	}, got)
 
@@ -303,14 +320,42 @@ func Test_Set_WriteNames(t *testing.T) {
 	assert.NotContains(t, s.WriteNames(), "clobbered")
 }
 
+func Test_Set_Grouped(t *testing.T) {
+	t.Parallel()
+
+	s := New(testDeps(nil, nil, nil))
+
+	got := map[Group][]Name{}
+
+	for g, tls := range s.Grouped() {
+		for _, tl := range tls {
+			info, err := tl.Info(context.Background())
+			require.NoError(t, err)
+
+			got[g] = append(got[g], Name(info.Name))
+		}
+	}
+
+	// document and block tools stay out of every group: each
+	// conversation needs them from its first call.
+	assert.Equal(t, map[Group][]Name{
+		GroupTags:        {NameListTags, NameCreateTag, NameUpdateTag, NameDeleteTag, NameSetTagAssignment},
+		GroupVariables:   {NameListVariables, NameCreateVariableGroup, NameUpdateVariableGroup, NameDeleteVariableGroup, NameCreateVariable, NameUpdateVariable, NameDeleteVariable, NameSetVariableValue},
+		GroupHooks:       {NameListHooks, NameCreateHook, NameUpdateHook, NameDeleteHook},
+		GroupDataSources: {NameListDataSources, NameGetDataSourceMetadata, NameListPrometheusLabels, NameListPrometheusSeries, NameQueryDataSource},
+	}, got)
+}
+
 func Test_Set_Label(t *testing.T) {
 	t.Parallel()
 
 	cc := map[string]struct {
-		DB     *DBMock
-		Name   Name
-		Args   string
-		Result string
+		DB             *DBMock
+		Name           Name
+		Args           string
+		Result         string
+		BranchFetches  int
+		TagTreeFetches int
 	}{
 		"Unknown name is not an error": {
 			Name: "not_a_tool",
@@ -321,21 +366,26 @@ func Test_Set_Label(t *testing.T) {
 			Args: `{}`,
 		},
 		"Read names the document": {
-			Name:   NameGetDocument,
-			Args:   `{` + targetArgs(_stubMainBranchID) + `}`,
-			Result: "Reading Runbook",
+			Name:          NameGetDocument,
+			Args:          `{` + targetArgs(_stubMainBranchID) + `}`,
+			Result:        "Reading Runbook",
+			BranchFetches: 1,
 		},
-		"Write names the document": {
-			Name:   NameUpdateBlockText,
-			Args:   `{` + targetArgs(_stubMainBranchID) + `,"block_uid":"b","text":"t"}`,
-			Result: "Updating Runbook",
+		// a write is announced by the summary its approval card shows.
+		"Write is announced by its summary": {
+			DB:            stubContentDB(nil),
+			Name:          NameReplaceBlocks,
+			Args:          `{` + targetArgs(_stubMainBranchID) + `,"block_uid":"a","content":"<p>t</p>"}`,
+			Result:        "Replace a block in Runbook with 1 block",
+			BranchFetches: 1,
 		},
-		"Tag write names the tag": {
-			Name:   NameDeleteTag,
-			Args:   `{"tag_id":"` + _testTagID.String() + `"}`,
-			Result: "Deleting tag Production",
+		"Tag write is announced by its summary": {
+			Name:           NameDeleteTag,
+			Args:           `{"tag_id":"` + _testTagID.String() + `"}`,
+			Result:         "Delete tag Production and take it off the 1 page carrying it",
+			TagTreeFetches: 1,
 		},
-		"Unresolvable document is not announced": {
+		"Error returned by db.FetchDocumentByBranchID": {
 			DB: &DBMock{
 				FetchDocumentFunc: func(context.Context, xid.ID, string, string) (*document.Document, error) {
 					return nil, assert.AnError
@@ -344,8 +394,9 @@ func Test_Set_Label(t *testing.T) {
 					return nil, assert.AnError
 				},
 			},
-			Name: NameGetDocument,
-			Args: `{` + targetArgs(_stubMainBranchID) + `}`,
+			Name:          NameGetDocument,
+			Args:          `{` + targetArgs(_stubMainBranchID) + `}`,
+			BranchFetches: 1,
 		},
 		"Malformed arguments are not announced": {
 			// the call is about to fail on these same arguments, and
@@ -372,6 +423,10 @@ func Test_Set_Label(t *testing.T) {
 
 			got := s.Label(context.Background(), c.Name, json.RawMessage(c.Args))
 			assert.Equal(t, c.Result, got)
+
+			assert.Len(t, db.FetchDocumentByBranchIDCalls(), c.BranchFetches)
+			assert.Empty(t, db.FetchDocumentBranchesCalls())
+			assert.Len(t, db.FetchTagTreeCalls(), c.TagTreeFetches)
 		})
 	}
 }

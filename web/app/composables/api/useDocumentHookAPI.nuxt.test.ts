@@ -45,13 +45,15 @@ function makeDocumentHookAPI() {
 function makeHook(id: string): DocumentHook {
 	return {
 		id,
+		crossBranchId: id,
 		type: DocumentHookType.GitHubTracking,
 		documentId: DOC_ID,
 		organizationId: ORG_ID,
 		branchId: BRANCH_ID,
 		blockId: "block1",
 		settings: { repository: "acme/docs", branch: "main", paths: ["a.md"] },
-		state: { pathsChecksums: { "a.md": "sum-a" }, status: "missing_branch" },
+		state: { pathsChecksums: { "a.md": "sum-a" } },
+		status: "missing_branch",
 		score: "100",
 		createdAt: "2024-01-01T00:00:00.000Z",
 		updatedAt: "2024-01-01T00:00:00.000Z",
@@ -202,17 +204,22 @@ describe("useDocumentHookAPI", { concurrent: false }, () => {
 			})
 			await create.reached
 
-			// the optimistic insert stamps a nanoid id and fresh dates
+			// the optimistic insert stamps a nanoid id and fresh dates. A new
+			// hook is its own across branches
+			const [inserted] = getHooks() as DocumentHook[]
+			expect(inserted?.crossBranchId).toBe(inserted?.id)
 			expect(getHooks()).toEqual([
 				{
 					id: ANY_STRING,
+					crossBranchId: ANY_STRING,
 					type: DocumentHookType.GitHubTracking,
 					documentId: DOC_ID,
 					branchId: BRANCH_ID,
 					organizationId: ORG_ID,
 					blockId: "block1",
 					settings: CREATE_REQ.settings,
-					state: { pathsChecksums: {}, status: "active" },
+					state: { pathsChecksums: {} },
+					status: "active",
 					score: "100",
 					createdAt: ANY_DATE,
 					updatedAt: ANY_DATE,
@@ -613,7 +620,8 @@ describe("useDocumentHookAPI", { concurrent: false }, () => {
 		}) => {
 			const resetHook = {
 				...makeHook(HOOK_ID),
-				state: { pathsChecksums: {}, status: "active" },
+				state: { pathsChecksums: {} },
+				status: "active",
 			}
 			const serverHooks = [resetHook, makeHook(OTHER_HOOK_ID)]
 
@@ -637,7 +645,8 @@ describe("useDocumentHookAPI", { concurrent: false }, () => {
 			expect(getHooks()).toEqual([
 				{
 					...makeHook(HOOK_ID),
-					state: { pathsChecksums: {}, status: "active" },
+					state: { pathsChecksums: {} },
+					status: "active",
 					updatedAt: ANY_DATE,
 				},
 				makeHook(OTHER_HOOK_ID),

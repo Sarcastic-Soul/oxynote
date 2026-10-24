@@ -1,8 +1,10 @@
 <script lang="ts" setup>
 import { nodeViewProps, NodeViewWrapper } from "@tiptap/vue-3"
 import { computePosition, flip, offset, shift } from "@floating-ui/dom"
-import { cn } from "~/lib/utils"
+import { cn } from "#layers/ui/app/lib/utils"
 import { DiffStatus } from "~/components/editor/diff/position-map"
+import DiffChangeMarker from "~/components/editor/diff/DiffChangeMarker.vue"
+import FigmaDiffDetails from "./FigmaDiffDetails.vue"
 import { isFigmaUrl, convertToEmbedUrl } from "./index"
 
 const props = defineProps(nodeViewProps)
@@ -35,8 +37,6 @@ const diffClass = computed(() => {
 			return "diff-added"
 		case DiffStatus.Removed:
 			return "diff-removed"
-		case DiffStatus.Modified:
-			return "diff-modified"
 		default:
 			return null
 	}
@@ -263,6 +263,9 @@ onBeforeUnmount(() => {
 				:style="{ height: `${displayHeight}px` }"
 				allowfullscreen
 			/>
+			<DiffChangeMarker :node="props.node" class="absolute top-1.5 right-1.5">
+				<FigmaDiffDetails :node="props.node" />
+			</DiffChangeMarker>
 			<div
 				v-if="!isEditingDisabled"
 				aria-hidden="true"
@@ -291,7 +294,13 @@ onBeforeUnmount(() => {
 			"
 			@click="openPopover"
 		>
-			<Icon name="simple-icons:figma" class="size-4.5 text-foreground" />
+			<Icon :name="BLOCK_ICONS.figmaBlock" class="size-4.5 text-foreground" />
+			<DiffChangeMarker
+				:node="props.node"
+				class="absolute top-1/2 right-2 -translate-y-1/2"
+			>
+				<FigmaDiffDetails :node="props.node" />
+			</DiffChangeMarker>
 			<span class="mt-0.25 text-2sm text-muted-foreground">
 				{{
 					isEditingDisabled

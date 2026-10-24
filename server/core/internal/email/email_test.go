@@ -25,11 +25,24 @@ func Test_NewSender(t *testing.T) {
 		NilClient bool
 		Err       error
 	}{
-		"Error returned by invalid port": {
+		"Error returned by url.Parse": {
 			Cfg: Config{
-				Host: "localhost",
-				Port: "not-a-port",
-				TLS:  TLSModeNone,
+				PublicURL: "::not-a-url",
+			},
+			Err: assert.AnError,
+		},
+		"Public url without a host": {
+			Cfg: Config{
+				PublicURL: "/core",
+			},
+			Err: assert.AnError,
+		},
+		"Error returned by strconv.Atoi": {
+			Cfg: Config{
+				Host:      "localhost",
+				Port:      "not-a-port",
+				TLS:       TLSModeNone,
+				PublicURL: "https://notes.example.com/core",
 			},
 			Err: assert.AnError,
 		},
@@ -38,22 +51,25 @@ func Test_NewSender(t *testing.T) {
 				Host: "localhost",
 				// out of the valid port range, so the client option
 				// fails inside mail.NewClient rather than in Atoi.
-				Port: "99999",
-				TLS:  TLSModeNone,
+				Port:      "99999",
+				TLS:       TLSModeNone,
+				PublicURL: "https://notes.example.com/core",
 			},
 			Err: assert.AnError,
 		},
-		"Error returned by invalid tls mode": {
+		"Invalid tls mode": {
 			Cfg: Config{
-				Host: "localhost",
-				Port: "1025",
-				TLS:  "ssl3",
+				Host:      "localhost",
+				Port:      "1025",
+				TLS:       "ssl3",
+				PublicURL: "https://notes.example.com/core",
 			},
 			Err: assert.AnError,
 		},
 		"Successful creation without a host": {
 			Cfg: Config{
 				FromAddress: "Oxynote <team@oxynote.io>",
+				PublicURL:   "https://notes.example.com/core",
 			},
 			NilClient: true,
 		},
@@ -63,6 +79,7 @@ func Test_NewSender(t *testing.T) {
 				Port:        "1025",
 				TLS:         TLSModeNone,
 				FromAddress: "Oxynote <team@oxynote.io>",
+				PublicURL:   "https://notes.example.com/core",
 			},
 		},
 		"Successful creation with starttls config and auth": {
@@ -73,6 +90,7 @@ func Test_NewSender(t *testing.T) {
 				Password:    "pass",
 				TLS:         TLSModeStartTLS,
 				FromAddress: "team@oxynote.io",
+				PublicURL:   "https://notes.example.com/core",
 			},
 		},
 		"Successful creation with implicit tls config": {
@@ -81,6 +99,7 @@ func Test_NewSender(t *testing.T) {
 				Port:        "465",
 				TLS:         TLSModeTLS,
 				FromAddress: "team@oxynote.io",
+				PublicURL:   "https://notes.example.com/core",
 			},
 		},
 	}
@@ -102,6 +121,7 @@ func Test_NewSender(t *testing.T) {
 			assert.Equal(t, log, sender.log)
 			assert.NotNil(t, sender.backoffStrategy)
 			assert.Equal(t, c.Cfg.FromAddress, sender.fromEmail)
+			assert.Equal(t, "notes.example.com", sender.publicHost)
 
 			if c.NilClient {
 				assert.Nil(t, sender.client)
@@ -135,14 +155,14 @@ func Test_Sender_send(t *testing.T) {
 			Template:    Template("nonexistent"),
 			LogContains: "cannot render email template",
 		},
-		"Invalid from address": {
+		"Error returned by msg.From": {
 			Client:      &clientMock{},
 			To:          "user@example.com",
 			Template:    TemplatePasswordReset,
 			Args:        map[string]string{"link": "https://example.com/reset"},
 			LogContains: "cannot set email from address",
 		},
-		"Invalid recipient address": {
+		"Error returned by msg.To": {
 			Client:      &clientMock{},
 			From:        "team@oxynote.io",
 			Template:    TemplatePasswordReset,
@@ -221,119 +241,113 @@ func Test_Sender_send(t *testing.T) {
 	}
 }
 
-func Test_Sender_SendEmailVerification(t *testing.T) {
-	t.Parallel()
+func Test_Sender_Send(t *testing.T) {
+	cc := map[string]struct {
+		Template Template
+		Data     Data
+		Subject  string
+		Contains []string
+		Err      error
+	}{
+		"Error returned by tmpl.Validate": {
+			Template: Template("nonexistent"),
+			Data:     Data{Email: "user@example.com"},
+			Err:      ErrInvalidTemplate,
+		},
+		"Email verification": {
+			Template: TemplateEmailVerification,
+			Data:     Data{Email: "user@example.com", Link: "https://example.com/verify"},
+			Subject:  "Verify your new email address",
+			Contains: []string{"https://example.com/verify"},
+		},
+		"Email change confirmation": {
+			Template: TemplateEmailChangeConfirmation,
+			Data:     Data{Email: "user@example.com", Link: "https://example.com/approve"},
+			Subject:  "Approve your email address change",
+			Contains: []string{"https://example.com/approve"},
+		},
+		"Organization invitation": {
+			Template: TemplateOrganizationInvitation,
+			Data:     Data{Email: "user@example.com", Organization: "Acme", Link: "https://example.com/join"},
+			Subject:  "You're invited to the Acme workspace",
+			Contains: []string{"https://example.com/join", "Acme", "Sent by Oxynote at notes.example.com"},
+		},
+		"User deletion confirmation": {
+			Template: TemplateUserDeletion,
+			Data:     Data{Email: "user@example.com", Link: "https://example.com/delete"},
+			Subject:  "Confirm your account deletion",
+			Contains: []string{"https://example.com/delete"},
+		},
+		"Password reset": {
+			Template: TemplatePasswordReset,
+			Data:     Data{Email: "user@example.com", Link: "https://example.com/reset"},
+			Subject:  "Reset your password",
+			Contains: []string{"https://example.com/reset"},
+		},
+		"Signup verification": {
+			Template: TemplateSignupVerification,
+			Data:     Data{Email: "user@example.com", Link: "https://example.com/activate"},
+			Subject:  "Confirm your email address",
+			Contains: []string{"https://example.com/activate"},
+		},
+		"Account exists": {
+			Template: TemplateAccountExists,
+			Data:     Data{Email: "user@example.com", Link: "https://example.com/login"},
+			Subject:  "You already have an Oxynote account",
+			Contains: []string{"https://example.com/login"},
+		},
+	}
 
-	client := &clientMock{}
-	s := stubSender(client)
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
 
-	s.SendEmailVerification("user@example.com", "https://example.com/verify")
+			client := &clientMock{}
+			s := &Sender{
+				log:             slog.New(slog.DiscardHandler),
+				client:          client,
+				backoffStrategy: func() backoff.BackOff { return &backoff.ZeroBackOff{} },
+				supv:            xync.NewSupervisor(),
+				fromEmail:       "Oxynote <team@oxynote.io>",
+				publicHost:      "notes.example.com",
+			}
 
-	s.supv.Wait()
+			err := s.Send(c.Template, c.Data)
 
-	msg := sentMsg(t, client)
-	assert.Equal(t, "user@example.com", msgTo(t, msg))
-	assert.Equal(t, []string{"Verify your new email address"}, msg.GetGenHeader(mail.HeaderSubject))
-	assert.Contains(t, msgBody(t, msg), "https://example.com/verify")
-}
+			s.supv.Wait()
 
-func Test_Sender_SendEmailChangeConfirmation(t *testing.T) {
-	t.Parallel()
+			testutil.AssertEqualError(t, c.Err, err)
 
-	client := &clientMock{}
-	s := stubSender(client)
+			if err != nil {
+				assert.Empty(t, client.DialAndSendWithContextCalls())
 
-	s.SendEmailChangeConfirmation("user@example.com", "https://example.com/approve")
+				return
+			}
 
-	s.supv.Wait()
+			ff := client.DialAndSendWithContextCalls()
+			require.Len(t, ff, 1)
+			require.Len(t, ff[0].Msgs, 1)
 
-	msg := sentMsg(t, client)
-	assert.Equal(t, "user@example.com", msgTo(t, msg))
-	assert.Equal(t, []string{"Approve your email address change"}, msg.GetGenHeader(mail.HeaderSubject))
-	assert.Contains(t, msgBody(t, msg), "https://example.com/approve")
-}
+			msg := ff[0].Msgs[0]
 
-func Test_Sender_SendOrganizationInvitation(t *testing.T) {
-	t.Parallel()
+			addrs := msg.GetTo()
+			require.Len(t, addrs, 1)
+			assert.Equal(t, c.Data.Email, addrs[0].Address)
+			assert.Equal(t, []string{c.Subject}, msg.GetGenHeader(mail.HeaderSubject))
 
-	client := &clientMock{}
-	s := stubSender(client)
+			// the first part holds the rendered HTML body before any
+			// transfer encoding is applied.
+			parts := msg.GetParts()
+			require.NotEmpty(t, parts)
 
-	s.SendOrganizationInvitation("user@example.com", "Acme", "https://example.com/join")
+			body, err := parts[0].GetContent()
+			require.NoError(t, err)
 
-	s.supv.Wait()
-
-	msg := sentMsg(t, client)
-	assert.Equal(t, "user@example.com", msgTo(t, msg))
-	assert.Equal(t, []string{"Join Acme on Oxynote"}, msg.GetGenHeader(mail.HeaderSubject))
-
-	body := msgBody(t, msg)
-	assert.Contains(t, body, "https://example.com/join")
-	assert.Contains(t, body, "Acme")
-}
-
-func Test_Sender_SendUserDeletionConfirmation(t *testing.T) {
-	t.Parallel()
-
-	client := &clientMock{}
-	s := stubSender(client)
-
-	s.SendUserDeletionConfirmation("user@example.com", "https://example.com/delete")
-
-	s.supv.Wait()
-
-	msg := sentMsg(t, client)
-	assert.Equal(t, "user@example.com", msgTo(t, msg))
-	assert.Equal(t, []string{"Confirm your account deletion"}, msg.GetGenHeader(mail.HeaderSubject))
-	assert.Contains(t, msgBody(t, msg), "https://example.com/delete")
-}
-
-func Test_Sender_SendPasswordReset(t *testing.T) {
-	t.Parallel()
-
-	client := &clientMock{}
-	s := stubSender(client)
-
-	s.SendPasswordReset("user@example.com", "https://example.com/reset")
-
-	s.supv.Wait()
-
-	msg := sentMsg(t, client)
-	assert.Equal(t, "user@example.com", msgTo(t, msg))
-	assert.Equal(t, []string{"Reset your password"}, msg.GetGenHeader(mail.HeaderSubject))
-	assert.Contains(t, msgBody(t, msg), "https://example.com/reset")
-}
-
-func Test_Sender_SendSignupVerification(t *testing.T) {
-	t.Parallel()
-
-	client := &clientMock{}
-	s := stubSender(client)
-
-	s.SendSignupVerification("user@example.com", "https://example.com/activate")
-
-	s.supv.Wait()
-
-	msg := sentMsg(t, client)
-	assert.Equal(t, "user@example.com", msgTo(t, msg))
-	assert.Equal(t, []string{"Confirm your email address"}, msg.GetGenHeader(mail.HeaderSubject))
-	assert.Contains(t, msgBody(t, msg), "https://example.com/activate")
-}
-
-func Test_Sender_SendAccountExists(t *testing.T) {
-	t.Parallel()
-
-	client := &clientMock{}
-	s := stubSender(client)
-
-	s.SendAccountExists("user@example.com", "https://example.com/login")
-
-	s.supv.Wait()
-
-	msg := sentMsg(t, client)
-	assert.Equal(t, "user@example.com", msgTo(t, msg))
-	assert.Equal(t, []string{"You already have an Oxynote account"}, msg.GetGenHeader(mail.HeaderSubject))
-	assert.Contains(t, msgBody(t, msg), "https://example.com/login")
+			for _, sub := range c.Contains {
+				assert.Contains(t, string(body), sub)
+			}
+		})
+	}
 }
 
 func Test_Sender_Close(t *testing.T) {
@@ -348,60 +362,20 @@ func Test_Sender_Close(t *testing.T) {
 			return nil
 		},
 	}
-	s := stubSender(client)
+	s := &Sender{
+		log:             slog.New(slog.DiscardHandler),
+		client:          client,
+		backoffStrategy: func() backoff.BackOff { return &backoff.ZeroBackOff{} },
+		supv:            xync.NewSupervisor(),
+		fromEmail:       "Oxynote <team@oxynote.io>",
+		publicHost:      "notes.example.com",
+	}
 
-	s.SendPasswordReset("user@example.com", "https://example.com/reset")
-
+	require.NoError(t, s.Send(TemplatePasswordReset, Data{Email: "user@example.com", Link: "https://example.com/reset"}))
 	require.NoError(t, s.Close())
 
 	// Close must drain the in-flight delivery before cancelling the
 	// supervisor context, so the send observed a live context.
 	require.Len(t, client.DialAndSendWithContextCalls(), 1)
 	assert.NoError(t, ctxErr)
-}
-
-// stubSender creates a sender backed by the provided mocked client.
-func stubSender(client *clientMock) *Sender {
-	return &Sender{
-		log:             slog.New(slog.DiscardHandler),
-		client:          client,
-		backoffStrategy: func() backoff.BackOff { return &backoff.ZeroBackOff{} },
-		supv:            xync.NewSupervisor(),
-		fromEmail:       "Oxynote <team@oxynote.io>",
-	}
-}
-
-// sentMsg extracts the single message passed to the mocked client.
-func sentMsg(t *testing.T, client *clientMock) *mail.Msg {
-	t.Helper()
-
-	ff := client.DialAndSendWithContextCalls()
-	require.Len(t, ff, 1)
-	require.Len(t, ff[0].Msgs, 1)
-
-	return ff[0].Msgs[0]
-}
-
-// msgTo extracts the single recipient address of the message.
-func msgTo(t *testing.T, msg *mail.Msg) string {
-	t.Helper()
-
-	addrs := msg.GetTo()
-	require.Len(t, addrs, 1)
-
-	return addrs[0].Address
-}
-
-// msgBody extracts the rendered HTML body of the message before any
-// transfer encoding is applied.
-func msgBody(t *testing.T, msg *mail.Msg) string {
-	t.Helper()
-
-	parts := msg.GetParts()
-	require.NotEmpty(t, parts)
-
-	body, err := parts[0].GetContent()
-	require.NoError(t, err)
-
-	return string(body)
 }

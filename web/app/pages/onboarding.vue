@@ -3,8 +3,8 @@ import { toTypedSchema } from "@vee-validate/zod"
 import { useForm } from "vee-validate"
 import * as z from "zod"
 // for some reason this isn't auto imported
-import { FormField as ShadcnUiFormField } from "@/components/shadcn/ui/form"
-import { cn } from "~/lib/utils"
+import { FormField as ShadcnUiFormField } from "#layers/ui/app/components/shadcn/ui/form"
+import { cn } from "#layers/ui/app/lib/utils"
 import { showToastMessage } from "~/components/toast"
 
 definePageMeta({
@@ -25,7 +25,7 @@ const formSchema = toTypedSchema(
 			.trim()
 			.min(2)
 			.max(50)
-			.regex(/^[a-zA-Z0-9-_]+$/, {
+			.regex(/^[a-zA-Z0-9-_ ]+$/, {
 				message: t("onboarding.welcome.errors.workspace-name-regex"),
 			}),
 		workspaceSlug: z
@@ -88,7 +88,6 @@ const onSubmit = form.handleSubmit(async (values) => {
 	const { data: orgData, error: orgError } = (await createOrganization({
 		name: values.workspaceName,
 		slug: values.workspaceSlug,
-		logo: "https://example.com/logo.png", // TODO allow uploading logo later
 	})) as AuthResponse & { data: { id: string; slug: string } }
 	if (orgError) {
 		// reset only on error so that the loading spinner shows while

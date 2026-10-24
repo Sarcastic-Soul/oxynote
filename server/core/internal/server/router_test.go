@@ -1,6 +1,7 @@
 package server
 
 import (
+	"log/slog"
 	"net/http"
 	"testing"
 
@@ -23,7 +24,7 @@ func Test_Server_httpRouter(t *testing.T) {
 	t.Parallel()
 
 	s := &Server{
-		log: discardLog(),
+		log: slog.New(slog.DiscardHandler),
 		fc:  metricutil.NewFactory("test", prometheus.NewRegistry()),
 	}
 
@@ -77,6 +78,11 @@ func Test_Server_httpRouter(t *testing.T) {
 	// the capability signal lives on the session-authed surface (the "/"
 	// mount walks as "*").
 	assert.True(t, routes["GET /api/*/capabilities"])
+
+	// MCP is off while its handler is nil, so nothing is mounted for it.
+	for route := range routes {
+		assert.NotContains(t, route, "/api/mcp")
+	}
 
 	// the service-to-service surface stays where it is.
 	assert.True(t, routes["POST /api/x/organizations/{organizationId}/teardown"])

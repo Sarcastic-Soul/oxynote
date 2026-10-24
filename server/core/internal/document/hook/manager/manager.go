@@ -12,9 +12,12 @@ import (
 	"github.com/oxynote/oxynote/server/core/internal/apps/webchange"
 	"github.com/oxynote/oxynote/server/core/internal/document"
 	"github.com/oxynote/oxynote/server/core/internal/document/hook"
+	"github.com/oxynote/oxynote/server/core/internal/document/hook/processor"
 	"github.com/oxynote/oxynote/server/core/internal/notification"
 	"github.com/oxynote/oxynote/server/core/pkg/errutil"
 	"github.com/oxynote/oxynote/server/core/pkg/logutil"
+	"github.com/oxynote/oxynote/server/core/pkg/sqlutil"
+	"github.com/oxynote/oxynote/server/core/pkg/syncutil"
 	"github.com/oxynote/oxynote/server/core/pkg/timeutil"
 	"github.com/rs/xid"
 )
@@ -28,21 +31,35 @@ const (
 
 	// _hookRetentionDuration defines how long to retain inactive hooks.
 	_hookRetentionDuration = time.Hour * 24
+
+	// _hookTimeout bounds one hook write or run, and with it how long the
+	// hook's lock is held.
+	_hookTimeout = time.Second * 30
+
+	// _teardownTimeout bounds tearing down a resource whose row was not
+	// stored. It runs on its own clock, since the write's may be spent.
+	_teardownTimeout = time.Second * 10
 )
 
 // Manager manages document freshness hooks.
 type Manager struct {
 	log             *slog.Logger
 	db              DB
+	flusher         Flusher
 	githubMan       *github.Manager
 	webchangeClient *webchange.Client
 	notifPub        notification.Publisher
+	changeCallback  func(hook.Hook)
+
+	// hookMu holds one lock per hook, taken by every write and run of it.
+	hookMu *syncutil.KeyedMutex[xid.ID]
 }
 
 // NewManager creates a new Manager with the given database interface.
 func NewManager(
 	log *slog.Logger,
 	db DB,
+	flusher Flusher,
 	githubMan *github.Manager,
 	webchangeClient *webchange.Client,
 	notifPub notification.Publisher,
@@ -50,13 +67,23 @@ func NewManager(
 	return &Manager{
 		log:             log.With("component", "document-hooks-manager"),
 		db:              db,
+		flusher:         flusher,
 		githubMan:       githubMan,
 		webchangeClient: webchangeClient,
 		notifPub:        notifPub,
+		changeCallback:  func(hook.Hook) {},
+		hookMu:          syncutil.NewKeyedMutex[xid.ID](),
 	}
 }
 
-// Start begins the periodic processing of document hooks.
+// BindHookChange sets the function called with every hook the manager
+// stores, changes or deletes. Call it once, before any hook write.
+func (m *Manager) BindHookChange(fn func(hook.Hook)) {
+	m.changeCallback = fn
+}
+
+// Start begins the periodic processing of document hooks. A pass also sets
+// up the hooks a branch operation could not.
 func (m *Manager) Start(ctx context.Context) {
 	m.log.Info("starting")
 	defer m.log.Info("stopped")
@@ -73,6 +100,30 @@ func (m *Manager) Start(ctx context.Context) {
 		logutil.RecoveryValue(m.log, logutil.NewRecoveryPlan("recovered from a panic while processing document hooks")),
 		true,
 	).Start(ctx)
+}
+
+// SetUpBranch sets up the branch's hooks that are not set up yet, such as
+// the copies a branch operation just stored. A hook it cannot set up waits
+// for the next pass.
+func (m *Manager) SetUpBranch(ctx context.Context, branchID xid.ID, organizationID string) {
+	hooks, err := m.db.FetchDocumentHooksByBranchID(ctx, branchID, organizationID)
+	if err != nil {
+		m.log.With("branch_id", branchID).
+			With("error", err).
+			Error("cannot fetch branch hooks")
+
+		return
+	}
+
+	ps := &ProcessingState{
+		Documents: make(map[xid.ID]*document.Document),
+	}
+
+	for _, h := range hooks {
+		if !h.State.Valid {
+			m.processHook(ctx, ps, h)
+		}
+	}
 }
 
 // ProcessingState holds the state during hook processing.
@@ -100,139 +151,92 @@ func (m *Manager) processHooks(ctx context.Context) error {
 		for _, h := range hooks {
 			ps.OffsetID = h.ID
 
-			// The hook was cut loose — its branch, document or whole
-			// organization was deleted, or a merge replaced the branch's
-			// hooks — and the row is the only trace left of it: tear down
-			// the external resource it holds before the row goes away with
-			// the last reference to it.
-			if !h.BranchID.Valid || !h.DocumentID.Valid || !h.OrganizationID.Valid {
-				m.deleteHook(ctx, &h)
-
-				continue
-			}
-
-			if m.skipsUnconfigured(&h) {
-				continue
-			}
-
-			previousScore := h.Score
-
-			ok := m.ensureHook(ctx, ps, &h)
-			if !ok {
-				continue
-			}
-
-			// a soft-deleted hook's block is gone from the document, so its
-			// score describes nothing and a zero-score notification would
-			// point at a block that no longer exists. The mark is still
-			// persisted — it starts the retention clock — and processing
-			// resumes when the block reappears and ensureHook clears it.
-			if h.SoftDeletedAt.Valid {
-				m.updateHook(ctx, h)
-
-				continue
-			}
-
-			err = h.Process(ctx, hook.NewInput(
-				h.OrganizationID.String,
-				m.githubMan,
-				m.webchangeClient,
-			))
-			if err != nil {
-				m.log.With("hook_id", h.ID).
-					With("error", err).
-					Error("processing document hook")
-
-				// a soft-deletion mark ensureHook just cleared for a
-				// reappeared block is persisted even here: leaving it stored
-				// would keep the retention clock running toward deleting a
-				// hook whose block is back.
-				m.updateHook(ctx, h)
-
-				continue
-			}
-
-			// a notification for a score that was not persisted would be
-			// published again on every cycle, since the next one recomputes
-			// the same transition from the same stored score.
-			if !m.updateHook(ctx, h) {
-				continue
-			}
-
-			// the score decays gradually — a scheduled reminder walks down
-			// through 99…1 — so the transition to watch for is the arrival
-			// at zero, not an exact full-to-zero jump within one cycle.
-			if !previousScore.IsZero() && h.Score.IsZero() {
-				m.notifyMaintainers(ctx, h)
-			}
+			m.processHook(ctx, ps, h)
 		}
 
 		if len(hooks) < _processingBatch {
-			break
+			return nil
 		}
 	}
-
-	return nil
 }
 
-// notifyMaintainers tells the document's maintainers that the hook ran out of
-// freshness.
-func (m *Manager) notifyMaintainers(ctx context.Context, h hook.Hook) {
-	maintainers, err := m.db.FetchDocumentMaintainers(ctx, h.DocumentID.V, h.OrganizationID.String)
+// processHook runs one hook, holding its lock. A hook a write holds is
+// waited for, within the hook's timeout.
+func (m *Manager) processHook(ctx context.Context, ps *ProcessingState, h hook.Hook) {
+	ctx, cancel := context.WithTimeout(ctx, _hookTimeout)
+	defer cancel()
+
+	unlock, err := m.hookMu.Lock(ctx, h.ID)
 	if err != nil {
 		m.log.With("hook_id", h.ID).
 			With("error", err).
-			Error("fetching document maintainers for hook notification")
+			Error("cannot lock hook")
 
 		return
 	}
 
-	m.notifPub.PublishNotifications(
-		h.OrganizationID.String,
-		notification.NewDocumentHookTriggeredNotification(
-			h.DocumentID.V,
-			h.Type,
-			h.BlockID,
-			h.BranchID.V,
-		),
-		maintainers...,
-	)
+	defer unlock()
+
+	// re-read the row, since a write may have changed it before the lock.
+	// A hook without an organization cannot be written, so the row read
+	// stands.
+	if h.OrganizationID.Valid {
+		stored, err := m.db.FetchDocumentHook(ctx, h.ID, h.OrganizationID.String)
+		if err != nil {
+			if !errutil.IsNotFound(err) {
+				m.log.With("hook_id", h.ID).
+					With("error", err).
+					Error("cannot fetch document hook")
+			}
+
+			return
+		}
+
+		h = *stored
+	}
+
+	// the branch, document or organization of the hook is gone.
+	gone := !h.BranchID.Valid || !h.DocumentID.Valid || !h.OrganizationID.Valid
+
+	var doc *document.Document
+
+	if !gone {
+		var ok bool
+
+		doc, ok = m.fetchDocument(ctx, ps, h)
+		if !ok {
+			return
+		}
+
+		gone = doc == nil || (h.SoftDeletedAt.Valid && h.SoftDeletedAt.Time.Before(timeutil.Now().Add(-_hookRetentionDuration)))
+	}
+
+	if gone {
+		if m.deleteHook(ctx, h) {
+			m.changeCallback(h)
+		}
+
+		return
+	}
+
+	prev := h
+
+	if !m.runHook(ctx, doc, &h) {
+		m.undoSetup(ctx, prev, h)
+
+		return
+	}
+
+	if h.ChangedFrom(prev) {
+		m.changeCallback(h)
+	}
+
+	m.notifyTransition(ctx, prev, h)
 }
 
-// ensureHook ensures the hook is valid and handles deletions if necessary.
-func (m *Manager) ensureHook(
-	ctx context.Context,
-	state *ProcessingState,
-	h *hook.Hook,
-) bool {
-	key := h.BranchID.V
-
-	doc, ok := state.Documents[key]
-	if !ok {
-		var err error
-
-		doc, err = m.db.FetchDocumentByBranchID(ctx, h.BranchID.V, h.OrganizationID.String)
-
-		switch {
-		case err == nil:
-			state.Documents[key] = doc
-		case errutil.IsNotFound(err):
-			state.Documents[key] = nil
-		default:
-			m.log.With("hook_id", h.ID).
-				With("error", err).
-				Error("fetching document for hook")
-
-			return false
-		}
-	}
-
-	if doc == nil || (h.SoftDeletedAt.Valid && h.SoftDeletedAt.Time.Before(timeutil.Now().Add(-_hookRetentionDuration))) {
-		m.deleteHook(ctx, h)
-
-		return false
-	}
-
+// runHook marks or lifts the hook's soft deletion, processes the hook and
+// stores the result. It reports whether the result was stored.
+func (m *Manager) runHook(ctx context.Context, doc *document.Document, h *hook.Hook) bool {
 	if h.BlockID.Valid {
 		hasBlock := doc.Content.HasBlock(h.BlockID.String)
 
@@ -243,59 +247,18 @@ func (m *Manager) ensureHook(
 		}
 	}
 
-	return true
-}
-
-// skipsUnconfigured reports whether the hook depends on an integration
-// this deployment does not have. Such a hook cannot make progress, so
-// the processing pass skips it and leaves its state untouched.
-func (m *Manager) skipsUnconfigured(h *hook.Hook) bool {
-	switch {
-	case h.Type == hook.TypeGithubTracking && !m.githubMan.Configured():
-		m.log.With("hook_id", h.ID).
-			Warn("skipping github-tracking hook: github app is not configured")
-
-		return true
-	case h.Type == hook.TypeURLWatcher && !m.webchangeClient.Configured():
-		m.log.With("hook_id", h.ID).
-			Warn("skipping url-watcher hook: changedetection is not configured")
-
-		return true
-	default:
-		return false
-	}
-}
-
-// deleteHook tears down the hook's external resource and then removes the
-// row describing it. The external teardown goes first: the row is the only
-// record of the resource, so dropping it first would strand the watcher
-// with nothing left to find it by.
-func (m *Manager) deleteHook(ctx context.Context, h *hook.Hook) {
-	err := h.Delete(ctx, hook.NewInput(
-		h.OrganizationID.String,
-		m.githubMan,
-		m.webchangeClient,
-	))
-	if err != nil {
-		m.log.With("hook_id", h.ID).
-			With("error", err).
-			Error("deleting hook external resource")
-
-		return
+	// a soft-deleted hook's block is gone, so its score describes nothing.
+	// The mark is still stored, since it starts the retention clock.
+	if !h.SoftDeletedAt.Valid {
+		if err := h.Process(ctx, m.input(h.OrganizationID.String)); err != nil {
+			// a failed run keeps the stored score and state.
+			m.log.With("hook_id", h.ID).
+				With("error", err).
+				Error("processing document hook")
+		}
 	}
 
-	err = m.db.DeleteDocumentHook(ctx, h.ID)
-	if err != nil {
-		m.log.With("hook_id", h.ID).
-			With("error", err).
-			Error("deleting hook from db")
-	}
-}
-
-// updateHook persists the hook's current state and reports whether it stuck.
-func (m *Manager) updateHook(ctx context.Context, h hook.Hook) bool {
-	err := m.db.UpdateDocumentHook(ctx, h)
-	if err != nil {
+	if err := m.db.UpdateDocumentHook(ctx, *h); err != nil {
 		m.log.With("hook_id", h.ID).
 			With("error", err).
 			Error("updating document hook")
@@ -306,13 +269,147 @@ func (m *Manager) updateHook(ctx context.Context, h hook.Hook) bool {
 	return true
 }
 
+// fetchDocument returns the hook's document, cached by branch. A
+// nil document means it is gone; false means it could not be read.
+func (m *Manager) fetchDocument(ctx context.Context, ps *ProcessingState, h hook.Hook) (*document.Document, bool) {
+	key := h.BranchID.V
+
+	if doc, ok := ps.Documents[key]; ok {
+		return doc, true
+	}
+
+	doc, err := m.db.FetchDocumentByBranchID(ctx, h.BranchID.V, h.OrganizationID.String)
+
+	switch {
+	case err == nil:
+		ps.Documents[key] = doc
+	case errutil.IsNotFound(err):
+		ps.Documents[key] = nil
+	default:
+		m.log.With("hook_id", h.ID).
+			With("error", err).
+			Error("fetching document for hook")
+
+		return nil, false
+	}
+
+	return ps.Documents[key], true
+}
+
+// deleteHook tears down the hook's external resource and then removes the
+// row. The row is the only record of the resource, so it goes last.
+func (m *Manager) deleteHook(ctx context.Context, h hook.Hook) bool {
+	if err := h.Delete(ctx, m.input(h.OrganizationID.String)); err != nil {
+		m.log.With("hook_id", h.ID).
+			With("error", err).
+			Error("deleting hook external resource")
+
+		return false
+	}
+
+	if err := m.db.DeleteDocumentHook(ctx, h.ID); err != nil {
+		m.log.With("hook_id", h.ID).
+			With("error", err).
+			Error("deleting hook from db")
+
+		return false
+	}
+
+	return true
+}
+
+// notifyTransition tells the document's maintainers when an active hook
+// ran out of freshness, or when a hook can no longer check its target.
+// Both fire on the transition only.
+func (m *Manager) notifyTransition(ctx context.Context, prev, h hook.Hook) {
+	var core notification.Core
+
+	switch {
+	case prev.Status == processor.StatusActive && h.Status != processor.StatusActive:
+		core = notification.NewDocumentHookNeedsAttentionNotification(
+			h.DocumentID.V,
+			h.Type,
+			h.BlockID,
+			h.BranchID.V,
+			h.Status,
+			h.Settings,
+		)
+	// a scheduled reminder decays through 99…1, so the transition is the
+	// arrival at zero, not a drop from full.
+	case h.Status == processor.StatusActive && !prev.Score.IsZero() && h.Score.IsZero():
+		summary, err := h.Summary()
+		if err != nil {
+			// the notification still goes out without the summary.
+			m.log.Warn(
+				"cannot summarize hook run",
+				slog.String("hook_id", h.ID.String()),
+				slog.String("error", err.Error()),
+			)
+		}
+
+		core = notification.NewDocumentHookTriggeredNotification(
+			h.DocumentID.V,
+			h.Type,
+			h.BlockID,
+			h.BranchID.V,
+			h.Settings,
+			summary,
+		)
+	default:
+		return
+	}
+
+	maintainers, err := m.db.FetchDocumentMaintainers(ctx, h.DocumentID.V, h.OrganizationID.String)
+	if err != nil {
+		m.log.With("hook_id", h.ID).
+			With("error", err).
+			Error("fetching document maintainers for hook notification")
+
+		return
+	}
+
+	m.notifPub.PublishNotifications(h.OrganizationID.String, core, maintainers...)
+}
+
+// undoSetup tears down the resource h got in this run, since the row
+// naming it was not stored. Nothing else names it, so a failure is
+// reported.
+func (m *Manager) undoSetup(ctx context.Context, prev, h hook.Hook) {
+	if prev.State.Valid || !h.State.Valid {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), _teardownTimeout)
+	defer cancel()
+
+	if err := h.Delete(ctx, m.input(h.OrganizationID.String)); err != nil {
+		logutil.Critical(m.log, err).Error(
+			"cannot tear down the resource of a hook that was not stored",
+			slog.String("hook_id", h.ID.String()),
+		)
+	}
+}
+
+// input builds the processor input for the organization's hooks.
+func (m *Manager) input(organizationID string) *hook.Input {
+	return hook.NewInput(organizationID, m.githubMan, m.webchangeClient)
+}
+
 // DB defines the database operations required by the Manager.
 //
 //go:generate ../../../../scripts/codegen/mock -t internal DB db
 type DB interface {
+	sqlutil.DB
+
 	// FetchPaginatedDocumentHooks should retrieve a paginated list of document hooks
 	// starting after the given offset ID, limited to the specified number of hooks.
 	FetchPaginatedDocumentHooks(ctx context.Context, offsetID xid.ID, limit int64) ([]hook.Hook, error)
+
+	// FetchDocumentHook should fetch the hook of the organization.
+	FetchDocumentHook(ctx context.Context, id xid.ID, organizationID string) (*hook.Hook, error)
+
+	// FetchDocumentHooksByBranchID should fetch the hooks of a branch.
+	FetchDocumentHooksByBranchID(ctx context.Context, branchID xid.ID, organizationID string) ([]hook.Hook, error)
 
 	// UpdateDocumentHook should update the given document hook in the database.
 	UpdateDocumentHook(ctx context.Context, hk hook.Hook) error
@@ -326,4 +423,50 @@ type DB interface {
 
 	// FetchDocumentMaintainers should fetch the document maintainers.
 	FetchDocumentMaintainers(ctx context.Context, documentID xid.ID, organizationID string) ([]string, error)
+}
+
+// Tx is the transaction a hook write runs in, with its history record.
+//
+//go:generate ../../../../scripts/codegen/mock -t internal Tx tx
+type Tx interface {
+	sqlutil.Tx
+
+	// InsertDocumentHook should insert the document hook.
+	InsertDocumentHook(ctx context.Context, hk hook.Hook) error
+
+	// UpdateDocumentHook should update the document hook.
+	UpdateDocumentHook(ctx context.Context, hk hook.Hook) error
+
+	// DeleteDocumentHook should delete the document hook for the given id.
+	DeleteDocumentHook(ctx context.Context, id xid.ID) error
+
+	// RecordDocumentBranchHistoryEntry should record the branch as it
+	// stands, with its hooks.
+	RecordDocumentBranchHistoryEntry(
+		ctx context.Context,
+		branchID xid.ID,
+		organizationID string,
+		by null.String,
+		boundary bool,
+	) error
+}
+
+// CopyTx is the part of a caller's transaction CopyHooks runs in.
+//
+//go:generate ../../../../scripts/codegen/mock -t internal CopyTx copy_tx
+type CopyTx interface {
+	// FetchDocumentHooksByBranchID should fetch the hooks of a branch.
+	FetchDocumentHooksByBranchID(ctx context.Context, branchID xid.ID, organizationID string) ([]hook.Hook, error)
+
+	// InsertDocumentHook should insert the document hook.
+	InsertDocumentHook(ctx context.Context, hk hook.Hook) error
+}
+
+// Flusher stores what the editors of a branch hold.
+//
+//go:generate ../../../../scripts/codegen/mock -t internal Flusher flusher
+type Flusher interface {
+	// Flush should have the realtime service store what the editors of
+	// the branch hold, returning once core has it.
+	Flush(ctx context.Context, documentID, branchID xid.ID) error
 }

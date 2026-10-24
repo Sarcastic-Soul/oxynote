@@ -6,6 +6,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/oxynote/oxynote/server/core/internal/assistant"
+	"github.com/oxynote/oxynote/server/core/internal/assistant/tools"
 	"github.com/oxynote/oxynote/server/core/internal/buildinfo"
 )
 
@@ -44,41 +45,44 @@ func (h *Handler) server(r *http.Request) *mcp.Server {
 
 	set := h.man.ToolSet(session.OrganizationID, session.UserID)
 
-	read := slices.Contains(session.Scopes, ScopeDocumentRead)
-	write := slices.Contains(session.Scopes, ScopeDocumentWrite)
-	dataSources := slices.Contains(session.Scopes, ScopeDataSourceRead)
-
 	for _, e := range set.Entries() {
-		// an internal tool addresses conversation state this surface has
-		// none of, so offering it would only invite a call that cannot
-		// succeed.
-		if e.Internal {
-			continue
-		}
-
-		// a data-source tool reaches outside Oxynote entirely, so it
-		// answers to its own scope rather than to the document ones.
-		if e.DataSource {
-			if !dataSources {
-				continue
-			}
-		} else if e.Write && !write || !e.Write && !read {
+		// a tool no scope grants is not offered: an internal one addresses
+		// conversation state this surface has none of, and the rest answer
+		// to the scope their access maps onto.
+		scope, ok := toolScope(e.Info.Traits)
+		if !ok || !slices.Contains(session.Scopes, scope) {
 			continue
 		}
 
 		// the wire shape is the tool's own description: same name, same
 		// prose, same argument schema the assistant's model sees.
 		srv.AddTool(&mcp.Tool{
-			Name:        string(e.Name),
+			Name:        string(e.Info.Name),
 			Description: e.Info.Description,
 			InputSchema: e.Info.Schema(),
 			Annotations: annotations(e),
 		}, h.toolHandler(e))
 	}
 
-	if read {
+	if slices.Contains(session.Scopes, ScopeDocumentRead) {
 		h.addResources(r.Context(), srv, session, set)
 	}
 
 	return srv
+}
+
+// toolScope returns the OAuth scope a token needs to be offered a tool
+// with the given traits. An internal tool answers to no scope: it
+// addresses conversation state only the assistant has.
+func toolScope(tr tools.Traits) (string, bool) {
+	switch {
+	case tr.Internal:
+		return "", false
+	case tr.DataSource:
+		return ScopeDataSourceRead, true
+	case tr.Write:
+		return ScopeDocumentWrite, true
+	default:
+		return ScopeDocumentRead, true
+	}
 }

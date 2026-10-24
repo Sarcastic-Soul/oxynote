@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/guregu/null/v5"
-	"github.com/oxynote/oxynote/server/core/internal/apps/webchange"
 	"github.com/oxynote/oxynote/server/core/internal/document"
 	hookCore "github.com/oxynote/oxynote/server/core/internal/document/hook"
 	"github.com/oxynote/oxynote/server/core/internal/document/hook/processor"
@@ -33,84 +32,18 @@ var (
 	_hookID     = xid.New()
 )
 
-// addSession stores a test session on the request context.
-func addSession(ctx context.Context) context.Context {
-	return auth.AddSessionToContext(ctx, auth.Session{
-		UserID:               "u1",
-		ActiveOrganizationID: "org1",
-	})
-}
-
-// urlWatcherHook builds a stored url-watcher hook that already holds a
-// changedetection.io watcher in its state.
-func urlWatcherHook() *hookCore.Hook {
-	return &hookCore.Hook{
-		ID:             _hookID,
-		Type:           hookCore.TypeURLWatcher,
-		DocumentID:     null.ValueFrom(_documentID),
-		OrganizationID: null.StringFrom("org1"),
-		BranchID:       null.ValueFrom(_branchID),
-		Settings:       processor.Settings(`{"url":"https://example.com"}`),
-		State:          processor.State(`{"watcherId":"w1"}`),
-	}
-}
-
-// scheduledHook builds a stored hook whose processor needs no external
-// dependencies.
-func scheduledHook(typ hookCore.Type) *hookCore.Hook {
-	return &hookCore.Hook{
-		ID:             _hookID,
-		Type:           typ,
-		DocumentID:     null.ValueFrom(_documentID),
-		OrganizationID: null.StringFrom("org1"),
-		BranchID:       null.ValueFrom(_branchID),
-		Settings:       processor.Settings(`{"scale":"linear"}`),
-	}
-}
-
-// notified is one hooks-change announcement a handler made.
-type notified struct {
-	organizationID string
-	documentID     xid.ID
-	branchID       xid.ID
-}
-
-// recordNotifications binds the handler's hooks-change callback to a
-// list the test reads back.
-func recordNotifications(hdl *Handler) *[]notified {
-	var out []notified
-
-	hdl.hooks.changeCallback = func(organizationID string, documentID, branchID xid.ID) {
-		out = append(out, notified{organizationID, documentID, branchID})
-	}
-
-	return &out
-}
-
-// assertNotified checks that a write that succeeded announced the branch
-// once and one that failed announced nothing.
-func assertNotified(t *testing.T, got []notified, code int) {
-	t.Helper()
-
-	if code >= http.StatusBadRequest {
-		assert.Empty(t, got)
-		return
-	}
-
-	assert.Equal(t, []notified{{"org1", _documentID, _branchID}}, got)
-}
-
 func Test_NewHandler(t *testing.T) {
 	t.Parallel()
 
 	db := &DBMock{}
 
-	hdl := NewHandler(slog.New(slog.DiscardHandler), db, nil, nil)
+	man := &ManagerMock{}
+
+	hdl := NewHandler(slog.New(slog.DiscardHandler), db, man)
 	require.NotNil(t, hdl)
 	assert.NotNil(t, hdl.log)
 	assert.Same(t, db, hdl.db)
-	assert.Nil(t, hdl.githubMan)
-	assert.Nil(t, hdl.webchangeClient)
+	assert.Same(t, man, hdl.hookMan)
 }
 
 func Test_Handler_FetchDocumentHooks(t *testing.T) {
@@ -120,14 +53,21 @@ func Test_Handler_FetchDocumentHooks(t *testing.T) {
 
 	hasResp := func(code int, body string) check {
 		return func(t *testing.T, _ *DBMock, rec *httptest.ResponseRecorder) {
-			assert.Equal(t, code, rec.Code)
+			testutil.AssertResponse(t, rec, code, body)
+		}
+	}
 
-			if body == "" {
-				assert.Zero(t, rec.Body.Len(), rec.Body.String())
+	wasFetchDocumentCalled := func(count int) check {
+		return func(t *testing.T, db *DBMock, _ *httptest.ResponseRecorder) {
+			ff := db.FetchDocumentByBranchIDCalls()
+			require.Len(t, ff, count)
+
+			if count == 0 {
 				return
 			}
 
-			assert.JSONEq(t, body, rec.Body.String())
+			assert.Equal(t, _branchID, ff[0].BranchID)
+			assert.Equal(t, "org1", ff[0].OrganizationID)
 		}
 	}
 
@@ -158,6 +98,7 @@ func Test_Handler_FetchDocumentHooks(t *testing.T) {
 			Query:     "?branchId=" + _branchID.String(),
 			Checks: checks(
 				hasResp(http.StatusUnauthorized, `{"code":"account.not_authenticated","message":"not authenticated"}`),
+				wasFetchDocumentCalled(0),
 				wasFetchCalled(0),
 			),
 		},
@@ -167,6 +108,7 @@ func Test_Handler_FetchDocumentHooks(t *testing.T) {
 			Query:  "?branchId=" + _branchID.String(),
 			Checks: checks(
 				hasResp(http.StatusNotFound, `{"code":"general","message":"not found"}`),
+				wasFetchDocumentCalled(0),
 				wasFetchCalled(0),
 			),
 		},
@@ -175,10 +117,11 @@ func Test_Handler_FetchDocumentHooks(t *testing.T) {
 			Query: "?branchId=bogus",
 			Checks: checks(
 				hasResp(http.StatusBadRequest, `{"code":"request.invalid_form","message":"invalid form data"}`),
+				wasFetchDocumentCalled(0),
 				wasFetchCalled(0),
 			),
 		},
-		"Branch document fetch error": {
+		"Error returned by DB.FetchDocumentByBranchID": {
 			DB: &DBMock{
 				FetchDocumentByBranchIDFunc: func(context.Context, xid.ID, string) (*document.Document, error) {
 					return nil, errors.New("boom")
@@ -187,6 +130,7 @@ func Test_Handler_FetchDocumentHooks(t *testing.T) {
 			Query: "?branchId=" + _branchID.String(),
 			Checks: checks(
 				hasResp(http.StatusInternalServerError, `{"code":"general","message":"internal server error"}`),
+				wasFetchDocumentCalled(1),
 				wasFetchCalled(0),
 			),
 		},
@@ -199,11 +143,15 @@ func Test_Handler_FetchDocumentHooks(t *testing.T) {
 			Query: "?branchId=" + _branchID.String(),
 			Checks: checks(
 				hasResp(http.StatusNotFound, `{"code":"document.branch_mismatch","message":"branch does not belong to the document"}`),
+				wasFetchDocumentCalled(1),
 				wasFetchCalled(0),
 			),
 		},
-		"Hook fetch error": {
+		"Error returned by DB.FetchDocumentHooksByBranchID": {
 			DB: &DBMock{
+				FetchDocumentByBranchIDFunc: func(context.Context, xid.ID, string) (*document.Document, error) {
+					return &document.Document{ID: _documentID}, nil
+				},
 				FetchDocumentHooksByBranchIDFunc: func(context.Context, xid.ID, string) ([]hookCore.Hook, error) {
 					return nil, errors.New("boom")
 				},
@@ -211,13 +159,26 @@ func Test_Handler_FetchDocumentHooks(t *testing.T) {
 			Query: "?branchId=" + _branchID.String(),
 			Checks: checks(
 				hasResp(http.StatusInternalServerError, `{"code":"general","message":"internal server error"}`),
+				wasFetchDocumentCalled(1),
 				wasFetchCalled(1),
 			),
 		},
 		"Successful fetch": {
 			DB: &DBMock{
+				FetchDocumentByBranchIDFunc: func(context.Context, xid.ID, string) (*document.Document, error) {
+					return &document.Document{ID: _documentID}, nil
+				},
 				FetchDocumentHooksByBranchIDFunc: func(context.Context, xid.ID, string) ([]hookCore.Hook, error) {
-					return []hookCore.Hook{*scheduledHook(hookCore.TypeScheduledReminder)}, nil
+					return []hookCore.Hook{
+						{
+							ID:             _hookID,
+							Type:           hookCore.TypeScheduledReminder,
+							DocumentID:     null.ValueFrom(_documentID),
+							OrganizationID: null.StringFrom("org1"),
+							BranchID:       null.ValueFrom(_branchID),
+							Settings:       processor.Settings(`{"scale":"linear"}`),
+						},
+					}, nil
 				},
 			},
 			Query: "?branchId=" + _branchID.String(),
@@ -226,6 +187,7 @@ func Test_Handler_FetchDocumentHooks(t *testing.T) {
 					assert.Equal(t, http.StatusOK, rec.Code)
 					assert.Contains(t, rec.Body.String(), _hookID.String())
 				},
+				wasFetchDocumentCalled(1),
 				wasFetchCalled(1),
 			),
 		},
@@ -235,25 +197,20 @@ func Test_Handler_FetchDocumentHooks(t *testing.T) {
 		t.Run(cn, func(t *testing.T) {
 			t.Parallel()
 
-			if c.DB.FetchDocumentByBranchIDFunc == nil {
-				c.DB.FetchDocumentByBranchIDFunc = func(context.Context, xid.ID, string) (*document.Document, error) {
-					return &document.Document{ID: _documentID}, nil
-				}
-			}
-
 			hdl := Handler{
-				log:             slog.New(slog.DiscardHandler),
-				db:              c.DB,
-				webchangeClient: webchange.NewClient("", ""),
+				log: slog.New(slog.DiscardHandler),
+				db:  c.DB,
 			}
-			got := recordNotifications(&hdl)
 
 			req := httptest.NewRequest(http.MethodGet, "http://test.com/"+c.Query, http.NoBody)
 
 			ctx := req.Context()
 
 			if !c.NoSession {
-				ctx = addSession(ctx)
+				ctx = auth.AddSessionToContext(ctx, auth.Session{
+					UserID:               "u1",
+					ActiveOrganizationID: "org1",
+				})
 			}
 
 			if !c.OmitID {
@@ -264,9 +221,6 @@ func Test_Handler_FetchDocumentHooks(t *testing.T) {
 
 			hdl.FetchDocumentHooks(rec, req.WithContext(ctx))
 
-			// a read announces nothing.
-			assert.Empty(t, *got)
-
 			for _, ch := range c.Checks {
 				ch(t, c.DB, rec)
 			}
@@ -274,159 +228,111 @@ func Test_Handler_FetchDocumentHooks(t *testing.T) {
 	}
 }
 
+// hookRequest builds a request carrying a session and the path parameters
+// a hook route reads, unless the respective omit flags are set.
+func hookRequest(method, body string, noSession, omitDoc, omitHook bool) *http.Request {
+	req := httptest.NewRequest(method, "http://test.com/", strings.NewReader(body))
+
+	ctx := req.Context()
+
+	if !noSession {
+		ctx = auth.AddSessionToContext(ctx, auth.Session{
+			UserID:               "u1",
+			ActiveOrganizationID: "org1",
+		})
+	}
+
+	if !omitDoc {
+		ctx = testutil.AddChiCtx(ctx, "documentId", _documentID.String())
+	}
+
+	if !omitHook {
+		ctx = testutil.AddChiCtx(ctx, "hookId", _hookID.String())
+	}
+
+	return req.WithContext(ctx)
+}
+
 func Test_Handler_CreateDocumentHook(t *testing.T) {
-	type check func(*testing.T, *DBMock, *httptest.ResponseRecorder)
-
-	checks := func(cc ...check) []check { return cc }
-
-	hasResp := func(code int, body string) check {
-		return func(t *testing.T, _ *DBMock, rec *httptest.ResponseRecorder) {
-			assert.Equal(t, code, rec.Code)
-
-			if body == "" {
-				assert.Zero(t, rec.Body.Len(), rec.Body.String())
-				return
-			}
-
-			assert.JSONEq(t, body, rec.Body.String())
-		}
-	}
-
-	wasInsertCalled := func(count int) check {
-		return func(t *testing.T, db *DBMock, _ *httptest.ResponseRecorder) {
-			ff := db.InsertDocumentHookCalls()
-			require.Len(t, ff, count)
-
-			if count == 0 {
-				return
-			}
-
-			assert.Equal(t, hookCore.TypeScheduledReminder, ff[0].Hk.Type)
-			assert.Equal(t, null.ValueFrom(_documentID), ff[0].Hk.DocumentID)
-			assert.Equal(t, null.StringFrom("org1"), ff[0].Hk.OrganizationID)
-			assert.NotEmpty(t, ff[0].Hk.State)
-		}
-	}
-
 	validBody := `{"type":"scheduled-reminder","branchId":"` + _branchID.String() + `","settings":{"scale":"linear"}}`
 
 	cc := map[string]struct {
-		DB        *DBMock
+		Man       *ManagerMock
 		NoSession bool
-		OmitID    bool
+		OmitDoc   bool
 		Body      string
-		Checks    []check
+		RespCode  int
+		RespBody  string
+		Creates   int
 	}{
 		"No session in context": {
-			DB:        &DBMock{},
+			Man:       &ManagerMock{},
 			NoSession: true,
 			Body:      validBody,
-			Checks: checks(
-				hasResp(http.StatusUnauthorized, `{"code":"account.not_authenticated","message":"not authenticated"}`),
-				wasInsertCalled(0),
-			),
+			RespCode:  http.StatusUnauthorized,
+			RespBody:  `{"code":"account.not_authenticated","message":"not authenticated"}`,
 		},
 		"Missing document ID parameter": {
-			DB:     &DBMock{},
-			OmitID: true,
-			Body:   validBody,
-			Checks: checks(
-				hasResp(http.StatusNotFound, `{"code":"general","message":"not found"}`),
-				wasInsertCalled(0),
-			),
+			Man:      &ManagerMock{},
+			OmitDoc:  true,
+			Body:     validBody,
+			RespCode: http.StatusNotFound,
 		},
 		"Invalid JSON body": {
-			DB:   &DBMock{},
-			Body: "{",
-			Checks: checks(
-				hasResp(http.StatusBadRequest, `{"code":"request.invalid_json","message":"invalid JSON body"}`),
-				wasInsertCalled(0),
-			),
+			Man:      &ManagerMock{},
+			Body:     "{",
+			RespCode: http.StatusBadRequest,
+			RespBody: `{"code":"request.invalid_json","message":"invalid JSON body"}`,
 		},
-		"Branch document fetch error": {
-			DB: &DBMock{
-				FetchDocumentByBranchIDFunc: func(context.Context, xid.ID, string) (*document.Document, error) {
+		"Invalid hook type": {
+			Man:      &ManagerMock{},
+			Body:     `{"type":"bogus","branchId":"` + _branchID.String() + `","settings":{}}`,
+			RespCode: http.StatusBadRequest,
+			RespBody: `{"code":"document_hook.invalid_type","message":"invalid hook type"}`,
+		},
+		"Error returned by Manager.CreateHook": {
+			Man: &ManagerMock{
+				CreateHookFunc: func(context.Context, hookCore.CreateInput, xid.ID, string, string) (*hookCore.Hook, error) {
 					return nil, errors.New("boom")
 				},
 			},
-			Body: validBody,
-			Checks: checks(
-				hasResp(http.StatusInternalServerError, `{"code":"general","message":"internal server error"}`),
-				wasInsertCalled(0),
-			),
-		},
-		"Invalid hook type": {
-			DB:   &DBMock{},
-			Body: `{"type":"bogus","branchId":"` + _branchID.String() + `","settings":{}}`,
-			Checks: checks(
-				hasResp(http.StatusBadRequest, `{"code":"document_hook.invalid_type","message":"invalid hook type"}`),
-				wasInsertCalled(0),
-			),
-		},
-		"Hook insertion error": {
-			DB: &DBMock{
-				InsertDocumentHookFunc: func(context.Context, hookCore.Hook) error {
-					return errors.New("boom")
-				},
-			},
-			Body: validBody,
-			Checks: checks(
-				hasResp(http.StatusInternalServerError, `{"code":"general","message":"internal server error"}`),
-				wasInsertCalled(1),
-			),
-		},
-		"Branch belongs to another document": {
-			DB: &DBMock{
-				FetchDocumentByBranchIDFunc: func(context.Context, xid.ID, string) (*document.Document, error) {
-					return &document.Document{ID: xid.New()}, nil
-				},
-			},
-			Body: validBody,
-			Checks: checks(
-				hasResp(http.StatusNotFound, `{"code":"document.branch_mismatch","message":"branch does not belong to the document"}`),
-				wasInsertCalled(0),
-			),
-		},
-		"Block not in the branch": {
-			DB:   &DBMock{},
-			Body: `{"type":"scheduled-reminder","branchId":"` + _branchID.String() + `","blockId":"nope","settings":{"scale":"linear"}}`,
-			Checks: checks(
-				hasResp(http.StatusNotFound, `{"code":"document.hook_block_not_found","message":"block not found in the branch"}`),
-				wasInsertCalled(0),
-			),
+			Body:     validBody,
+			RespCode: http.StatusInternalServerError,
+			Creates:  1,
 		},
 		"Successful creation on a block": {
-			DB:   &DBMock{},
-			Body: `{"type":"scheduled-reminder","branchId":"` + _branchID.String() + `","blockId":"b1","settings":{"scale":"linear"}}`,
-			Checks: checks(
-				func(t *testing.T, db *DBMock, rec *httptest.ResponseRecorder) {
-					assert.Equal(t, http.StatusCreated, rec.Code)
-
-					ff := db.InsertDocumentHookCalls()
-					require.Len(t, ff, 1)
-					assert.Equal(t, null.StringFrom("b1"), ff[0].Hk.BlockID)
+			Man: &ManagerMock{
+				CreateHookFunc: func(context.Context, hookCore.CreateInput, xid.ID, string, string) (*hookCore.Hook, error) {
+					return &hookCore.Hook{
+						ID:             _hookID,
+						Type:           hookCore.TypeScheduledReminder,
+						DocumentID:     null.ValueFrom(_documentID),
+						OrganizationID: null.StringFrom("org1"),
+						BranchID:       null.ValueFrom(_branchID),
+						Settings:       processor.Settings(`{"scale":"linear"}`),
+					}, nil
 				},
-				wasInsertCalled(1),
-			),
-		},
-		"URL watcher without changedetection": {
-			DB:   &DBMock{},
-			Body: `{"type":"url-watcher","branchId":"` + _branchID.String() + `","settings":{"url":"https://example.com"}}`,
-			Checks: checks(
-				hasResp(http.StatusConflict, `{"code":"changedetection.not_configured","message":"changedetection is not configured"}`),
-				wasInsertCalled(0),
-			),
+			},
+			Body:     `{"type":"scheduled-reminder","branchId":"` + _branchID.String() + `","blockId":"b1","settings":{"scale":"linear"}}`,
+			RespCode: http.StatusCreated,
+			Creates:  1,
 		},
 		"Successful creation": {
-			DB:   &DBMock{},
-			Body: validBody,
-			Checks: checks(
-				func(t *testing.T, _ *DBMock, rec *httptest.ResponseRecorder) {
-					assert.Equal(t, http.StatusCreated, rec.Code)
-					assert.Contains(t, rec.Body.String(), `"scheduled-reminder"`)
+			Man: &ManagerMock{
+				CreateHookFunc: func(context.Context, hookCore.CreateInput, xid.ID, string, string) (*hookCore.Hook, error) {
+					return &hookCore.Hook{
+						ID:             _hookID,
+						Type:           hookCore.TypeScheduledReminder,
+						DocumentID:     null.ValueFrom(_documentID),
+						OrganizationID: null.StringFrom("org1"),
+						BranchID:       null.ValueFrom(_branchID),
+						Settings:       processor.Settings(`{"scale":"linear"}`),
+					}, nil
 				},
-				wasInsertCalled(1),
-			),
+			},
+			Body:     validBody,
+			RespCode: http.StatusCreated,
+			Creates:  1,
 		},
 	}
 
@@ -434,216 +340,106 @@ func Test_Handler_CreateDocumentHook(t *testing.T) {
 		t.Run(cn, func(t *testing.T) {
 			t.Parallel()
 
-			// the branch holds one block, so a hook can anchor to it and
-			// to nothing else.
-			if c.DB.FetchDocumentByBranchIDFunc == nil {
-				c.DB.FetchDocumentByBranchIDFunc = func(context.Context, xid.ID, string) (*document.Document, error) {
-					return &document.Document{
-						ID: _documentID,
-						Content: document.RootBlock{
-							Content: []document.Block{{
-								Type:  document.BlockNodeParagraph,
-								Attrs: document.Attributes{document.AttrUID: "b1"},
-							}},
-						},
-					}, nil
-				}
-			}
-
-			hdl := Handler{
-				log:             slog.New(slog.DiscardHandler),
-				db:              c.DB,
-				webchangeClient: webchange.NewClient("", ""),
-			}
-			got := recordNotifications(&hdl)
-
-			req := httptest.NewRequest(http.MethodPost, "http://test.com/", strings.NewReader(c.Body))
-
-			ctx := req.Context()
-
-			if !c.NoSession {
-				ctx = addSession(ctx)
-			}
-
-			if !c.OmitID {
-				ctx = testutil.AddChiCtx(ctx, "documentId", _documentID.String())
-			}
+			hdl := NewHandler(slog.New(slog.DiscardHandler), &DBMock{}, c.Man)
 
 			rec := httptest.NewRecorder()
 
-			hdl.CreateDocumentHook(rec, req.WithContext(ctx))
+			hdl.CreateDocumentHook(rec, hookRequest(http.MethodPost, c.Body, c.NoSession, c.OmitDoc, true))
 
-			assertNotified(t, *got, rec.Code)
+			assert.Equal(t, c.RespCode, rec.Code)
 
-			for _, ch := range c.Checks {
-				ch(t, c.DB, rec)
+			if c.RespBody != "" {
+				assert.JSONEq(t, c.RespBody, rec.Body.String())
+			}
+
+			ff := c.Man.CreateHookCalls()
+			require.Len(t, ff, c.Creates)
+
+			if c.Creates > 0 {
+				assert.Equal(t, _branchID, ff[0].Ci.BranchID)
+				assert.Equal(t, hookCore.TypeScheduledReminder, ff[0].Ci.Type)
+				assert.Equal(t, _documentID, ff[0].DocumentID)
+				assert.Equal(t, "org1", ff[0].OrganizationID)
+				assert.Equal(t, "u1", ff[0].UpdatedBy)
 			}
 		})
 	}
 }
 
 func Test_Handler_UpdateDocumentHook(t *testing.T) {
-	type check func(*testing.T, *DBMock, *httptest.ResponseRecorder)
-
-	checks := func(cc ...check) []check { return cc }
-
-	hasResp := func(code int, body string) check {
-		return func(t *testing.T, _ *DBMock, rec *httptest.ResponseRecorder) {
-			assert.Equal(t, code, rec.Code)
-
-			if body == "" {
-				assert.Zero(t, rec.Body.Len(), rec.Body.String())
-				return
-			}
-
-			assert.JSONEq(t, body, rec.Body.String())
-		}
-	}
-
-	wasUpdateCalled := func(count int) check {
-		return func(t *testing.T, db *DBMock, _ *httptest.ResponseRecorder) {
-			ff := db.UpdateDocumentHookCalls()
-			require.Len(t, ff, count)
-
-			if count == 0 {
-				return
-			}
-
-			assert.Equal(t, _hookID, ff[0].Hk.ID)
-			assert.JSONEq(t, `{"scale":"linear","duration":"48h"}`, string(ff[0].Hk.Settings))
-			assert.True(t, ff[0].Hk.UpdatedAt.Valid)
-		}
-	}
-
 	validBody := `{"settings":{"scale":"linear","duration":"48h"}}`
 
 	cc := map[string]struct {
-		DB        *DBMock
+		Man       *ManagerMock
 		NoSession bool
 		OmitDoc   bool
-		OmitID    bool
+		OmitHook  bool
 		Body      string
-		Checks    []check
+		RespCode  int
+		RespBody  string
+		Updates   int
 	}{
 		"No session in context": {
-			DB:        &DBMock{},
+			Man:       &ManagerMock{},
 			NoSession: true,
 			Body:      validBody,
-			Checks: checks(
-				hasResp(http.StatusUnauthorized, `{"code":"account.not_authenticated","message":"not authenticated"}`),
-				wasUpdateCalled(0),
-			),
+			RespCode:  http.StatusUnauthorized,
 		},
 		"Missing document ID parameter": {
-			DB:      &DBMock{},
-			OmitDoc: true,
-			Body:    validBody,
-			Checks: checks(
-				hasResp(http.StatusNotFound, `{"code":"general","message":"not found"}`),
-				wasUpdateCalled(0),
-			),
+			Man:      &ManagerMock{},
+			OmitDoc:  true,
+			Body:     validBody,
+			RespCode: http.StatusNotFound,
 		},
 		"Missing hook ID parameter": {
-			DB:     &DBMock{},
-			OmitID: true,
-			Body:   validBody,
-			Checks: checks(
-				hasResp(http.StatusNotFound, `{"code":"general","message":"not found"}`),
-				wasUpdateCalled(0),
-			),
+			Man:      &ManagerMock{},
+			OmitHook: true,
+			Body:     validBody,
+			RespCode: http.StatusNotFound,
 		},
 		"Hook of another document": {
-			DB: &DBMock{
-				FetchDocumentHookFunc: func(context.Context, xid.ID, string) (*hookCore.Hook, error) {
-					hk := scheduledHook(hookCore.TypeScheduledReminder)
-					hk.DocumentID = null.ValueFrom(xid.New())
-
-					return hk, nil
+			Man: &ManagerMock{
+				UpdateHookFunc: func(context.Context, xid.ID, xid.ID, string, hookCore.UpdateInput, string) (*hookCore.Hook, error) {
+					return nil, hookCore.ErrHookMismatch
 				},
 			},
-			Body: validBody,
-			Checks: checks(
-				hasResp(http.StatusNotFound, `{"code":"document.hook_mismatch","message":"hook does not belong to the document"}`),
-				wasUpdateCalled(0),
-			),
-		},
-		"Hook fetch error": {
-			DB: &DBMock{
-				FetchDocumentHookFunc: func(context.Context, xid.ID, string) (*hookCore.Hook, error) {
-					return nil, errors.New("boom")
-				},
-			},
-			Body: validBody,
-			Checks: checks(
-				hasResp(http.StatusInternalServerError, `{"code":"general","message":"internal server error"}`),
-				wasUpdateCalled(0),
-			),
+			Body:     validBody,
+			RespCode: http.StatusNotFound,
+			RespBody: `{"code":"document.hook_mismatch","message":"hook does not belong to the document"}`,
+			Updates:  1,
 		},
 		"Invalid JSON body": {
-			DB: &DBMock{
-				FetchDocumentHookFunc: func(context.Context, xid.ID, string) (*hookCore.Hook, error) {
-					return scheduledHook(hookCore.TypeScheduledReminder), nil
-				},
-			},
-			Body: "{",
-			Checks: checks(
-				hasResp(http.StatusBadRequest, `{"code":"request.invalid_json","message":"invalid JSON body"}`),
-				wasUpdateCalled(0),
-			),
+			Man:      &ManagerMock{},
+			Body:     "{",
+			RespCode: http.StatusBadRequest,
 		},
-		"Update application error": {
-			DB: &DBMock{
-				FetchDocumentHookFunc: func(context.Context, xid.ID, string) (*hookCore.Hook, error) {
-					return scheduledHook("bogus"), nil
+		"Error returned by Manager.UpdateHook": {
+			Man: &ManagerMock{
+				UpdateHookFunc: func(context.Context, xid.ID, xid.ID, string, hookCore.UpdateInput, string) (*hookCore.Hook, error) {
+					return nil, hookCore.ErrUpstreamUnavailable
 				},
 			},
-			Body: validBody,
-			Checks: checks(
-				hasResp(http.StatusInternalServerError, `{"code":"general","message":"internal server error"}`),
-				wasUpdateCalled(0),
-			),
-		},
-		"Hook update error": {
-			DB: &DBMock{
-				FetchDocumentHookFunc: func(context.Context, xid.ID, string) (*hookCore.Hook, error) {
-					return scheduledHook(hookCore.TypeScheduledReminder), nil
-				},
-				UpdateDocumentHookFunc: func(context.Context, hookCore.Hook) error {
-					return errors.New("boom")
-				},
-			},
-			Body: validBody,
-			Checks: checks(
-				hasResp(http.StatusInternalServerError, `{"code":"general","message":"internal server error"}`),
-				wasUpdateCalled(1),
-			),
-		},
-		"URL watcher without changedetection": {
-			DB: &DBMock{
-				FetchDocumentHookFunc: func(context.Context, xid.ID, string) (*hookCore.Hook, error) {
-					return urlWatcherHook(), nil
-				},
-			},
-			Body: `{"settings":{"url":"https://example.com"}}`,
-			Checks: checks(
-				hasResp(http.StatusConflict, `{"code":"changedetection.not_configured","message":"changedetection is not configured"}`),
-				wasUpdateCalled(0),
-			),
+			Body:     validBody,
+			RespCode: http.StatusFailedDependency,
+			RespBody: `{"code":"document_hook.upstream_unavailable","message":"the service the hook checks is unavailable"}`,
+			Updates:  1,
 		},
 		"Successful update": {
-			DB: &DBMock{
-				FetchDocumentHookFunc: func(context.Context, xid.ID, string) (*hookCore.Hook, error) {
-					return scheduledHook(hookCore.TypeScheduledReminder), nil
+			Man: &ManagerMock{
+				UpdateHookFunc: func(context.Context, xid.ID, xid.ID, string, hookCore.UpdateInput, string) (*hookCore.Hook, error) {
+					return &hookCore.Hook{
+						ID:             _hookID,
+						Type:           hookCore.TypeScheduledReminder,
+						DocumentID:     null.ValueFrom(_documentID),
+						OrganizationID: null.StringFrom("org1"),
+						BranchID:       null.ValueFrom(_branchID),
+						Settings:       processor.Settings(`{"scale":"linear"}`),
+					}, nil
 				},
 			},
-			Body: validBody,
-			Checks: checks(
-				func(t *testing.T, _ *DBMock, rec *httptest.ResponseRecorder) {
-					assert.Equal(t, http.StatusOK, rec.Code)
-					assert.Contains(t, rec.Body.String(), _hookID.String())
-				},
-				wasUpdateCalled(1),
-			),
+			Body:     validBody,
+			RespCode: http.StatusOK,
+			Updates:  1,
 		},
 	}
 
@@ -651,146 +447,89 @@ func Test_Handler_UpdateDocumentHook(t *testing.T) {
 		t.Run(cn, func(t *testing.T) {
 			t.Parallel()
 
-			hdl := Handler{
-				log:             slog.New(slog.DiscardHandler),
-				db:              c.DB,
-				webchangeClient: webchange.NewClient("", ""),
-			}
-			got := recordNotifications(&hdl)
-
-			req := httptest.NewRequest(http.MethodPut, "http://test.com/", strings.NewReader(c.Body))
-
-			ctx := req.Context()
-
-			if !c.NoSession {
-				ctx = addSession(ctx)
-			}
-
-			if !c.OmitDoc {
-				ctx = testutil.AddChiCtx(ctx, "documentId", _documentID.String())
-			}
-
-			if !c.OmitID {
-				ctx = testutil.AddChiCtx(ctx, "hookId", _hookID.String())
-			}
+			hdl := NewHandler(slog.New(slog.DiscardHandler), &DBMock{}, c.Man)
 
 			rec := httptest.NewRecorder()
 
-			hdl.UpdateDocumentHook(rec, req.WithContext(ctx))
+			hdl.UpdateDocumentHook(rec, hookRequest(http.MethodPut, c.Body, c.NoSession, c.OmitDoc, c.OmitHook))
 
-			assertNotified(t, *got, rec.Code)
+			assert.Equal(t, c.RespCode, rec.Code)
 
-			for _, ch := range c.Checks {
-				ch(t, c.DB, rec)
+			if c.RespBody != "" {
+				assert.JSONEq(t, c.RespBody, rec.Body.String())
+			}
+
+			ff := c.Man.UpdateHookCalls()
+			require.Len(t, ff, c.Updates)
+
+			if c.Updates > 0 {
+				assert.Equal(t, _hookID, ff[0].ID)
+				assert.Equal(t, _documentID, ff[0].DocumentID)
+				assert.Equal(t, "org1", ff[0].OrganizationID)
+				assert.JSONEq(t, `{"scale":"linear","duration":"48h"}`, string(ff[0].UI.Settings))
+				assert.Equal(t, "u1", ff[0].UpdatedBy)
 			}
 		})
 	}
 }
 
 func Test_Handler_ResetDocumentHook(t *testing.T) {
-	type check func(*testing.T, *DBMock, *httptest.ResponseRecorder)
-
-	checks := func(cc ...check) []check { return cc }
-
-	wasUpdateCalled := func(count int) check {
-		return func(t *testing.T, db *DBMock, _ *httptest.ResponseRecorder) {
-			ff := db.UpdateDocumentHookCalls()
-			require.Len(t, ff, count)
-
-			if count == 0 {
-				return
-			}
-
-			assert.Equal(t, _hookID, ff[0].Hk.ID)
-			assert.NotEmpty(t, ff[0].Hk.State)
-		}
-	}
-
 	cc := map[string]struct {
-		DB        *DBMock
+		Man       *ManagerMock
 		NoSession bool
 		OmitDoc   bool
-		OmitID    bool
+		OmitHook  bool
 		RespCode  int
-		Checks    []check
+		Resets    int
 	}{
 		"No session in context": {
-			DB:        &DBMock{},
+			Man:       &ManagerMock{},
 			NoSession: true,
 			RespCode:  http.StatusUnauthorized,
-			Checks:    checks(wasUpdateCalled(0)),
 		},
 		"Missing document ID parameter": {
-			DB:       &DBMock{},
+			Man:      &ManagerMock{},
 			OmitDoc:  true,
 			RespCode: http.StatusNotFound,
-			Checks:   checks(wasUpdateCalled(0)),
 		},
 		"Missing hook ID parameter": {
-			DB:       &DBMock{},
-			OmitID:   true,
+			Man:      &ManagerMock{},
+			OmitHook: true,
 			RespCode: http.StatusNotFound,
-			Checks:   checks(wasUpdateCalled(0)),
 		},
 		"Hook of another document": {
-			DB: &DBMock{
-				FetchDocumentHookFunc: func(context.Context, xid.ID, string) (*hookCore.Hook, error) {
-					hk := scheduledHook(hookCore.TypeScheduledReminder)
-					hk.DocumentID = null.ValueFrom(xid.New())
-
-					return hk, nil
+			Man: &ManagerMock{
+				ResetHookFunc: func(context.Context, xid.ID, xid.ID, string) (*hookCore.Hook, error) {
+					return nil, hookCore.ErrHookMismatch
 				},
 			},
 			RespCode: http.StatusNotFound,
-			Checks:   checks(wasUpdateCalled(0)),
+			Resets:   1,
 		},
-		"Hook fetch error": {
-			DB: &DBMock{
-				FetchDocumentHookFunc: func(context.Context, xid.ID, string) (*hookCore.Hook, error) {
+		"Error returned by Manager.ResetHook": {
+			Man: &ManagerMock{
+				ResetHookFunc: func(context.Context, xid.ID, xid.ID, string) (*hookCore.Hook, error) {
 					return nil, errors.New("boom")
 				},
 			},
 			RespCode: http.StatusInternalServerError,
-			Checks:   checks(wasUpdateCalled(0)),
-		},
-		"Reset error": {
-			DB: &DBMock{
-				FetchDocumentHookFunc: func(context.Context, xid.ID, string) (*hookCore.Hook, error) {
-					return scheduledHook("bogus"), nil
-				},
-			},
-			RespCode: http.StatusInternalServerError,
-			Checks:   checks(wasUpdateCalled(0)),
-		},
-		"Hook update error": {
-			DB: &DBMock{
-				FetchDocumentHookFunc: func(context.Context, xid.ID, string) (*hookCore.Hook, error) {
-					return scheduledHook(hookCore.TypeScheduledReminder), nil
-				},
-				UpdateDocumentHookFunc: func(context.Context, hookCore.Hook) error {
-					return errors.New("boom")
-				},
-			},
-			RespCode: http.StatusInternalServerError,
-			Checks:   checks(wasUpdateCalled(1)),
-		},
-		"URL watcher without changedetection": {
-			DB: &DBMock{
-				FetchDocumentHookFunc: func(context.Context, xid.ID, string) (*hookCore.Hook, error) {
-					return urlWatcherHook(), nil
-				},
-			},
-			RespCode: http.StatusConflict,
-			Checks:   checks(wasUpdateCalled(0)),
+			Resets:   1,
 		},
 		"Successful reset": {
-			DB: &DBMock{
-				FetchDocumentHookFunc: func(context.Context, xid.ID, string) (*hookCore.Hook, error) {
-					return scheduledHook(hookCore.TypeScheduledReminder), nil
+			Man: &ManagerMock{
+				ResetHookFunc: func(context.Context, xid.ID, xid.ID, string) (*hookCore.Hook, error) {
+					return &hookCore.Hook{
+						ID:             _hookID,
+						Type:           hookCore.TypeScheduledReminder,
+						DocumentID:     null.ValueFrom(_documentID),
+						OrganizationID: null.StringFrom("org1"),
+						BranchID:       null.ValueFrom(_branchID),
+						Settings:       processor.Settings(`{"scale":"linear"}`),
+					}, nil
 				},
 			},
 			RespCode: http.StatusOK,
-			Checks:   checks(wasUpdateCalled(1)),
+			Resets:   1,
 		},
 	}
 
@@ -798,150 +537,72 @@ func Test_Handler_ResetDocumentHook(t *testing.T) {
 		t.Run(cn, func(t *testing.T) {
 			t.Parallel()
 
-			hdl := Handler{
-				log:             slog.New(slog.DiscardHandler),
-				db:              c.DB,
-				webchangeClient: webchange.NewClient("", ""),
-			}
-			got := recordNotifications(&hdl)
-
-			req := httptest.NewRequest(http.MethodPost, "http://test.com/", http.NoBody)
-
-			ctx := req.Context()
-
-			if !c.NoSession {
-				ctx = addSession(ctx)
-			}
-
-			if !c.OmitDoc {
-				ctx = testutil.AddChiCtx(ctx, "documentId", _documentID.String())
-			}
-
-			if !c.OmitID {
-				ctx = testutil.AddChiCtx(ctx, "hookId", _hookID.String())
-			}
+			hdl := NewHandler(slog.New(slog.DiscardHandler), &DBMock{}, c.Man)
 
 			rec := httptest.NewRecorder()
 
-			hdl.ResetDocumentHook(rec, req.WithContext(ctx))
-
-			assertNotified(t, *got, rec.Code)
+			hdl.ResetDocumentHook(rec, hookRequest(http.MethodPut, "", c.NoSession, c.OmitDoc, c.OmitHook))
 
 			assert.Equal(t, c.RespCode, rec.Code)
 
-			for _, ch := range c.Checks {
-				ch(t, c.DB, rec)
+			ff := c.Man.ResetHookCalls()
+			require.Len(t, ff, c.Resets)
+
+			if c.Resets > 0 {
+				assert.Equal(t, _hookID, ff[0].ID)
+				assert.Equal(t, _documentID, ff[0].DocumentID)
+				assert.Equal(t, "org1", ff[0].OrganizationID)
 			}
 		})
 	}
 }
 
 func Test_Handler_DeleteDocumentHook(t *testing.T) {
-	type check func(*testing.T, *DBMock, *httptest.ResponseRecorder)
-
-	checks := func(cc ...check) []check { return cc }
-
-	wasDeleteCalled := func(count int) check {
-		return func(t *testing.T, db *DBMock, _ *httptest.ResponseRecorder) {
-			ff := db.DeleteDocumentHookCalls()
-			require.Len(t, ff, count)
-
-			if count == 0 {
-				return
-			}
-
-			assert.Equal(t, _hookID, ff[0].ID)
-		}
-	}
-
 	cc := map[string]struct {
-		DB        *DBMock
+		Man       *ManagerMock
 		NoSession bool
 		OmitDoc   bool
-		OmitID    bool
+		OmitHook  bool
 		RespCode  int
-		Checks    []check
+		Deletes   int
 	}{
 		"No session in context": {
-			DB:        &DBMock{},
+			Man:       &ManagerMock{},
 			NoSession: true,
 			RespCode:  http.StatusUnauthorized,
-			Checks:    checks(wasDeleteCalled(0)),
 		},
 		"Missing document ID parameter": {
-			DB:       &DBMock{},
+			Man:      &ManagerMock{},
 			OmitDoc:  true,
 			RespCode: http.StatusNotFound,
-			Checks:   checks(wasDeleteCalled(0)),
 		},
 		"Missing hook ID parameter": {
-			DB:       &DBMock{},
-			OmitID:   true,
+			Man:      &ManagerMock{},
+			OmitHook: true,
 			RespCode: http.StatusNotFound,
-			Checks:   checks(wasDeleteCalled(0)),
 		},
 		"Hook of another document": {
-			DB: &DBMock{
-				FetchDocumentHookFunc: func(context.Context, xid.ID, string) (*hookCore.Hook, error) {
-					hk := scheduledHook(hookCore.TypeScheduledReminder)
-					hk.DocumentID = null.ValueFrom(xid.New())
-
-					return hk, nil
+			Man: &ManagerMock{
+				DeleteHookFunc: func(context.Context, xid.ID, xid.ID, string, string) error {
+					return hookCore.ErrHookMismatch
 				},
 			},
 			RespCode: http.StatusNotFound,
-			Checks:   checks(wasDeleteCalled(0)),
+			Deletes:  1,
 		},
-		"Hook fetch error": {
-			DB: &DBMock{
-				FetchDocumentHookFunc: func(context.Context, xid.ID, string) (*hookCore.Hook, error) {
-					return nil, errors.New("boom")
-				},
-			},
-			RespCode: http.StatusInternalServerError,
-			Checks:   checks(wasDeleteCalled(0)),
-		},
-		"External cleanup error": {
-			DB: &DBMock{
-				FetchDocumentHookFunc: func(context.Context, xid.ID, string) (*hookCore.Hook, error) {
-					return scheduledHook("bogus"), nil
-				},
-			},
-			RespCode: http.StatusInternalServerError,
-			Checks:   checks(wasDeleteCalled(0)),
-		},
-		"Hook deletion error": {
-			DB: &DBMock{
-				FetchDocumentHookFunc: func(context.Context, xid.ID, string) (*hookCore.Hook, error) {
-					return scheduledHook(hookCore.TypeScheduledReminder), nil
-				},
-				DeleteDocumentHookFunc: func(context.Context, xid.ID) error {
+		"Error returned by Manager.DeleteHook": {
+			Man: &ManagerMock{
+				DeleteHookFunc: func(context.Context, xid.ID, xid.ID, string, string) error {
 					return errors.New("boom")
 				},
 			},
 			RespCode: http.StatusInternalServerError,
-			Checks:   checks(wasDeleteCalled(1)),
+			Deletes:  1,
 		},
 		"Successful deletion": {
-			DB: &DBMock{
-				FetchDocumentHookFunc: func(context.Context, xid.ID, string) (*hookCore.Hook, error) {
-					return scheduledHook(hookCore.TypeScheduledReminder), nil
-				},
-			},
+			Man:      &ManagerMock{},
 			RespCode: http.StatusNoContent,
-			Checks:   checks(wasDeleteCalled(1)),
-		},
-
-		// an unconfigured changedetection must not trap the row: the
-		// teardown is skipped and the deletion proceeds.
-		"URL watcher deletion without changedetection": {
-			DB: &DBMock{
-				FetchDocumentHookFunc: func(context.Context, xid.ID, string) (*hookCore.Hook, error) {
-					return urlWatcherHook(), nil
-				},
-			},
-			RespCode: http.StatusNoContent,
-			Checks:   checks(wasDeleteCalled(1)),
+			Deletes:  1,
 		},
 	}
 
@@ -949,39 +610,22 @@ func Test_Handler_DeleteDocumentHook(t *testing.T) {
 		t.Run(cn, func(t *testing.T) {
 			t.Parallel()
 
-			hdl := Handler{
-				log:             slog.New(slog.DiscardHandler),
-				db:              c.DB,
-				webchangeClient: webchange.NewClient("", ""),
-			}
-			got := recordNotifications(&hdl)
-
-			req := httptest.NewRequest(http.MethodDelete, "http://test.com/", http.NoBody)
-
-			ctx := req.Context()
-
-			if !c.NoSession {
-				ctx = addSession(ctx)
-			}
-
-			if !c.OmitDoc {
-				ctx = testutil.AddChiCtx(ctx, "documentId", _documentID.String())
-			}
-
-			if !c.OmitID {
-				ctx = testutil.AddChiCtx(ctx, "hookId", _hookID.String())
-			}
+			hdl := NewHandler(slog.New(slog.DiscardHandler), &DBMock{}, c.Man)
 
 			rec := httptest.NewRecorder()
 
-			hdl.DeleteDocumentHook(rec, req.WithContext(ctx))
-
-			assertNotified(t, *got, rec.Code)
+			hdl.DeleteDocumentHook(rec, hookRequest(http.MethodDelete, "", c.NoSession, c.OmitDoc, c.OmitHook))
 
 			assert.Equal(t, c.RespCode, rec.Code)
 
-			for _, ch := range c.Checks {
-				ch(t, c.DB, rec)
+			ff := c.Man.DeleteHookCalls()
+			require.Len(t, ff, c.Deletes)
+
+			if c.Deletes > 0 {
+				assert.Equal(t, _hookID, ff[0].ID)
+				assert.Equal(t, _documentID, ff[0].DocumentID)
+				assert.Equal(t, "org1", ff[0].OrganizationID)
+				assert.Equal(t, "u1", ff[0].UpdatedBy)
 			}
 		})
 	}

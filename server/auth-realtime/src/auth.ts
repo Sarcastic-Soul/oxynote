@@ -2,6 +2,7 @@ import { betterAuth } from "better-auth"
 import {
 	APIError,
 	createAuthMiddleware,
+	createEmailVerificationToken,
 	getSessionFromCtx,
 } from "better-auth/api"
 import { jwt, organization } from "better-auth/plugins"
@@ -9,6 +10,7 @@ import { electron } from "@better-auth/electron"
 import { mcp } from "@better-auth/mcp"
 import type { PostgresDialect } from "kysely"
 import { z } from "zod"
+import { bootstrapAdmin } from "./bootstrap.js"
 import type { Store } from "./db.js"
 import type { CoreClient, EmailTemplate } from "./core.js"
 import type { Env, SocialProviderName } from "./env.js"
@@ -149,16 +151,18 @@ export interface InvitationData {
 
 // the invite link the emailed button points at. Everything the
 // accept-invite page needs to render before the user has a session travels
-// in the query string.
+// in the query string. The values are encoded, because a name can hold
+// spaces.
 export function invitationLink(env: Env, data: InvitationData): string {
-	return (
-		env.organizationInvitationUrl +
-		`?id=${data.id}` +
-		`&email=${data.email}` +
-		`&inviter=${data.inviter.user.name}` +
-		`&orgName=${data.organization.name}` +
-		`&orgId=${data.organization.id}`
-	)
+	const query = new URLSearchParams({
+		id: data.id,
+		email: data.email,
+		inviter: data.inviter.user.name,
+		orgName: data.organization.name,
+		orgId: data.organization.id,
+	})
+
+	return `${env.organizationInvitationUrl}?${query.toString()}`
 }
 
 // bind an MCP token to the user's organization at issuance, the same way
@@ -339,6 +343,115 @@ export async function confirmWithPassword(
 	})
 
 	return ctx.json({ status: true })
+}
+
+// a single-organization deployment has no open signup: a request creates
+// an account only for an address with a pending invitation. A user created
+// outside any request is the bootstrap's admin.
+export async function checkSignUpAllowed(
+	env: Env,
+	store: Store,
+	email: string,
+	fromRequest: boolean,
+): Promise<void> {
+	if (env.maxOrganizations !== 1 || !fromRequest) {
+		return
+	}
+
+	const allowed = await reported(() => store.hasPendingInvitation(email))
+	if (allowed) {
+		return
+	}
+
+	// not a 403: better-auth answers that on signup with a fake success.
+	throw APIError.from("BAD_REQUEST", {
+		code: "SIGN_UP_DISABLED",
+		message: "Sign-up is by invitation only",
+	})
+}
+
+// a single-organization deployment keeps at least one member, because
+// nobody can sign up to take over an empty organization. The callback is
+// checked too, since members may leave between the request and the link.
+export async function refuseLastMemberDeletion(
+	env: Env,
+	store: Store,
+	path: string,
+	currentUser: () => Promise<SessionUser | undefined>,
+): Promise<void> {
+	if (
+		env.maxOrganizations !== 1 ||
+		(path !== "/delete-user" && path !== "/delete-user/callback")
+	) {
+		return
+	}
+
+	// the endpoint's own session check answers a caller without one.
+	const user = await currentUser()
+	if (!user) {
+		return
+	}
+
+	const last = await reported(async () => {
+		const organizationId = await store.userOrganizationId(user.id)
+
+		return (
+			organizationId !== null &&
+			(await store.organizationMemberCount(organizationId)) <=
+				1
+		)
+	})
+	if (!last) {
+		return
+	}
+
+	throw APIError.from("FORBIDDEN", {
+		code: "LAST_ORGANIZATION_MEMBER",
+		message: "The last member of the organization cannot be deleted",
+	})
+}
+
+// the first step of a change of address: the current address approves it,
+// and better-auth then emails the new one through sendVerificationEmail.
+// Sending the approval to the new address would ask it to approve its own
+// claim. The bootstrap admin's address receives no mail, so the new
+// address gets the link that completes the change instead, the one
+// better-auth sends when no approval is configured. better-auth signs its
+// tokens with the configured secret, so this one verifies like its own.
+export async function sendChangeEmailConfirmation(
+	env: Env,
+	core: CoreClient,
+	{
+		user,
+		newEmail,
+		url,
+	}: { user: { email: string }; newEmail: string; url: string },
+): Promise<void> {
+	if (user.email !== bootstrapAdmin.email) {
+		await core.sendEmail("email_change_confirmation", {
+			email: user.email,
+			link: toPublicAuthUrl(env, url),
+		})
+
+		return
+	}
+
+	const link = new URL(toPublicAuthUrl(env, url))
+	link.searchParams.set(
+		"token",
+		await createEmailVerificationToken(
+			env.betterAuthSecret,
+			user.email,
+			newEmail,
+			undefined,
+			{ requestType: "change-email-verification" },
+		),
+	)
+
+	await core.sendEmail("email_verification", {
+		email: newEmail,
+		link: link.toString(),
+	})
 }
 
 export function createSecondaryStorage(redis: SecondaryStorageClient) {
@@ -556,23 +669,13 @@ export function createAuth({
 			},
 			changeEmail: {
 				enabled: true,
-				// the first step of a change of address: the current
-				// address approves it, and better-auth then emails the
-				// new one through sendVerificationEmail above. Sending
-				// this to the new address instead would ask it to
-				// approve its own claim.
 				sendChangeEmailConfirmation: env.emailEnabled
-					? async ({ user, url }) => {
+					? async (data) => {
 							await reported(() =>
-								core.sendEmail(
-									"email_change_confirmation",
-									{
-										email: user.email,
-										link: toPublicAuthUrl(
-											env,
-											url,
-										),
-									},
+								sendChangeEmailConfirmation(
+									env,
+									core,
+									data,
 								),
 							)
 						}
@@ -647,7 +750,14 @@ export function createAuth({
 					organizationHooks.canCreateOrganization,
 				disableOrganizationDeletion: true, // prevent clients from deleting the org
 				organizationLimit: 1,
-				membershipLimit: env.maxOrganizationMembers,
+				// better-auth also passes the limit to the database
+				// as the page size of a member list, which cannot be
+				// Infinity.
+				membershipLimit: Number.isFinite(
+					env.maxOrganizationMembers,
+				)
+					? env.maxOrganizationMembers
+					: Number.MAX_SAFE_INTEGER,
 				schema: {
 					session: {
 						fields: {
@@ -704,177 +814,197 @@ export function createAuth({
 					},
 				},
 			}),
-			mcp({
-				loginPage: `${env.frontendUrl}/login`,
-				consentPage: `${env.frontendUrl}/oauth-consent`,
-				resource: env.mcpResource,
-				scopes: [
-					"documents:read",
-					"documents:write",
-					"data-sources:read",
-				],
-				// MCP clients self-register per RFC 7591 before
-				// the user has any session, so registration must
-				// be open. What a client can actually do is
-				// still gated by the user's consent and the
-				// token scopes.
-				allowDynamicClientRegistration: true,
-				allowUnauthenticatedClientRegistration: true,
-				customAccessTokenClaims: ({ user }) =>
-					organizationClaims(store, user),
-				schema: {
-					oauthClient: {
-						modelName: "oauth_clients",
-						fields: {
-							clientId: "client_id",
-							clientSecret:
-								"client_secret",
-							clientDiscoveryId:
-								"client_discovery_id",
-							skipConsent:
-								"skip_consent",
-							enableEndSession:
-								"enable_end_session",
-							subjectType:
-								"subject_type",
-							clientCredentialsScopes:
-								"client_credentials_scopes",
-							userId: "fk_user_id",
-							createdAt: "created_at",
-							updatedAt: "updated_at",
-							softwareId: "software_id",
-							softwareVersion:
-								"software_version",
-							softwareStatement:
-								"software_statement",
-							redirectUris:
-								"redirect_uris",
-							postLogoutRedirectUris:
-								"post_logout_redirect_uris",
-							backchannelLogoutUri:
-								"backchannel_logout_uri",
-							backchannelLogoutSessionRequired:
-								"backchannel_logout_session_required",
-							tokenEndpointAuthMethod:
-								"token_endpoint_auth_method",
-							applicationType:
-								"application_type",
-							jwksUri: "jwks_uri",
-							grantTypes: "grant_types",
-							responseTypes:
-								"response_types",
-							requirePKCE:
-								"require_pkce",
-							dpopBoundAccessTokens:
-								"dpop_bound_access_tokens",
-							referenceId:
-								"reference_id",
-						},
-					},
-					oauthResource: {
-						modelName: "oauth_resources",
-						fields: {
-							accessTokenTtl:
-								"access_token_ttl",
-							refreshTokenTtl:
-								"refresh_token_ttl",
-							signingAlgorithm:
-								"signing_algorithm",
-							signingKeyId:
-								"signing_key_id",
-							allowedScopes:
-								"allowed_scopes",
-							customClaims:
-								"custom_claims",
-							dpopBoundAccessTokensRequired:
-								"dpop_bound_access_tokens_required",
-							createdAt: "created_at",
-							updatedAt: "updated_at",
-							policyVersion:
-								"policy_version",
-						},
-					},
-					oauthClientResource: {
-						modelName: "oauth_client_resources",
-						fields: {
-							clientId: "client_id",
-							resourceId: "resource_id",
-							createdAt: "created_at",
-						},
-					},
-					oauthRefreshToken: {
-						modelName: "oauth_refresh_tokens",
-						fields: {
-							clientId: "client_id",
-							sessionId: "session_id",
-							userId: "fk_user_id",
-							referenceId:
-								"reference_id",
-							authorizationCodeId:
-								"authorization_code_id",
-							requestedUserInfoClaims:
-								"requested_user_info_claims",
-							expiresAt: "expires_at",
-							createdAt: "created_at",
-							rotatedAt: "rotated_at",
-							rotationReplayResponse:
-								"rotation_replay_response",
-							rotationReplayExpiresAt:
-								"rotation_replay_expires_at",
-							authTime: "auth_time",
-						},
-					},
-					oauthAccessToken: {
-						modelName: "oauth_access_tokens",
-						fields: {
-							clientId: "client_id",
-							sessionId: "session_id",
-							userId: "fk_user_id",
-							referenceId:
-								"reference_id",
-							authorizationCodeId:
-								"authorization_code_id",
-							requestedUserInfoClaims:
-								"requested_user_info_claims",
-							refreshId: "fk_refresh_token_id",
-							expiresAt: "expires_at",
-							createdAt: "created_at",
-						},
-					},
-					oauthConsent: {
-						modelName: "oauth_consents",
-						fields: {
-							clientId: "client_id",
-							userId: "fk_user_id",
-							referenceId:
-								"reference_id",
-							requestedUserInfoClaims:
-								"requested_user_info_claims",
-							createdAt: "created_at",
-							updatedAt: "updated_at",
-						},
-					},
-					oauthClientAssertion: {
-						modelName: "oauth_client_assertions",
-						fields: {
-							expiresAt: "expires_at",
-						},
-					},
-				},
-			}),
+			// MCP is off when no resource URL is set. Better Auth rejects
+			// a plain-http resource on a non-loopback host.
+			...(env.mcpResource === undefined
+				? []
+				: [
+						mcp({
+							loginPage: `${env.frontendUrl}/login`,
+							consentPage: `${env.frontendUrl}/oauth-consent`,
+							resource: env.mcpResource,
+							scopes: [
+								"documents:read",
+								"documents:write",
+								"data-sources:read",
+								"offline_access",
+							],
+							// MCP clients self-register per RFC 7591 before
+							// the user has any session, so registration must
+							// be open. What a client can actually do is
+							// still gated by the user's consent and the
+							// token scopes.
+							allowDynamicClientRegistration: true,
+							allowUnauthenticatedClientRegistration: true,
+							customAccessTokenClaims:
+								({ user }) =>
+									organizationClaims(
+										store,
+										user,
+									),
+							schema: {
+								oauthClient: {
+									modelName: "oauth_clients",
+									fields: {
+										clientId: "client_id",
+										clientSecret:
+											"client_secret",
+										clientDiscoveryId:
+											"client_discovery_id",
+										skipConsent:
+											"skip_consent",
+										enableEndSession:
+											"enable_end_session",
+										subjectType:
+											"subject_type",
+										clientCredentialsScopes:
+											"client_credentials_scopes",
+										userId: "fk_user_id",
+										createdAt: "created_at",
+										updatedAt: "updated_at",
+										softwareId: "software_id",
+										softwareVersion:
+											"software_version",
+										softwareStatement:
+											"software_statement",
+										redirectUris:
+											"redirect_uris",
+										postLogoutRedirectUris:
+											"post_logout_redirect_uris",
+										backchannelLogoutUri:
+											"backchannel_logout_uri",
+										backchannelLogoutSessionRequired:
+											"backchannel_logout_session_required",
+										tokenEndpointAuthMethod:
+											"token_endpoint_auth_method",
+										applicationType:
+											"application_type",
+										jwksUri: "jwks_uri",
+										grantTypes: "grant_types",
+										responseTypes:
+											"response_types",
+										requirePKCE:
+											"require_pkce",
+										dpopBoundAccessTokens:
+											"dpop_bound_access_tokens",
+										referenceId:
+											"reference_id",
+									},
+								},
+								oauthResource: {
+									modelName: "oauth_resources",
+									fields: {
+										accessTokenTtl:
+											"access_token_ttl",
+										refreshTokenTtl:
+											"refresh_token_ttl",
+										signingAlgorithm:
+											"signing_algorithm",
+										signingKeyId:
+											"signing_key_id",
+										allowedScopes:
+											"allowed_scopes",
+										customClaims:
+											"custom_claims",
+										dpopBoundAccessTokensRequired:
+											"dpop_bound_access_tokens_required",
+										createdAt: "created_at",
+										updatedAt: "updated_at",
+										policyVersion:
+											"policy_version",
+									},
+								},
+								oauthClientResource:
+									{
+										modelName: "oauth_client_resources",
+										fields: {
+											clientId: "client_id",
+											resourceId: "resource_id",
+											createdAt: "created_at",
+										},
+									},
+								oauthRefreshToken:
+									{
+										modelName: "oauth_refresh_tokens",
+										fields: {
+											clientId: "client_id",
+											sessionId: "session_id",
+											userId: "fk_user_id",
+											referenceId:
+												"reference_id",
+											authorizationCodeId:
+												"authorization_code_id",
+											requestedUserInfoClaims:
+												"requested_user_info_claims",
+											expiresAt: "expires_at",
+											createdAt: "created_at",
+											rotatedAt: "rotated_at",
+											rotationReplayResponse:
+												"rotation_replay_response",
+											rotationReplayExpiresAt:
+												"rotation_replay_expires_at",
+											authTime: "auth_time",
+										},
+									},
+								oauthAccessToken:
+									{
+										modelName: "oauth_access_tokens",
+										fields: {
+											clientId: "client_id",
+											sessionId: "session_id",
+											userId: "fk_user_id",
+											referenceId:
+												"reference_id",
+											authorizationCodeId:
+												"authorization_code_id",
+											requestedUserInfoClaims:
+												"requested_user_info_claims",
+											refreshId: "fk_refresh_token_id",
+											expiresAt: "expires_at",
+											createdAt: "created_at",
+										},
+									},
+								oauthConsent: {
+									modelName: "oauth_consents",
+									fields: {
+										clientId: "client_id",
+										userId: "fk_user_id",
+										referenceId:
+											"reference_id",
+										requestedUserInfoClaims:
+											"requested_user_info_claims",
+										createdAt: "created_at",
+										updatedAt: "updated_at",
+									},
+								},
+								oauthClientAssertion:
+									{
+										modelName: "oauth_client_assertions",
+										fields: {
+											expiresAt: "expires_at",
+										},
+									},
+							},
+						}),
+					]),
 		],
 		hooks: {
 			before: createAuthMiddleware(async (ctx) => {
+				const currentUser = async () =>
+					(await getSessionFromCtx(ctx))?.user
+
+				await refuseLastMemberDeletion(
+					env,
+					store,
+					ctx.path,
+					currentUser,
+				)
+
 				if (!env.emailEnabled) {
 					const answer =
 						await confirmWithPassword(
 							ctx,
-							async () =>
-								(
-									await getSessionFromCtx(
-										ctx,
-									)
-								)?.user,
+							currentUser,
 						)
 					if (answer !== undefined) {
 						return answer
@@ -888,6 +1018,22 @@ export function createAuth({
 			}),
 		},
 		databaseHooks: {
+			user: {
+				create: {
+					// better-auth hands the hook the
+					// request's context. For a call from
+					// this service's own code it is
+					// undefined, though typed as null.
+					before: async (user, ctx) => {
+						await checkSignUpAllowed(
+							env,
+							store,
+							user.email,
+							Boolean(ctx),
+						)
+					},
+				},
+			},
 			session: {
 				create: {
 					before: async (session) =>

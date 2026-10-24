@@ -1,17 +1,20 @@
 package tools
 
 import (
+	"cmp"
 	"context"
+	"encoding/json"
+	"errors"
 	"maps"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/oxynote/oxynote/server/core/internal/assistant/block"
 	"github.com/oxynote/oxynote/server/core/internal/datasource"
 	datasourceMock "github.com/oxynote/oxynote/server/core/internal/datasource/_mock"
 	"github.com/oxynote/oxynote/server/core/internal/datasource/processor"
-	"github.com/oxynote/oxynote/server/core/internal/document"
+	"github.com/oxynote/oxynote/server/core/internal/variable"
 	"github.com/oxynote/oxynote/server/core/pkg/errutil"
 	"github.com/oxynote/oxynote/server/core/pkg/testutil"
 	"github.com/oxynote/oxynote/server/core/pkg/timeutil"
@@ -24,16 +27,9 @@ import (
 // _testDataSourceID is the id every data-source test addresses.
 var _testDataSourceID = xid.New()
 
-// dataSourceDeps builds session wiring whose data-source lookups answer
-// with one data source of the given type, and whose runner is the given
-// mock.
-func dataSourceDeps(t *testing.T, typ datasource.Type, runner *datasourceMock.Runner) *Deps {
-	t.Helper()
-
-	if runner == nil {
-		runner = &datasourceMock.Runner{}
-	}
-
+// dataSourceDB builds a database whose data-source lookups answer with
+// one data source of the given type.
+func dataSourceDB(typ datasource.Type) *DBMock {
 	ds := datasource.DataSource{
 		ID:     _testDataSourceID,
 		Name:   "prod",
@@ -42,7 +38,7 @@ func dataSourceDeps(t *testing.T, typ datasource.Type, runner *datasourceMock.Ru
 		Status: processor.ConnectionStatusSuccess,
 	}
 
-	db := &DBMock{
+	return &DBMock{
 		FetchDataSourceFunc: func(_ context.Context, id xid.ID, orgID string) (*datasource.DataSource, error) {
 			if id != _testDataSourceID || orgID != "org" {
 				return nil, errutil.ErrNotFound
@@ -60,8 +56,19 @@ func dataSourceDeps(t *testing.T, typ datasource.Type, runner *datasourceMock.Ru
 			return []datasource.DataSource{ds}, nil
 		},
 	}
+}
 
-	d := testDeps(db, nil, nil)
+// dataSourceDeps builds session wiring whose data-source lookups answer
+// with one data source of the given type, and whose runner is the given
+// mock.
+func dataSourceDeps(t *testing.T, typ datasource.Type, runner *datasourceMock.Runner) *Deps {
+	t.Helper()
+
+	if runner == nil {
+		runner = &datasourceMock.Runner{}
+	}
+
+	d := testDeps(dataSourceDB(typ), nil, nil)
 	d.runners = &DataSourceRunnersMock{
 		RunnerFunc: func(datasource.DataSource) datasource.Runner { return runner },
 	}
@@ -69,75 +76,31 @@ func dataSourceDeps(t *testing.T, typ datasource.Type, runner *datasourceMock.Ru
 	return d
 }
 
-// prometheusRunner builds a runner handing out the given Prometheus
-// client. A nil client is a data source that cannot serve one, which is
-// what the real runner reports for the wrong type or a failed
-// connection.
-func prometheusRunner(client *datasourceMock.Prometheus) *datasourceMock.Runner {
-	return &datasourceMock.Runner{
-		TypeFunc: func() datasource.Type { return datasource.TypePrometheus },
-		PrometheusFunc: func(context.Context) (datasource.Prometheus, error) {
-			if client == nil {
-				return nil, assert.AnError
-			}
-
-			return client, nil
-		},
-	}
-}
-
-// sqlRunner builds a runner handing out the given dialect-agnostic SQL
-// client.
-func sqlRunner(client *datasourceMock.SQL) *datasourceMock.Runner {
-	return &datasourceMock.Runner{
-		TypeFunc: func() datasource.Type { return datasource.TypePostgreSQL },
-		SQLFunc: func(context.Context) (datasource.SQL, error) {
-			if client == nil {
-				return nil, assert.AnError
-			}
-
-			return client, nil
-		},
-	}
-}
-
-// dialectRunner builds a runner of the given type handing out both
-// dialect clients, so query_sql's own dispatch is what decides which
-// one is reached.
-func dialectRunner(typ datasource.Type, pg *datasourceMock.PostgreSQL, my *datasourceMock.MySQL) *datasourceMock.Runner {
-	return &datasourceMock.Runner{
-		TypeFunc: func() datasource.Type { return typ },
-		PostgreSQLFunc: func(context.Context) (datasource.PostgreSQL, error) {
-			if pg == nil {
-				return nil, assert.AnError
-			}
-
-			return pg, nil
-		},
-		MySQLFunc: func(context.Context) (datasource.MySQL, error) {
-			if my == nil {
-				return nil, assert.AnError
-			}
-
-			return my, nil
-		},
-	}
-}
-
 // dataSourceCase is one data-source tool call: the wiring it runs
 // against, the arguments the model supplied, and what it should produce.
 type dataSourceCase struct {
-	// Type is the data source's type, which decides what the lookup
-	// reports and, for query_sql, which dialect is reached.
+	// Type is the data source's type. The lookup reports it, and the
+	// runner says it is what it reads.
 	Type datasource.Type
 
-	// Runner is the runner the call reads through. Nil is a don't-care
-	// stub whose accessors hand out nothing.
-	Runner *datasourceMock.Runner
+	// DB answers the data-source lookups. Nil holds one data source of
+	// Type.
+	DB *DBMock
 
-	// Deps overrides the wiring entirely, for the cases that need the
-	// lookup itself to fail.
-	Deps *Deps
+	// Variables answers the variable reads. Nil holds the stubbed tree.
+	Variables *VariableManagerMock
+
+	// Prometheus, SQL, PostgreSQL and MySQL are the clients the runner
+	// hands out. Nil is a don't-care client.
+	Prometheus *datasourceMock.Prometheus
+	SQL        *datasourceMock.SQL
+	PostgreSQL *datasourceMock.PostgreSQL
+	MySQL      *datasourceMock.MySQL
+
+	// NoClient indicates the runner hands out no client at all, which is
+	// what the real runner reports for the wrong type or a failed
+	// connection.
+	NoClient bool
 
 	// Args is the raw JSON the model supplied.
 	Args string
@@ -145,28 +108,131 @@ type dataSourceCase struct {
 	// Contains is a fragment the result has to carry.
 	Contains string
 
+	// Omits are fragments the result must not carry.
+	Omits []string
+
 	// Err is the expected failure, if any.
 	Err error
+
+	// Calls is how often the call reaches each mocked method.
+	Calls dataSourceCalls
 }
 
-// runDataSourceCase executes a data-source tool and asserts the outcome.
+// dataSourceCalls counts the calls a data-source tool makes to each
+// mocked method it can reach. Each field is named after its method. The
+// runner's accessors take the name of the client they hand out, and a
+// method two clients share is prefixed with its client.
+type dataSourceCalls struct {
+	FetchDataSources   int
+	FetchDataSource    int
+	Runner             int
+	FetchTree          int
+	Type               int
+	Prometheus         int
+	SQL                int
+	PostgreSQL         int
+	MySQL              int
+	PrometheusMetadata int
+	LabelNames         int
+	LabelValues        int
+	Series             int
+	QueryRange         int
+	SQLMetadata        int
+	PostgreSQLQuery    int
+	MySQLQuery         int
+}
+
+// runDataSourceCase executes a data-source tool and asserts the outcome
+// and the calls it made.
 func runDataSourceCase(t *testing.T, tl Tool, name Name, c dataSourceCase) {
 	t.Helper()
 
-	d := c.Deps
-	if d == nil {
-		d = dataSourceDeps(t, c.Type, c.Runner)
+	variables := cmp.Or(c.Variables, stubVariableManager())
+	prom := cmp.Or(c.Prometheus, &datasourceMock.Prometheus{})
+	sql := cmp.Or(c.SQL, &datasourceMock.SQL{})
+	pg := cmp.Or(c.PostgreSQL, &datasourceMock.PostgreSQL{})
+	my := cmp.Or(c.MySQL, &datasourceMock.MySQL{})
+
+	runner := &datasourceMock.Runner{
+		TypeFunc: func() datasource.Type { return c.Type },
+		PrometheusFunc: func(context.Context) (datasource.Prometheus, error) {
+			if c.NoClient {
+				return nil, assert.AnError
+			}
+
+			return prom, nil
+		},
+		SQLFunc: func(context.Context) (datasource.SQL, error) {
+			if c.NoClient {
+				return nil, assert.AnError
+			}
+
+			return sql, nil
+		},
+		PostgreSQLFunc: func(context.Context) (datasource.PostgreSQL, error) {
+			if c.NoClient {
+				return nil, assert.AnError
+			}
+
+			return pg, nil
+		},
+		MySQLFunc: func(context.Context) (datasource.MySQL, error) {
+			if c.NoClient {
+				return nil, assert.AnError
+			}
+
+			return my, nil
+		},
 	}
 
-	got, err := tl.Execute(testInput(d, name, c.Args))
+	d := dataSourceDeps(t, c.Type, runner)
+	d.variableMan = variables
+
+	if c.DB != nil {
+		d.db = c.DB
+	}
+
+	db, ok := d.db.(*DBMock)
+	require.True(t, ok)
+
+	runners, ok := d.runners.(*DataSourceRunnersMock)
+	require.True(t, ok)
+
+	got, err := tl.Execute(d.newInput(context.Background(), name, json.RawMessage(c.Args)))
 
 	testutil.AssertEqualError(t, c.Err, err)
+
+	calls := dataSourceCalls{
+		FetchDataSources:   len(db.FetchDataSourcesCalls()),
+		FetchDataSource:    len(db.FetchDataSourceCalls()),
+		Runner:             len(runners.RunnerCalls()),
+		FetchTree:          len(variables.FetchTreeCalls()),
+		Type:               len(runner.TypeCalls()),
+		Prometheus:         len(runner.PrometheusCalls()),
+		SQL:                len(runner.SQLCalls()),
+		PostgreSQL:         len(runner.PostgreSQLCalls()),
+		MySQL:              len(runner.MySQLCalls()),
+		PrometheusMetadata: len(prom.MetadataCalls()),
+		LabelNames:         len(prom.LabelNamesCalls()),
+		LabelValues:        len(prom.LabelValuesCalls()),
+		Series:             len(prom.SeriesCalls()),
+		QueryRange:         len(prom.QueryRangeCalls()),
+		SQLMetadata:        len(sql.MetadataCalls()),
+		PostgreSQLQuery:    len(pg.QueryCalls()),
+		MySQLQuery:         len(my.QueryCalls()),
+	}
+
+	assert.Equal(t, c.Calls, calls)
 
 	if c.Err != nil {
 		return
 	}
 
 	assert.Contains(t, got, c.Contains)
+
+	for _, absent := range c.Omits {
+		assert.NotContains(t, got, absent)
+	}
 }
 
 // _badIDCases are the ways the model can name a data source that cannot
@@ -184,9 +250,10 @@ func badIDCases(argsFor func(id string) string) map[string]dataSourceCase {
 			Err:  assert.AnError,
 		},
 		"An id from another organisation": {
-			Type: datasource.TypePrometheus,
-			Args: argsFor(xid.New().String()),
-			Err:  assert.AnError,
+			Type:  datasource.TypePrometheus,
+			Args:  argsFor(xid.New().String()),
+			Err:   assert.AnError,
+			Calls: dataSourceCalls{FetchDataSource: 1},
 		},
 	}
 }
@@ -196,46 +263,34 @@ func Test_listDataSources_Info(t *testing.T) {
 
 	info := listDataSources{}.Info()
 
+	assert.Equal(t, Traits{DataSource: true, Group: GroupDataSources}, info.Traits)
+
 	assert.Equal(t, NameListDataSources, info.Name)
 	assert.Empty(t, info.Required)
 	assert.Empty(t, info.Properties)
 }
 
-func Test_listDataSources_Traits(t *testing.T) {
-	t.Parallel()
-
-	assert.Equal(t, Traits{DataSource: true}, listDataSources{}.Traits())
-}
-
-func Test_listDataSources_Title(t *testing.T) {
-	t.Parallel()
-
-	got, err := listDataSources{}.Title(testInput(
-		dataSourceDeps(t, datasource.TypePrometheus, nil),
-		NameListDataSources,
-		"",
-	))
-	require.NoError(t, err)
-	assert.Empty(t, got)
-}
-
 func Test_listDataSources_Execute(t *testing.T) {
 	t.Parallel()
 
-	failing := testDeps(&DBMock{
-		FetchDataSourcesFunc: func(context.Context, string) ([]datasource.DataSource, error) {
-			return nil, assert.AnError
-		},
-	}, nil, nil)
-
 	cc := map[string]dataSourceCase{
-		"The organisation's data sources": {
+		// the id, the name, the type and the status are what a tool needs to
+		// be addressed; the URL and the credentials are the organisation's
+		// secret and never reach the model.
+		"Data sources of the organisation": {
 			Type:     datasource.TypePrometheus,
-			Contains: `"name":"prod"`,
+			Contains: `{"id":"` + _testDataSourceID.String() + `","name":"prod","type":"prometheus","status":"success"}`,
+			Omits:    []string{"prometheus:9090", "credentials"},
+			Calls:    dataSourceCalls{FetchDataSources: 1},
 		},
-		"A failing lookup": {
-			Deps: failing,
-			Err:  assert.AnError,
+		"Error returned by DB.FetchDataSources": {
+			DB: &DBMock{
+				FetchDataSourcesFunc: func(context.Context, string) ([]datasource.DataSource, error) {
+					return nil, assert.AnError
+				},
+			},
+			Err:   assert.AnError,
+			Calls: dataSourceCalls{FetchDataSources: 1},
 		},
 	}
 
@@ -246,72 +301,21 @@ func Test_listDataSources_Execute(t *testing.T) {
 			runDataSourceCase(t, listDataSources{}, NameListDataSources, c)
 		})
 	}
-
-	// the id, the name, the type and the status are what a tool needs to
-	// be addressed; the URL and the credentials are the organisation's
-	// secret and never reach the model.
-	got, err := listDataSources{}.Execute(testInput(
-		dataSourceDeps(t, datasource.TypePrometheus, nil),
-		NameListDataSources,
-		"",
-	))
-	require.NoError(t, err)
-	assert.Contains(t, got, _testDataSourceID.String())
-	assert.Contains(t, got, `"type":"prometheus"`)
-	assert.Contains(t, got, `"status":"success"`)
-	assert.NotContains(t, got, "prometheus:9090")
-	assert.NotContains(t, got, "credentials")
 }
 
-func Test_getPrometheusMetadataArgs_Validate(t *testing.T) {
+func Test_dataSourceArgs_Validate(t *testing.T) {
 	t.Parallel()
-
-	assertValidate(t, getPrometheusMetadataArgs{DataSourceID: _testDataSourceID}, map[string]Args{
-		"data_source_id": getPrometheusMetadataArgs{},
-	})
-}
-
-func Test_getPrometheusMetadata_Info(t *testing.T) {
-	t.Parallel()
-
-	info := getPrometheusMetadata{}.Info()
-
-	assert.Equal(t, NameGetPrometheusMetadata, info.Name)
-	assert.Equal(t, []string{"data_source_id"}, info.Required)
-}
-
-func Test_getPrometheusMetadata_Traits(t *testing.T) {
-	t.Parallel()
-
-	assert.Equal(t, Traits{DataSource: true}, getPrometheusMetadata{}.Traits())
-}
-
-func Test_getPrometheusMetadata_Title(t *testing.T) {
-	t.Parallel()
-
-	d := dataSourceDeps(t, datasource.TypePrometheus, nil)
-	other := xid.New().String()
 
 	cc := map[string]struct {
-		Args     string
-		Expected string
-		Err      error
+		Args dataSourceArgs
+		Err  error
 	}{
-		"A data source that resolves is named": {
-			Args:     `{"data_source_id":"` + _testDataSourceID.String() + `"}`,
-			Expected: `Reading metric metadata of "prod"`,
+		"Data source id is required": {
+			Args: dataSourceArgs{},
+			Err:  errors.New("data_source_id is required"),
 		},
-		"One that does not is an error": {
-			Args: `{"data_source_id":"` + other + `"}`,
-			Err:  assert.AnError,
-		},
-		"No id at all": {
-			Args: `{}`,
-			Err:  assert.AnError,
-		},
-		"Unreadable arguments": {
-			Args: `{`,
-			Err:  assert.AnError,
+		"Valid arguments": {
+			Args: dataSourceArgs{DataSourceID: _testDataSourceID},
 		},
 	}
 
@@ -319,54 +323,137 @@ func Test_getPrometheusMetadata_Title(t *testing.T) {
 		t.Run(cn, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := getPrometheusMetadata{}.Title(testInput(d, NameGetPrometheusMetadata, c.Args))
-
-			testutil.AssertEqualError(t, c.Err, err)
-			assert.Equal(t, c.Expected, got)
+			testutil.AssertEqualError(t, c.Err, c.Args.Validate())
 		})
 	}
 }
 
-func Test_getPrometheusMetadata_Execute(t *testing.T) {
+func Test_getDataSourceMetadata_Info(t *testing.T) {
+	t.Parallel()
+
+	info := getDataSourceMetadata{}.Info()
+
+	assert.Equal(t, Traits{DataSource: true, Group: GroupDataSources}, info.Traits)
+
+	assert.Equal(t, NameGetDataSourceMetadata, info.Name)
+	assert.Equal(t, []string{"data_source_id"}, info.Required)
+}
+
+func Test_getDataSourceMetadata_Title(t *testing.T) {
+	t.Parallel()
+
+	cc := map[string]struct {
+		Args            string
+		Expected        string
+		FetchDataSource int
+	}{
+		"A data source that resolves is named": {
+			Args:            `{"data_source_id":"` + _testDataSourceID.String() + `"}`,
+			Expected:        `Reading what "prod" holds`,
+			FetchDataSource: 1,
+		},
+		"One that does not is an error": {
+			Args:            `{"data_source_id":"` + xid.New().String() + `"}`,
+			FetchDataSource: 1,
+		},
+		"No id at all": {
+			Args: `{}`,
+		},
+		"Unreadable arguments": {
+			Args: `{`,
+		},
+	}
+
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			db := dataSourceDB(datasource.TypePrometheus)
+
+			// arguments that name nothing it can describe make no line.
+			assert.Equal(t, c.Expected, getDataSourceMetadata{}.Title(testDeps(db, nil, nil).newInput(context.Background(), NameGetDataSourceMetadata, json.RawMessage(c.Args))))
+			assert.Len(t, db.FetchDataSourceCalls(), c.FetchDataSource)
+		})
+	}
+}
+
+func Test_getDataSourceMetadata_Execute(t *testing.T) {
 	t.Parallel()
 
 	id := _testDataSourceID.String()
 
-	cc := map[string]dataSourceCase{
-		"The data source's metric metadata": {
-			Type: datasource.TypePrometheus,
-			Args: `{"data_source_id":"` + id + `"}`,
-			Runner: prometheusRunner(&datasourceMock.Prometheus{
-				MetadataFunc: func(context.Context) (*processor.PrometheusMetadataResult, error) {
-					return &processor.PrometheusMetadataResult{
-						Result: map[string]any{
-							"up": "gauge",
-						},
-					}, nil
+	prom := &datasourceMock.Prometheus{
+		MetadataFunc: func(context.Context) (*processor.PrometheusMetadataResult, error) {
+			return &processor.PrometheusMetadataResult{Result: map[string]any{"up": "gauge"}}, nil
+		},
+	}
+
+	sql := &datasourceMock.SQL{
+		MetadataFunc: func(context.Context) (*processor.SQLMetadataResult, error) {
+			return &processor.SQLMetadataResult{
+				Tables: map[string]processor.SQLTable{
+					"public.orders": {Columns: []processor.SQLColumn{{Name: "id"}, {Name: "total"}}},
 				},
-			}),
-			Contains: "gauge",
+				DefaultSchema: "public",
+			}, nil
+		},
+	}
+
+	cc := map[string]dataSourceCase{
+		"Metrics of a Prometheus data source": {
+			Type:       datasource.TypePrometheus,
+			Prometheus: prom,
+			Args:       `{"data_source_id":"` + id + `"}`,
+			Contains:   "gauge",
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, Type: 1, Prometheus: 1, PrometheusMetadata: 1},
+		},
+		"Tables of a SQL data source each with its column names": {
+			Type:     datasource.TypePostgreSQL,
+			SQL:      sql,
+			Args:     `{"data_source_id":"` + id + `"}`,
+			Contains: `{"default_schema":"public","tables":{"public.orders":["id","total"]}}`,
+			Calls:    dataSourceCalls{FetchDataSource: 1, Runner: 1, Type: 1, SQL: 1, SQLMetadata: 1},
 		},
 		"Unreadable arguments": {
 			Type: datasource.TypePrometheus,
 			Args: `{`,
 			Err:  assert.AnError,
 		},
-		"A data source that hands out no Prometheus client": {
-			Type:   datasource.TypePostgreSQL,
-			Args:   `{"data_source_id":"` + id + `"}`,
-			Runner: prometheusRunner(nil),
-			Err:    assert.AnError,
+		"Error returned by Runner.Prometheus": {
+			Type:     datasource.TypePrometheus,
+			NoClient: true,
+			Args:     `{"data_source_id":"` + id + `"}`,
+			Err:      assert.AnError,
+			Calls:    dataSourceCalls{FetchDataSource: 1, Runner: 1, Type: 1, Prometheus: 1},
 		},
-		"A failing read": {
+		"Error returned by Runner.SQL": {
+			Type:     datasource.TypePostgreSQL,
+			NoClient: true,
+			Args:     `{"data_source_id":"` + id + `"}`,
+			Err:      assert.AnError,
+			Calls:    dataSourceCalls{FetchDataSource: 1, Runner: 1, Type: 1, SQL: 1},
+		},
+		"Error returned by Prometheus.Metadata": {
 			Type: datasource.TypePrometheus,
-			Args: `{"data_source_id":"` + id + `"}`,
-			Runner: prometheusRunner(&datasourceMock.Prometheus{
+			Prometheus: &datasourceMock.Prometheus{
 				MetadataFunc: func(context.Context) (*processor.PrometheusMetadataResult, error) {
 					return nil, assert.AnError
 				},
-			}),
-			Err: assert.AnError,
+			},
+			Args:  `{"data_source_id":"` + id + `"}`,
+			Err:   assert.AnError,
+			Calls: dataSourceCalls{FetchDataSource: 1, Runner: 1, Type: 1, Prometheus: 1, PrometheusMetadata: 1},
+		},
+		"Error returned by SQL.Metadata": {
+			Type: datasource.TypePostgreSQL,
+			SQL: &datasourceMock.SQL{
+				MetadataFunc: func(context.Context) (*processor.SQLMetadataResult, error) {
+					return nil, assert.AnError
+				},
+			},
+			Args:  `{"data_source_id":"` + id + `"}`,
+			Err:   assert.AnError,
+			Calls: dataSourceCalls{FetchDataSource: 1, Runner: 1, Type: 1, SQL: 1, SQLMetadata: 1},
 		},
 	}
 
@@ -378,111 +465,197 @@ func Test_getPrometheusMetadata_Execute(t *testing.T) {
 		t.Run(cn, func(t *testing.T) {
 			t.Parallel()
 
-			runDataSourceCase(t, getPrometheusMetadata{}, NameGetPrometheusMetadata, c)
+			runDataSourceCase(t, getDataSourceMetadata{}, NameGetDataSourceMetadata, c)
 		})
 	}
 }
 
-func Test_prometheusLabelNamesArgs_Validate(t *testing.T) {
+func Test_prometheusLabelsArgs_Validate(t *testing.T) {
 	t.Parallel()
 
-	assertValidate(t, prometheusLabelNamesArgs{DataSourceID: _testDataSourceID}, map[string]Args{
-		"data_source_id": prometheusLabelNamesArgs{},
-	})
+	cc := map[string]struct {
+		Args prometheusLabelsArgs
+		Err  error
+	}{
+		"Data source id is required": {
+			Args: prometheusLabelsArgs{Label: "job"},
+			Err:  errors.New("data_source_id is required"),
+		},
+		"Valid arguments": {
+			Args: prometheusLabelsArgs{DataSourceID: _testDataSourceID},
+		},
+	}
+
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			testutil.AssertEqualError(t, c.Err, c.Args.Validate())
+		})
+	}
 }
 
-func Test_listPrometheusLabelNames_Info(t *testing.T) {
+func Test_listPrometheusLabels_Info(t *testing.T) {
 	t.Parallel()
 
-	info := listPrometheusLabelNames{}.Info()
+	info := listPrometheusLabels{}.Info()
 
-	assert.Equal(t, NameListPrometheusLabelNames, info.Name)
+	assert.Equal(t, Traits{DataSource: true, Group: GroupDataSources}, info.Traits)
+
+	assert.Equal(t, NameListPrometheusLabels, info.Name)
 	assert.Equal(t, []string{"data_source_id"}, info.Required)
+	assert.Contains(t, info.Properties, "label")
 	assert.Contains(t, info.Properties, "matchers")
 	assert.Contains(t, info.Properties, "from")
 }
 
-func Test_listPrometheusLabelNames_Traits(t *testing.T) {
-	t.Parallel()
-
-	assert.Equal(t, Traits{DataSource: true}, listPrometheusLabelNames{}.Traits())
-}
-
-func Test_listPrometheusLabelNames_Title(t *testing.T) {
-	t.Parallel()
-
-	d := dataSourceDeps(t, datasource.TypePrometheus, nil)
-
-	got, err := listPrometheusLabelNames{}.Title(testInput(
-		d,
-		NameListPrometheusLabelNames,
-		`{"data_source_id":"`+_testDataSourceID.String()+`"}`,
-	))
-	require.NoError(t, err)
-	assert.Equal(t, `Listing label names of "prod"`, got)
-
-	_, err = listPrometheusLabelNames{}.Title(testInput(d, NameListPrometheusLabelNames, `{`))
-	require.Error(t, err)
-
-	// a data source the organisation does not own is an error, not a
-	// label: the model is told what it named does not exist.
-	_, err = listPrometheusLabelNames{}.Title(testInput(d, NameListPrometheusLabelNames, `{"data_source_id":"`+xid.New().String()+`"}`))
-	require.Error(t, err)
-}
-
-func Test_listPrometheusLabelNames_Execute(t *testing.T) {
+func Test_listPrometheusLabels_Title(t *testing.T) {
 	t.Parallel()
 
 	id := _testDataSourceID.String()
 
-	client := &datasourceMock.Prometheus{
-		LabelNamesFunc: func(_ context.Context, matchers []string, tr processor.TimeRange) (*processor.PrometheusLabelNamesResult, error) {
-			if len(matchers) > 0 && matchers[0] == "boom" {
-				return nil, assert.AnError
-			}
-
-			assert.Equal(t, time.Hour, tr.To.Sub(tr.From))
-
-			return &processor.PrometheusLabelNamesResult{Result: []string{"job"}}, nil
+	cc := map[string]struct {
+		Args            string
+		Expected        string
+		FetchDataSource int
+	}{
+		"The label names": {
+			Args:            `{"data_source_id":"` + id + `"}`,
+			Expected:        `Listing labels of "prod"`,
+			FetchDataSource: 1,
+		},
+		"Values of one label": {
+			Args:            `{"data_source_id":"` + id + `","label":"job"}`,
+			Expected:        `Listing values of label "job" in "prod"`,
+			FetchDataSource: 1,
+		},
+		// a data source the organisation does not own is an error, not a
+		// label: the model is told what it named does not exist.
+		"A data source of another organisation": {
+			Args:            `{"data_source_id":"` + xid.New().String() + `"}`,
+			FetchDataSource: 1,
+		},
+		"Unreadable arguments": {
+			Args: `{`,
 		},
 	}
 
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			db := dataSourceDB(datasource.TypePrometheus)
+
+			// arguments that name nothing it can describe make no line.
+			assert.Equal(t, c.Expected, listPrometheusLabels{}.Title(testDeps(db, nil, nil).newInput(context.Background(), NameListPrometheusLabels, json.RawMessage(c.Args))))
+			assert.Len(t, db.FetchDataSourceCalls(), c.FetchDataSource)
+		})
+	}
+}
+
+func Test_listPrometheusLabels_Execute(t *testing.T) {
+	t.Parallel()
+
+	id := _testDataSourceID.String()
+
+	client := func() *datasourceMock.Prometheus {
+		return &datasourceMock.Prometheus{
+			LabelNamesFunc: func(_ context.Context, matchers []string, tr processor.TimeRange) (*processor.PrometheusLabelNamesResult, error) {
+				if len(matchers) > 0 && (matchers[0] == "boom" || strings.Contains(matchers[0], "$")) {
+					return nil, assert.AnError
+				}
+
+				assert.Equal(t, time.Hour, tr.To.Sub(tr.From))
+
+				return &processor.PrometheusLabelNamesResult{Result: []string{"job"}}, nil
+			},
+			LabelValuesFunc: func(_ context.Context, label string, matchers []string, _ processor.TimeRange) (*processor.PrometheusLabelValuesResult, error) {
+				if label == "boom" || (len(matchers) > 0 && strings.Contains(matchers[0], "$")) {
+					return nil, assert.AnError
+				}
+
+				return &processor.PrometheusLabelValuesResult{Result: []string{"api"}}, nil
+			},
+		}
+	}
+
+	// a $ left in a matcher fails the read, so the substitution cases pass
+	// only when every reference was replaced from stubVariableTree.
 	cc := map[string]dataSourceCase{
+		"The label names with variables substituted": {
+			Type:       datasource.TypePrometheus,
+			Prometheus: client(),
+			Args:       `{"data_source_id":"` + id + `","matchers":["up{region=\"$region\"}"]}`,
+			Contains:   `["job"]`,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, FetchTree: 1, Prometheus: 1, LabelNames: 1},
+		},
+		"The label values with variables substituted": {
+			Type:       datasource.TypePrometheus,
+			Prometheus: client(),
+			Args:       `{"data_source_id":"` + id + `","label":"job","matchers":["up{region=\"$region\"}"]}`,
+			Contains:   `["api"]`,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, FetchTree: 1, Prometheus: 1, LabelValues: 1},
+		},
+		"Error returned by VariableManager.FetchTree": {
+			Type:       datasource.TypePrometheus,
+			Variables:  failingTreeManager(),
+			Prometheus: client(),
+			Args:       `{"data_source_id":"` + id + `","matchers":["up{region=\"$region\"}"]}`,
+			Err:        assert.AnError,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, FetchTree: 1},
+		},
 		"The label names on the selected series": {
-			Type:     datasource.TypePrometheus,
-			Runner:   prometheusRunner(client),
-			Args:     `{"data_source_id":"` + id + `","matchers":["up"]}`,
-			Contains: "job",
+			Type:       datasource.TypePrometheus,
+			Prometheus: client(),
+			Args:       `{"data_source_id":"` + id + `","matchers":["up"]}`,
+			Contains:   `["job"]`,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, Prometheus: 1, LabelNames: 1},
+		},
+		"The values a label takes": {
+			Type:       datasource.TypePrometheus,
+			Prometheus: client(),
+			Args:       `{"data_source_id":"` + id + `","label":"job"}`,
+			Contains:   `["api"]`,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, Prometheus: 1, LabelValues: 1},
 		},
 		"Unreadable arguments": {
-			Type:   datasource.TypePrometheus,
-			Runner: prometheusRunner(client),
-			Args:   `{`,
-			Err:    assert.AnError,
+			Type:       datasource.TypePrometheus,
+			Prometheus: client(),
+			Args:       `{`,
+			Err:        assert.AnError,
 		},
 		"An unparseable range start": {
-			Type:   datasource.TypePrometheus,
-			Runner: prometheusRunner(client),
-			Args:   `{"data_source_id":"` + id + `","from":"yesterday"}`,
-			Err:    assert.AnError,
+			Type:       datasource.TypePrometheus,
+			Prometheus: client(),
+			Args:       `{"data_source_id":"` + id + `","from":"yesterday"}`,
+			Err:        assert.AnError,
 		},
 		"An inverted range": {
-			Type:   datasource.TypePrometheus,
-			Runner: prometheusRunner(client),
-			Args:   `{"data_source_id":"` + id + `","from":"2026-08-01T12:00:00Z","to":"2026-08-01T10:00:00Z"}`,
-			Err:    assert.AnError,
+			Type:       datasource.TypePrometheus,
+			Prometheus: client(),
+			Args:       `{"data_source_id":"` + id + `","from":"2026-08-01T12:00:00Z","to":"2026-08-01T10:00:00Z"}`,
+			Err:        assert.AnError,
 		},
-		"A data source that hands out no Prometheus client": {
-			Type:   datasource.TypePostgreSQL,
-			Runner: prometheusRunner(nil),
-			Args:   `{"data_source_id":"` + id + `"}`,
-			Err:    assert.AnError,
+		"Error returned by Runner.Prometheus": {
+			Type:     datasource.TypePostgreSQL,
+			NoClient: true,
+			Args:     `{"data_source_id":"` + id + `"}`,
+			Err:      assert.AnError,
+			Calls:    dataSourceCalls{FetchDataSource: 1, Runner: 1, Prometheus: 1},
 		},
-		"A failing read": {
-			Type:   datasource.TypePrometheus,
-			Runner: prometheusRunner(client),
-			Args:   `{"data_source_id":"` + id + `","matchers":["boom"]}`,
-			Err:    assert.AnError,
+		"Error returned by Prometheus.LabelNames": {
+			Type:       datasource.TypePrometheus,
+			Prometheus: client(),
+			Args:       `{"data_source_id":"` + id + `","matchers":["boom"]}`,
+			Err:        assert.AnError,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, Prometheus: 1, LabelNames: 1},
+		},
+		"Error returned by Prometheus.LabelValues": {
+			Type:       datasource.TypePrometheus,
+			Prometheus: client(),
+			Args:       `{"data_source_id":"` + id + `","label":"boom"}`,
+			Err:        assert.AnError,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, Prometheus: 1, LabelValues: 1},
 		},
 	}
 
@@ -494,146 +667,7 @@ func Test_listPrometheusLabelNames_Execute(t *testing.T) {
 		t.Run(cn, func(t *testing.T) {
 			t.Parallel()
 
-			runDataSourceCase(t, listPrometheusLabelNames{}, NameListPrometheusLabelNames, c)
-		})
-	}
-}
-
-func Test_prometheusLabelValuesArgs_Validate(t *testing.T) {
-	t.Parallel()
-
-	assertValidate(t, prometheusLabelValuesArgs{DataSourceID: _testDataSourceID, Label: "job"}, map[string]Args{
-		"data_source_id": prometheusLabelValuesArgs{Label: "job"},
-		"label":          prometheusLabelValuesArgs{DataSourceID: _testDataSourceID},
-	})
-}
-
-func Test_listPrometheusLabelValues_Info(t *testing.T) {
-	t.Parallel()
-
-	info := listPrometheusLabelValues{}.Info()
-
-	assert.Equal(t, NameListPrometheusLabelValues, info.Name)
-	assert.Equal(t, []string{"data_source_id", "label"}, info.Required)
-}
-
-func Test_listPrometheusLabelValues_Traits(t *testing.T) {
-	t.Parallel()
-
-	assert.Equal(t, Traits{DataSource: true}, listPrometheusLabelValues{}.Traits())
-}
-
-func Test_listPrometheusLabelValues_Title(t *testing.T) {
-	t.Parallel()
-
-	d := dataSourceDeps(t, datasource.TypePrometheus, nil)
-	id := _testDataSourceID.String()
-
-	cc := map[string]struct {
-		Args     string
-		Expected string
-		Err      error
-	}{
-		"The label and the data source": {
-			Args:     `{"data_source_id":"` + id + `","label":"job"}`,
-			Expected: `Listing values of label "job" in "prod"`,
-		},
-		"No label yet": {
-			Args: `{"data_source_id":"` + id + `"}`,
-			Err:  assert.AnError,
-		},
-		"Unreadable arguments": {
-			Args: `{`,
-			Err:  assert.AnError,
-		},
-	}
-
-	for cn, c := range cc {
-		t.Run(cn, func(t *testing.T) {
-			t.Parallel()
-
-			got, err := listPrometheusLabelValues{}.Title(testInput(d, NameListPrometheusLabelValues, c.Args))
-
-			testutil.AssertEqualError(t, c.Err, err)
-			assert.Equal(t, c.Expected, got)
-		})
-	}
-
-	// a data source the organisation does not own is an error, not a
-	// label: the model is told what it named does not exist.
-	_, err := listPrometheusLabelValues{}.Title(testInput(d, NameListPrometheusLabelValues, `{"data_source_id":"`+xid.New().String()+`","label":"job"}`))
-	require.Error(t, err)
-}
-
-func Test_listPrometheusLabelValues_Execute(t *testing.T) {
-	t.Parallel()
-
-	id := _testDataSourceID.String()
-
-	client := &datasourceMock.Prometheus{
-		LabelValuesFunc: func(_ context.Context, label string, _ []string, _ processor.TimeRange) (*processor.PrometheusLabelValuesResult, error) {
-			if label == "boom" {
-				return nil, assert.AnError
-			}
-
-			return &processor.PrometheusLabelValuesResult{Result: []string{"api"}}, nil
-		},
-	}
-
-	cc := map[string]dataSourceCase{
-		"The values the label takes": {
-			Type:     datasource.TypePrometheus,
-			Runner:   prometheusRunner(client),
-			Args:     `{"data_source_id":"` + id + `","label":"job"}`,
-			Contains: "api",
-		},
-		"Unreadable arguments": {
-			Type:   datasource.TypePrometheus,
-			Runner: prometheusRunner(client),
-			Args:   `{`,
-			Err:    assert.AnError,
-		},
-		"No label": {
-			Type:   datasource.TypePrometheus,
-			Runner: prometheusRunner(client),
-			Args:   `{"data_source_id":"` + id + `"}`,
-			Err:    assert.AnError,
-		},
-		"An unparseable range end": {
-			Type:   datasource.TypePrometheus,
-			Runner: prometheusRunner(client),
-			Args:   `{"data_source_id":"` + id + `","label":"job","to":"soon"}`,
-			Err:    assert.AnError,
-		},
-		"An inverted range": {
-			Type:   datasource.TypePrometheus,
-			Runner: prometheusRunner(client),
-			Args:   `{"data_source_id":"` + id + `","label":"job","from":"2026-08-01T12:00:00Z","to":"2026-08-01T10:00:00Z"}`,
-			Err:    assert.AnError,
-		},
-		"A data source that hands out no Prometheus client": {
-			Type:   datasource.TypePostgreSQL,
-			Runner: prometheusRunner(nil),
-			Args:   `{"data_source_id":"` + id + `","label":"job"}`,
-			Err:    assert.AnError,
-		},
-		"A failing read": {
-			Type:   datasource.TypePrometheus,
-			Runner: prometheusRunner(client),
-			Args:   `{"data_source_id":"` + id + `","label":"boom"}`,
-			Err:    assert.AnError,
-		},
-	}
-
-	maps.Copy(cc, badIDCases(func(id string) string {
-		return `{"data_source_id":"` + id + `","label":"job"}`
-	}))
-
-	for cn, c := range cc {
-		t.Run(cn, func(t *testing.T) {
-			t.Parallel()
-
-			runDataSourceCase(t, listPrometheusLabelValues{}, NameListPrometheusLabelValues, c)
+			runDataSourceCase(t, listPrometheusLabels{}, NameListPrometheusLabels, c)
 		})
 	}
 }
@@ -641,10 +675,30 @@ func Test_listPrometheusLabelValues_Execute(t *testing.T) {
 func Test_prometheusSeriesArgs_Validate(t *testing.T) {
 	t.Parallel()
 
-	assertValidate(t, prometheusSeriesArgs{DataSourceID: _testDataSourceID, Matchers: []string{"up"}}, map[string]Args{
-		"data_source_id": prometheusSeriesArgs{Matchers: []string{"up"}},
-		"matchers":       prometheusSeriesArgs{DataSourceID: _testDataSourceID},
-	})
+	cc := map[string]struct {
+		Args prometheusSeriesArgs
+		Err  error
+	}{
+		"Data source id is required": {
+			Args: prometheusSeriesArgs{Matchers: []string{"up"}},
+			Err:  errors.New("data_source_id is required"),
+		},
+		"Matchers are required": {
+			Args: prometheusSeriesArgs{DataSourceID: _testDataSourceID},
+			Err:  errors.New("matchers is required"),
+		},
+		"Valid arguments": {
+			Args: prometheusSeriesArgs{DataSourceID: _testDataSourceID, Matchers: []string{"up"}},
+		},
+	}
+
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			testutil.AssertEqualError(t, c.Err, c.Args.Validate())
+		})
+	}
 }
 
 func Test_listPrometheusSeries_Info(t *testing.T) {
@@ -652,36 +706,45 @@ func Test_listPrometheusSeries_Info(t *testing.T) {
 
 	info := listPrometheusSeries{}.Info()
 
+	assert.Equal(t, Traits{DataSource: true, Group: GroupDataSources}, info.Traits)
+
 	assert.Equal(t, NameListPrometheusSeries, info.Name)
 	assert.Equal(t, []string{"data_source_id", "matchers"}, info.Required)
-}
-
-func Test_listPrometheusSeries_Traits(t *testing.T) {
-	t.Parallel()
-
-	assert.Equal(t, Traits{DataSource: true}, listPrometheusSeries{}.Traits())
 }
 
 func Test_listPrometheusSeries_Title(t *testing.T) {
 	t.Parallel()
 
-	d := dataSourceDeps(t, datasource.TypePrometheus, nil)
+	cc := map[string]struct {
+		Args            string
+		Expected        string
+		FetchDataSource int
+	}{
+		"A data source that resolves is named": {
+			Args:            `{"data_source_id":"` + _testDataSourceID.String() + `","matchers":["up"]}`,
+			Expected:        `Listing series of "prod"`,
+			FetchDataSource: 1,
+		},
+		"Unreadable arguments": {
+			Args: `{`,
+		},
+		"A data source of another organisation": {
+			Args:            `{"data_source_id":"` + xid.New().String() + `","matchers":["up"]}`,
+			FetchDataSource: 1,
+		},
+	}
 
-	got, err := listPrometheusSeries{}.Title(testInput(
-		d,
-		NameListPrometheusSeries,
-		`{"data_source_id":"`+_testDataSourceID.String()+`","matchers":["up"]}`,
-	))
-	require.NoError(t, err)
-	assert.Equal(t, `Listing series of "prod"`, got)
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
 
-	_, err = listPrometheusSeries{}.Title(testInput(d, NameListPrometheusSeries, `{`))
-	require.Error(t, err)
+			db := dataSourceDB(datasource.TypePrometheus)
 
-	// a data source the organisation does not own is an error, not a
-	// label: the model is told what it named does not exist.
-	_, err = listPrometheusSeries{}.Title(testInput(d, NameListPrometheusSeries, `{"data_source_id":"`+xid.New().String()+`","matchers":["up"]}`))
-	require.Error(t, err)
+			// arguments that name nothing it can describe make no line.
+			assert.Equal(t, c.Expected, listPrometheusSeries{}.Title(testDeps(db, nil, nil).newInput(context.Background(), NameListPrometheusSeries, json.RawMessage(c.Args))))
+			assert.Len(t, db.FetchDataSourceCalls(), c.FetchDataSource)
+		})
+	}
 }
 
 func Test_listPrometheusSeries_Execute(t *testing.T) {
@@ -689,70 +752,92 @@ func Test_listPrometheusSeries_Execute(t *testing.T) {
 
 	id := _testDataSourceID.String()
 
-	client := &datasourceMock.Prometheus{
-		SeriesFunc: func(_ context.Context, matchers []string, _ processor.TimeRange) (*processor.PrometheusSeriesResult, error) {
-			if matchers[0] == "boom" {
-				return nil, assert.AnError
-			}
+	client := func() *datasourceMock.Prometheus {
+		return &datasourceMock.Prometheus{
+			SeriesFunc: func(_ context.Context, matchers []string, _ processor.TimeRange) (*processor.PrometheusSeriesResult, error) {
+				if matchers[0] == "boom" || strings.Contains(matchers[0], "$") {
+					return nil, assert.AnError
+				}
 
-			return &processor.PrometheusSeriesResult{
-				Result: []model.LabelSet{
-					{"job": "api"},
-				},
-			}, nil
-		},
+				return &processor.PrometheusSeriesResult{
+					Result: []model.LabelSet{
+						{"job": "api"},
+					},
+				}, nil
+			},
+		}
 	}
 
+	// a $ left in a matcher fails the read, so the substitution case passes
+	// only when every reference was replaced from stubVariableTree.
 	cc := map[string]dataSourceCase{
+		"The series with variables substituted": {
+			Type:       datasource.TypePrometheus,
+			Prometheus: client(),
+			Args:       `{"data_source_id":"` + id + `","matchers":["{region=\"$region\"}"]}`,
+			Contains:   "api",
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, FetchTree: 1, Prometheus: 1, Series: 1},
+		},
+		"Error returned by VariableManager.FetchTree": {
+			Type:       datasource.TypePrometheus,
+			Variables:  failingTreeManager(),
+			Prometheus: client(),
+			Args:       `{"data_source_id":"` + id + `","matchers":["{region=\"$region\"}"]}`,
+			Err:        assert.AnError,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, FetchTree: 1},
+		},
 		"The series the matchers select": {
-			Type:     datasource.TypePrometheus,
-			Runner:   prometheusRunner(client),
-			Args:     `{"data_source_id":"` + id + `","matchers":["{job=\"api\"}"]}`,
-			Contains: "api",
+			Type:       datasource.TypePrometheus,
+			Prometheus: client(),
+			Args:       `{"data_source_id":"` + id + `","matchers":["{job=\"api\"}"]}`,
+			Contains:   "api",
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, Prometheus: 1, Series: 1},
 		},
 		"Unreadable arguments": {
-			Type:   datasource.TypePrometheus,
-			Runner: prometheusRunner(client),
-			Args:   `{`,
-			Err:    assert.AnError,
+			Type:       datasource.TypePrometheus,
+			Prometheus: client(),
+			Args:       `{`,
+			Err:        assert.AnError,
 		},
 		// Prometheus rejects a series query with no selector, so the model
 		// is told what is missing rather than handed the upstream error.
 		"No matcher at all": {
-			Type:   datasource.TypePrometheus,
-			Runner: prometheusRunner(client),
-			Args:   `{"data_source_id":"` + id + `"}`,
-			Err:    assert.AnError,
+			Type:       datasource.TypePrometheus,
+			Prometheus: client(),
+			Args:       `{"data_source_id":"` + id + `"}`,
+			Err:        assert.AnError,
 		},
 		"An empty matcher list": {
-			Type:   datasource.TypePrometheus,
-			Runner: prometheusRunner(client),
-			Args:   `{"data_source_id":"` + id + `","matchers":[]}`,
-			Err:    assert.AnError,
+			Type:       datasource.TypePrometheus,
+			Prometheus: client(),
+			Args:       `{"data_source_id":"` + id + `","matchers":[]}`,
+			Err:        assert.AnError,
 		},
 		"An unparseable range": {
-			Type:   datasource.TypePrometheus,
-			Runner: prometheusRunner(client),
-			Args:   `{"data_source_id":"` + id + `","matchers":["up"],"from":"then"}`,
-			Err:    assert.AnError,
+			Type:       datasource.TypePrometheus,
+			Prometheus: client(),
+			Args:       `{"data_source_id":"` + id + `","matchers":["up"],"from":"then"}`,
+			Err:        assert.AnError,
 		},
 		"An inverted range": {
-			Type:   datasource.TypePrometheus,
-			Runner: prometheusRunner(client),
-			Args:   `{"data_source_id":"` + id + `","matchers":["up"],"from":"2026-08-01T12:00:00Z","to":"2026-08-01T10:00:00Z"}`,
-			Err:    assert.AnError,
+			Type:       datasource.TypePrometheus,
+			Prometheus: client(),
+			Args:       `{"data_source_id":"` + id + `","matchers":["up"],"from":"2026-08-01T12:00:00Z","to":"2026-08-01T10:00:00Z"}`,
+			Err:        assert.AnError,
 		},
-		"A data source that hands out no Prometheus client": {
-			Type:   datasource.TypePostgreSQL,
-			Runner: prometheusRunner(nil),
-			Args:   `{"data_source_id":"` + id + `","matchers":["up"]}`,
-			Err:    assert.AnError,
+		"Error returned by Runner.Prometheus": {
+			Type:     datasource.TypePostgreSQL,
+			NoClient: true,
+			Args:     `{"data_source_id":"` + id + `","matchers":["up"]}`,
+			Err:      assert.AnError,
+			Calls:    dataSourceCalls{FetchDataSource: 1, Runner: 1, Prometheus: 1},
 		},
-		"A failing read": {
-			Type:   datasource.TypePrometheus,
-			Runner: prometheusRunner(client),
-			Args:   `{"data_source_id":"` + id + `","matchers":["boom"]}`,
-			Err:    assert.AnError,
+		"Error returned by Prometheus.Series": {
+			Type:       datasource.TypePrometheus,
+			Prometheus: client(),
+			Args:       `{"data_source_id":"` + id + `","matchers":["boom"]}`,
+			Err:        assert.AnError,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, Prometheus: 1, Series: 1},
 		},
 	}
 
@@ -769,79 +854,97 @@ func Test_listPrometheusSeries_Execute(t *testing.T) {
 	}
 }
 
-func Test_queryPrometheusArgs_Validate(t *testing.T) {
+func Test_queryDataSourceArgs_Validate(t *testing.T) {
 	t.Parallel()
 
-	assertValidate(t, queryPrometheusArgs{DataSourceID: _testDataSourceID, Query: "up"}, map[string]Args{
-		"data_source_id": queryPrometheusArgs{Query: "up"},
-		"query":          queryPrometheusArgs{DataSourceID: _testDataSourceID},
-	})
+	cc := map[string]struct {
+		Args queryDataSourceArgs
+		Err  error
+	}{
+		"Data source id is required": {
+			Args: queryDataSourceArgs{Query: "up"},
+			Err:  errors.New("data_source_id is required"),
+		},
+		"Query is required": {
+			Args: queryDataSourceArgs{DataSourceID: _testDataSourceID},
+			Err:  errors.New("query is required"),
+		},
+		"Valid arguments": {
+			Args: queryDataSourceArgs{DataSourceID: _testDataSourceID, Query: "up"},
+		},
+	}
+
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			testutil.AssertEqualError(t, c.Err, c.Args.Validate())
+		})
+	}
 }
 
-func Test_queryPrometheus_Info(t *testing.T) {
+func Test_queryDataSource_Info(t *testing.T) {
 	t.Parallel()
 
-	info := queryPrometheus{}.Info()
+	info := queryDataSource{}.Info()
 
-	assert.Equal(t, NameQueryPrometheus, info.Name)
+	assert.Equal(t, Traits{DataSource: true, Group: GroupDataSources}, info.Traits)
+
+	assert.Equal(t, NameQueryDataSource, info.Name)
 	assert.Equal(t, []string{"data_source_id", "query"}, info.Required)
-	assert.Contains(t, info.Properties, "chart_type")
 
-	// the chart types the metric block schema declares are exactly the
-	// ones chart_type accepts. The block package cannot import the
-	// processor — that would drag the Prometheus client and pgx into a
-	// leaf package — so the two lists are only kept equal by this check.
-	for _, v := range block.MetricEnums()[document.AttrVisualizationType] {
-		assert.True(t, processor.ChartType(v).IsValid(), "%q is in the block schema but not a chart type", v)
-		assert.Contains(t, "Optional. One of line_chart, bar_chart, gauge_chart. When set, the result describes what the metric block would draw (render status, series count, and each series' labels, point count and endpoints) instead of the raw data. Use it to check a query before putting it in a metric block; omit it when you need the values themselves.", v)
-	}
+	chartType, ok := info.Properties["chart_type"].(map[string]any)
+	require.True(t, ok)
 
-	for _, ct := range []processor.ChartType{
-		processor.ChartTypeLine,
-		processor.ChartTypeBar,
-		processor.ChartTypeGauge,
-	} {
-		assert.Contains(t, block.MetricEnums()[document.AttrVisualizationType], string(ct))
-	}
+	assert.Equal(t, []processor.ChartType{processor.ChartTypeLine, processor.ChartTypeBar, processor.ChartTypeGauge}, chartType["enum"])
 }
 
-func Test_queryPrometheus_Traits(t *testing.T) {
+func Test_queryDataSource_Title(t *testing.T) {
 	t.Parallel()
 
-	assert.Equal(t, Traits{DataSource: true}, queryPrometheus{}.Traits())
+	cc := map[string]struct {
+		Args            string
+		Expected        string
+		FetchDataSource int
+	}{
+		"A data source that resolves is named": {
+			Args:            `{"data_source_id":"` + _testDataSourceID.String() + `","query":"up"}`,
+			Expected:        `Querying "prod"`,
+			FetchDataSource: 1,
+		},
+		// a data source the organisation does not own is an error, not a
+		// label: the model is told what it named does not exist.
+		"A data source of another organisation": {
+			Args:            `{"data_source_id":"` + xid.New().String() + `","query":"up"}`,
+			FetchDataSource: 1,
+		},
+		"Unreadable arguments": {
+			Args: `{`,
+		},
+	}
+
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			db := dataSourceDB(datasource.TypePrometheus)
+
+			// arguments that name nothing it can describe make no line.
+			assert.Equal(t, c.Expected, queryDataSource{}.Title(testDeps(db, nil, nil).newInput(context.Background(), NameQueryDataSource, json.RawMessage(c.Args))))
+			assert.Len(t, db.FetchDataSourceCalls(), c.FetchDataSource)
+		})
+	}
 }
 
-func Test_queryPrometheus_Title(t *testing.T) {
-	t.Parallel()
-
-	d := dataSourceDeps(t, datasource.TypePrometheus, nil)
-
-	got, err := queryPrometheus{}.Title(testInput(
-		d,
-		NameQueryPrometheus,
-		`{"data_source_id":"`+_testDataSourceID.String()+`","query":"up"}`,
-	))
-	require.NoError(t, err)
-	assert.Equal(t, `Querying "prod"`, got)
-
-	_, err = queryPrometheus{}.Title(testInput(d, NameQueryPrometheus, `{`))
-	require.Error(t, err)
-
-	// a data source the organisation does not own is an error, not a
-	// label: the model is told what it named does not exist.
-	_, err = queryPrometheus{}.Title(testInput(d, NameQueryPrometheus, `{"data_source_id":"`+xid.New().String()+`","query":"up"}`))
-	require.Error(t, err)
-}
-
-func Test_queryPrometheus_Execute(t *testing.T) {
+func Test_queryDataSource_Execute(t *testing.T) {
 	t.Parallel()
 
 	id := _testDataSourceID.String()
 
-	client := func(res *processor.PrometheusQueryResult) *datasourceMock.Prometheus {
+	prom := func(res *processor.PrometheusQueryResult) *datasourceMock.Prometheus {
 		return &datasourceMock.Prometheus{
 			QueryRangeFunc: func(_ context.Context, q string, _ processor.TimeRange) (*processor.PrometheusQueryResult, error) {
-				if q == "boom" {
+				if q == "boom" || strings.Contains(q, "$") {
 					return nil, assert.AnError
 				}
 
@@ -850,496 +953,245 @@ func Test_queryPrometheus_Execute(t *testing.T) {
 		}
 	}
 
-	cc := map[string]dataSourceCase{
-		"A raw query returns the raw result": {
-			Type: datasource.TypePrometheus,
-			Runner: prometheusRunner(client(&processor.PrometheusQueryResult{
-				Type:     model.ValMatrix,
-				Warnings: []string{"slow"},
-			})),
-			Args:     `{"data_source_id":"` + id + `","query":"up"}`,
-			Contains: `"warnings":["slow"]`,
-		},
-		"A chart query returns the transformed series": {
-			Type: datasource.TypePrometheus,
-			Runner: prometheusRunner(client(&processor.PrometheusQueryResult{
-				Type: model.ValMatrix,
-			})),
-			Args:     `{"data_source_id":"` + id + `","query":"up","chart_type":"line_chart"}`,
-			Contains: `"status"`,
-		},
-		// a query that returned nothing has no result to transform, and the
-		// metric block renders it as no-data — which is the answer the model
-		// asked for by naming a chart type.
-		"A chart query with no result at all is no-data": {
-			Type:     datasource.TypePrometheus,
-			Runner:   prometheusRunner(client(nil)),
-			Args:     `{"data_source_id":"` + id + `","query":"up","chart_type":"gauge_chart"}`,
-			Contains: `"status":"no-data"`,
-		},
-		"Unreadable arguments": {
-			Type:   datasource.TypePrometheus,
-			Runner: prometheusRunner(client(nil)),
-			Args:   `{`,
-			Err:    assert.AnError,
-		},
-		"No query": {
-			Type:   datasource.TypePrometheus,
-			Runner: prometheusRunner(client(nil)),
-			Args:   `{"data_source_id":"` + id + `"}`,
-			Err:    assert.AnError,
-		},
-		"An unknown chart type": {
-			Type:   datasource.TypePrometheus,
-			Runner: prometheusRunner(client(nil)),
-			Args:   `{"data_source_id":"` + id + `","query":"up","chart_type":"pie_chart"}`,
-			Err:    assert.AnError,
-		},
-		"An unparseable range": {
-			Type:   datasource.TypePrometheus,
-			Runner: prometheusRunner(client(nil)),
-			Args:   `{"data_source_id":"` + id + `","query":"up","from":"now"}`,
-			Err:    assert.AnError,
-		},
-		"An inverted range": {
-			Type:   datasource.TypePrometheus,
-			Runner: prometheusRunner(client(nil)),
-			Args:   `{"data_source_id":"` + id + `","query":"up","from":"2026-08-01T12:00:00Z","to":"2026-08-01T10:00:00Z"}`,
-			Err:    assert.AnError,
-		},
-		"A data source that hands out no Prometheus client": {
-			Type:   datasource.TypePostgreSQL,
-			Runner: prometheusRunner(nil),
-			Args:   `{"data_source_id":"` + id + `","query":"up"}`,
-			Err:    assert.AnError,
-		},
-		"A failing read": {
-			Type:   datasource.TypePrometheus,
-			Runner: prometheusRunner(client(nil)),
-			Args:   `{"data_source_id":"` + id + `","query":"boom"}`,
-			Err:    assert.AnError,
-		},
-	}
-
-	maps.Copy(cc, badIDCases(func(id string) string {
-		return `{"data_source_id":"` + id + `","query":"up"}`
-	}))
-
-	for cn, c := range cc {
-		t.Run(cn, func(t *testing.T) {
-			t.Parallel()
-
-			runDataSourceCase(t, queryPrometheus{}, NameQueryPrometheus, c)
-		})
-	}
-}
-
-func Test_getSQLMetadataArgs_Validate(t *testing.T) {
-	t.Parallel()
-
-	assertValidate(t, getSQLMetadataArgs{DataSourceID: _testDataSourceID}, map[string]Args{
-		"data_source_id": getSQLMetadataArgs{},
-	})
-}
-
-func Test_getSQLMetadata_Info(t *testing.T) {
-	t.Parallel()
-
-	info := getSQLMetadata{}.Info()
-
-	assert.Equal(t, NameGetSQLMetadata, info.Name)
-	assert.Equal(t, []string{"data_source_id"}, info.Required)
-}
-
-func Test_getSQLMetadata_Traits(t *testing.T) {
-	t.Parallel()
-
-	assert.Equal(t, Traits{DataSource: true}, getSQLMetadata{}.Traits())
-}
-
-func Test_getSQLMetadata_Title(t *testing.T) {
-	t.Parallel()
-
-	d := dataSourceDeps(t, datasource.TypePostgreSQL, nil)
-
-	got, err := getSQLMetadata{}.Title(testInput(
-		d,
-		NameGetSQLMetadata,
-		`{"data_source_id":"`+_testDataSourceID.String()+`"}`,
-	))
-	require.NoError(t, err)
-	assert.Equal(t, `Reading tables of "prod"`, got)
-
-	_, err = getSQLMetadata{}.Title(testInput(d, NameGetSQLMetadata, `{`))
-	require.Error(t, err)
-
-	// a data source the organisation does not own is an error, not a
-	// label: the model is told what it named does not exist.
-	_, err = getSQLMetadata{}.Title(testInput(d, NameGetSQLMetadata, `{"data_source_id":"`+xid.New().String()+`"}`))
-	require.Error(t, err)
-}
-
-func Test_getSQLMetadata_Execute(t *testing.T) {
-	t.Parallel()
-
-	id := _testDataSourceID.String()
-
-	client := &datasourceMock.SQL{
-		MetadataFunc: func(context.Context) (*processor.SQLMetadataResult, error) {
-			return &processor.SQLMetadataResult{
-				Tables: map[string]processor.SQLTable{
-					"public.orders": {
-						Columns: []processor.SQLColumn{
-							{Name: "id"},
-						},
-					},
-				},
-				DefaultSchema: "public",
-			}, nil
-		},
-	}
-
-	cc := map[string]dataSourceCase{
-		"The data source's tables and columns": {
-			Type:     datasource.TypePostgreSQL,
-			Runner:   sqlRunner(client),
-			Args:     `{"data_source_id":"` + id + `"}`,
-			Contains: "public.orders",
-		},
-		"Unreadable arguments": {
-			Type:   datasource.TypePostgreSQL,
-			Runner: sqlRunner(client),
-			Args:   `{`,
-			Err:    assert.AnError,
-		},
-		"A data source that hands out no SQL client": {
-			Type:   datasource.TypePrometheus,
-			Runner: sqlRunner(nil),
-			Args:   `{"data_source_id":"` + id + `"}`,
-			Err:    assert.AnError,
-		},
-		"A failing read": {
-			Type: datasource.TypePostgreSQL,
-			Runner: sqlRunner(&datasourceMock.SQL{
-				MetadataFunc: func(context.Context) (*processor.SQLMetadataResult, error) {
-					return nil, assert.AnError
-				},
-			}),
-			Args: `{"data_source_id":"` + id + `"}`,
-			Err:  assert.AnError,
-		},
-	}
-
-	maps.Copy(cc, badIDCases(func(id string) string {
-		return `{"data_source_id":"` + id + `"}`
-	}))
-
-	for cn, c := range cc {
-		t.Run(cn, func(t *testing.T) {
-			t.Parallel()
-
-			runDataSourceCase(t, getSQLMetadata{}, NameGetSQLMetadata, c)
-		})
-	}
-}
-
-func Test_sqlQueryLabelsArgs_Validate(t *testing.T) {
-	t.Parallel()
-
-	assertValidate(t, sqlQueryLabelsArgs{DataSourceID: _testDataSourceID, Query: "select 1"}, map[string]Args{
-		"data_source_id": sqlQueryLabelsArgs{Query: "select 1"},
-		"query":          sqlQueryLabelsArgs{DataSourceID: _testDataSourceID},
-	})
-}
-
-func Test_getSQLQueryLabels_Info(t *testing.T) {
-	t.Parallel()
-
-	info := getSQLQueryLabels{}.Info()
-
-	assert.Equal(t, NameGetSQLQueryLabels, info.Name)
-	assert.Equal(t, []string{"data_source_id", "query"}, info.Required)
-}
-
-func Test_getSQLQueryLabels_Traits(t *testing.T) {
-	t.Parallel()
-
-	assert.Equal(t, Traits{DataSource: true}, getSQLQueryLabels{}.Traits())
-}
-
-func Test_getSQLQueryLabels_Title(t *testing.T) {
-	t.Parallel()
-
-	d := dataSourceDeps(t, datasource.TypeMySQL, nil)
-
-	got, err := getSQLQueryLabels{}.Title(testInput(
-		d,
-		NameGetSQLQueryLabels,
-		`{"data_source_id":"`+_testDataSourceID.String()+`","query":"select 1"}`,
-	))
-	require.NoError(t, err)
-	assert.Equal(t, `Probing query labels of "prod"`, got)
-
-	_, err = getSQLQueryLabels{}.Title(testInput(d, NameGetSQLQueryLabels, `{`))
-	require.Error(t, err)
-
-	// a data source the organisation does not own is an error, not a
-	// label: the model is told what it named does not exist.
-	_, err = getSQLQueryLabels{}.Title(testInput(d, NameGetSQLQueryLabels, `{"data_source_id":"`+xid.New().String()+`","query":"select 1"}`))
-	require.Error(t, err)
-}
-
-func Test_getSQLQueryLabels_Execute(t *testing.T) {
-	t.Parallel()
-
-	id := _testDataSourceID.String()
-
-	client := &datasourceMock.SQL{
-		QueryLabelsFunc: func(_ context.Context, q string, _ processor.TimeRange) (map[string]string, error) {
-			if q == "boom" {
-				return nil, assert.AnError
-			}
-
-			return map[string]string{"region": "eu"}, nil
-		},
-	}
-
-	cc := map[string]dataSourceCase{
-		"The query's string columns": {
-			Type:     datasource.TypeMariaDB,
-			Runner:   sqlRunner(client),
-			Args:     `{"data_source_id":"` + id + `","query":"select id from orders"}`,
-			Contains: `"region":"eu"`,
-		},
-		"Unreadable arguments": {
-			Type:   datasource.TypePostgreSQL,
-			Runner: sqlRunner(client),
-			Args:   `{`,
-			Err:    assert.AnError,
-		},
-		"No query": {
-			Type:   datasource.TypePostgreSQL,
-			Runner: sqlRunner(client),
-			Args:   `{"data_source_id":"` + id + `"}`,
-			Err:    assert.AnError,
-		},
-		"An unparseable range": {
-			Type:   datasource.TypePostgreSQL,
-			Runner: sqlRunner(client),
-			Args:   `{"data_source_id":"` + id + `","query":"select 1","to":"later"}`,
-			Err:    assert.AnError,
-		},
-		"An inverted range": {
-			Type:   datasource.TypePostgreSQL,
-			Runner: sqlRunner(client),
-			Args:   `{"data_source_id":"` + id + `","query":"select 1","from":"2026-08-01T12:00:00Z","to":"2026-08-01T10:00:00Z"}`,
-			Err:    assert.AnError,
-		},
-		"A data source that hands out no SQL client": {
-			Type:   datasource.TypePrometheus,
-			Runner: sqlRunner(nil),
-			Args:   `{"data_source_id":"` + id + `","query":"select 1"}`,
-			Err:    assert.AnError,
-		},
-		"A failing read": {
-			Type:   datasource.TypePostgreSQL,
-			Runner: sqlRunner(client),
-			Args:   `{"data_source_id":"` + id + `","query":"boom"}`,
-			Err:    assert.AnError,
-		},
-	}
-
-	maps.Copy(cc, badIDCases(func(id string) string {
-		return `{"data_source_id":"` + id + `","query":"select 1"}`
-	}))
-
-	for cn, c := range cc {
-		t.Run(cn, func(t *testing.T) {
-			t.Parallel()
-
-			runDataSourceCase(t, getSQLQueryLabels{}, NameGetSQLQueryLabels, c)
-		})
-	}
-}
-
-func Test_querySQLArgs_Validate(t *testing.T) {
-	t.Parallel()
-
-	assertValidate(t, querySQLArgs{DataSourceID: _testDataSourceID, Query: "select 1"}, map[string]Args{
-		"data_source_id": querySQLArgs{Query: "select 1"},
-		"query":          querySQLArgs{DataSourceID: _testDataSourceID},
-	})
-}
-
-func Test_querySQL_Info(t *testing.T) {
-	t.Parallel()
-
-	info := querySQL{}.Info()
-
-	assert.Equal(t, NameQuerySQL, info.Name)
-	assert.Equal(t, []string{"data_source_id", "query"}, info.Required)
-	assert.Contains(t, info.Properties, "chart_type")
-}
-
-func Test_querySQL_Traits(t *testing.T) {
-	t.Parallel()
-
-	assert.Equal(t, Traits{DataSource: true}, querySQL{}.Traits())
-}
-
-func Test_querySQL_Title(t *testing.T) {
-	t.Parallel()
-
-	d := dataSourceDeps(t, datasource.TypePostgreSQL, nil)
-
-	got, err := querySQL{}.Title(testInput(
-		d,
-		NameQuerySQL,
-		`{"data_source_id":"`+_testDataSourceID.String()+`","query":"select 1"}`,
-	))
-	require.NoError(t, err)
-	assert.Equal(t, `Querying "prod"`, got)
-
-	_, err = querySQL{}.Title(testInput(d, NameQuerySQL, `{`))
-	require.Error(t, err)
-
-	// a data source the organisation does not own is an error, not a
-	// label: the model is told what it named does not exist.
-	_, err = querySQL{}.Title(testInput(d, NameQuerySQL, `{"data_source_id":"`+xid.New().String()+`","query":"select 1"}`))
-	require.Error(t, err)
-}
-
-func Test_querySQL_Execute(t *testing.T) {
-	t.Parallel()
-
-	id := _testDataSourceID.String()
-
 	rows := [][]any{
 		{float64(1), float64(2)},
 	}
 
-	pg := &datasourceMock.PostgreSQL{
-		QueryFunc: func(_ context.Context, q string, _ processor.TimeRange) (*processor.PostgreSQLQueryResult, error) {
-			if q == "boom" {
-				return nil, assert.AnError
-			}
-
-			// a query the data source answered with nothing at all: the
-			// result is absent, not an error.
-			if q == "empty" {
-				//nolint:nilnil // an absent result is what the executor reports here
-				return nil, nil
-			}
-
-			return &processor.PostgreSQLQueryResult{Columns: []string{"time", "value"}, Rows: rows}, nil
-		},
+	pg := func() *datasourceMock.PostgreSQL {
+		return &datasourceMock.PostgreSQL{
+			QueryFunc: func(_ context.Context, q string, _ processor.TimeRange) (*processor.PostgreSQLQueryResult, error) {
+				switch {
+				case q == "boom", strings.Contains(q, "$"):
+					return nil, assert.AnError
+				case q == "empty":
+					// an absent result is what the executor reports here.
+					return nil, nil
+				default:
+					return &processor.PostgreSQLQueryResult{Columns: []string{"time", "value"}, Rows: rows}, nil
+				}
+			},
+		}
 	}
 
-	my := &datasourceMock.MySQL{
-		QueryFunc: func(_ context.Context, q string, _ processor.TimeRange) (*processor.MySQLQueryResult, error) {
-			if q == "boom" {
-				return nil, assert.AnError
-			}
-
-			if q == "empty" {
-				//nolint:nilnil // an absent result is what the executor reports here
-				return nil, nil
-			}
-
-			return &processor.MySQLQueryResult{Columns: []string{"time", "value"}, Rows: rows}, nil
-		},
+	my := func() *datasourceMock.MySQL {
+		return &datasourceMock.MySQL{
+			QueryFunc: func(_ context.Context, q string, _ processor.TimeRange) (*processor.MySQLQueryResult, error) {
+				switch {
+				case q == "boom", strings.Contains(q, "$"):
+					return nil, assert.AnError
+				case q == "empty":
+					// an absent result is what the executor reports here.
+					return nil, nil
+				default:
+					return &processor.MySQLQueryResult{Columns: []string{"time", "value"}, Rows: rows}, nil
+				}
+			},
+		}
 	}
 
+	// a $ left in a query fails it, so these pass only when every
+	// reference was substituted from stubVariableTree. Both dialect
+	// clients are handed out, so the tool's own dispatch decides which
+	// one is reached.
 	cc := map[string]dataSourceCase{
+		"Prometheus substituted variables": {
+			Type:       datasource.TypePrometheus,
+			Prometheus: prom(&processor.PrometheusQueryResult{Type: model.ValMatrix, Warnings: []string{"slow"}}),
+			Args:       `{"data_source_id":"` + id + `","query":"up{region=\"$region\",range=\"$metric_range\"}"}`,
+			Contains:   `"warnings":["slow"]`,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, FetchTree: 1, Type: 1, Prometheus: 1, QueryRange: 1},
+		},
+		"PostgreSQL substituted variables": {
+			Type:       datasource.TypePostgreSQL,
+			PostgreSQL: pg(),
+			MySQL:      my(),
+			Args:       `{"data_source_id":"` + id + `","query":"select '$region'"}`,
+			Contains:   `"columns":["time","value"]`,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, FetchTree: 1, Type: 1, PostgreSQL: 1, PostgreSQLQuery: 1},
+		},
+		"MySQL substituted variables": {
+			Type:       datasource.TypeMySQL,
+			PostgreSQL: pg(),
+			MySQL:      my(),
+			Args:       `{"data_source_id":"` + id + `","query":"select '$region'"}`,
+			Contains:   `"columns":["time","value"]`,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, FetchTree: 1, Type: 1, MySQL: 1, MySQLQuery: 1},
+		},
+		"Variables of the acting organization and user only": {
+			Type: datasource.TypePostgreSQL,
+			Variables: &VariableManagerMock{
+				FetchTreeFunc: func(_ context.Context, orgID, userID string) (variable.Tree, error) {
+					if orgID != "org" || userID != "user" {
+						return variable.Tree{}, nil
+					}
+
+					return stubVariableTree(), nil
+				},
+			},
+			PostgreSQL: pg(),
+			MySQL:      my(),
+			Args:       `{"data_source_id":"` + id + `","query":"select '$region'"}`,
+			Contains:   `"columns":["time","value"]`,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, FetchTree: 1, Type: 1, PostgreSQL: 1, PostgreSQLQuery: 1},
+		},
+		"Error returned by VariableManager.FetchTree": {
+			Type:       datasource.TypePostgreSQL,
+			Variables:  failingTreeManager(),
+			PostgreSQL: pg(),
+			MySQL:      my(),
+			Args:       `{"data_source_id":"` + id + `","query":"select '$region'"}`,
+			Err:        assert.AnError,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, FetchTree: 1},
+		},
+		"Prometheus raw": {
+			Type:       datasource.TypePrometheus,
+			Prometheus: prom(&processor.PrometheusQueryResult{Type: model.ValMatrix, Warnings: []string{"slow"}}),
+			Args:       `{"data_source_id":"` + id + `","query":"up"}`,
+			Contains:   `"warnings":["slow"]`,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, Type: 1, Prometheus: 1, QueryRange: 1},
+		},
+		"Prometheus charted": {
+			Type:       datasource.TypePrometheus,
+			Prometheus: prom(&processor.PrometheusQueryResult{Type: model.ValMatrix}),
+			Args:       `{"data_source_id":"` + id + `","query":"up","chart_type":"line_chart"}`,
+			Contains:   `"status"`,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, Type: 1, Prometheus: 1, QueryRange: 1},
+		},
+		// a query that returned nothing has no result to transform, and the
+		// metric block renders it as no-data.
+		"A Prometheus query with no result at all is no-data": {
+			Type:       datasource.TypePrometheus,
+			Prometheus: prom(nil),
+			Args:       `{"data_source_id":"` + id + `","query":"up","chart_type":"gauge_chart"}`,
+			Contains:   `"status":"no-data"`,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, Type: 1, Prometheus: 1, QueryRange: 1},
+		},
 		"PostgreSQL raw": {
-			Type:     datasource.TypePostgreSQL,
-			Runner:   dialectRunner(datasource.TypePostgreSQL, pg, my),
-			Args:     `{"data_source_id":"` + id + `","query":"select 1"}`,
-			Contains: `"columns":["time","value"]`,
+			Type:       datasource.TypePostgreSQL,
+			PostgreSQL: pg(),
+			MySQL:      my(),
+			Args:       `{"data_source_id":"` + id + `","query":"select 1"}`,
+			Contains:   `"columns":["time","value"]`,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, Type: 1, PostgreSQL: 1, PostgreSQLQuery: 1},
 		},
 		"PostgreSQL charted": {
-			Type:     datasource.TypePostgreSQL,
-			Runner:   dialectRunner(datasource.TypePostgreSQL, pg, my),
-			Args:     `{"data_source_id":"` + id + `","query":"select 1","chart_type":"line_chart"}`,
-			Contains: `"status"`,
+			Type:       datasource.TypePostgreSQL,
+			PostgreSQL: pg(),
+			MySQL:      my(),
+			Args:       `{"data_source_id":"` + id + `","query":"select 1","chart_type":"line_chart"}`,
+			Contains:   `"status"`,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, Type: 1, PostgreSQL: 1, PostgreSQLQuery: 1},
+		},
+		"A PostgreSQL query with no rows at all is no-data": {
+			Type:       datasource.TypePostgreSQL,
+			PostgreSQL: pg(),
+			MySQL:      my(),
+			Args:       `{"data_source_id":"` + id + `","query":"empty","chart_type":"line_chart"}`,
+			Contains:   `"status":"no-data"`,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, Type: 1, PostgreSQL: 1, PostgreSQLQuery: 1},
 		},
 		"MySQL raw": {
-			Type:     datasource.TypeMySQL,
-			Runner:   dialectRunner(datasource.TypeMySQL, pg, my),
-			Args:     `{"data_source_id":"` + id + `","query":"select 1"}`,
-			Contains: `"columns":["time","value"]`,
+			Type:       datasource.TypeMySQL,
+			PostgreSQL: pg(),
+			MySQL:      my(),
+			Args:       `{"data_source_id":"` + id + `","query":"select 1"}`,
+			Contains:   `"columns":["time","value"]`,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, Type: 1, MySQL: 1, MySQLQuery: 1},
 		},
 		"MariaDB charted": {
-			Type:     datasource.TypeMariaDB,
-			Runner:   dialectRunner(datasource.TypeMariaDB, pg, my),
-			Args:     `{"data_source_id":"` + id + `","query":"select 1","chart_type":"bar_chart"}`,
-			Contains: `"status"`,
+			Type:       datasource.TypeMariaDB,
+			PostgreSQL: pg(),
+			MySQL:      my(),
+			Args:       `{"data_source_id":"` + id + `","query":"select 1","chart_type":"bar_chart"}`,
+			Contains:   `"status"`,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, Type: 1, MySQL: 1, MySQLQuery: 1},
 		},
-		"A PostgreSQL chart query with no rows at all is no-data": {
-			Type:     datasource.TypePostgreSQL,
-			Runner:   dialectRunner(datasource.TypePostgreSQL, pg, my),
-			Args:     `{"data_source_id":"` + id + `","query":"empty","chart_type":"line_chart"}`,
-			Contains: `"status":"no-data"`,
-		},
-		"A MySQL chart query with no rows at all is no-data": {
-			Type:     datasource.TypeMySQL,
-			Runner:   dialectRunner(datasource.TypeMySQL, pg, my),
-			Args:     `{"data_source_id":"` + id + `","query":"empty","chart_type":"line_chart"}`,
-			Contains: `"status":"no-data"`,
+		"A MySQL query with no rows at all is no-data": {
+			Type:       datasource.TypeMySQL,
+			PostgreSQL: pg(),
+			MySQL:      my(),
+			Args:       `{"data_source_id":"` + id + `","query":"empty","chart_type":"line_chart"}`,
+			Contains:   `"status":"no-data"`,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, Type: 1, MySQL: 1, MySQLQuery: 1},
 		},
 		"Unreadable arguments": {
-			Type:   datasource.TypePostgreSQL,
-			Runner: dialectRunner(datasource.TypePostgreSQL, pg, my),
-			Args:   `{`,
-			Err:    assert.AnError,
+			Type:       datasource.TypePostgreSQL,
+			PostgreSQL: pg(),
+			MySQL:      my(),
+			Args:       `{`,
+			Err:        assert.AnError,
 		},
 		"No query": {
-			Type:   datasource.TypePostgreSQL,
-			Runner: dialectRunner(datasource.TypePostgreSQL, pg, my),
-			Args:   `{"data_source_id":"` + id + `"}`,
-			Err:    assert.AnError,
+			Type:       datasource.TypePostgreSQL,
+			PostgreSQL: pg(),
+			MySQL:      my(),
+			Args:       `{"data_source_id":"` + id + `"}`,
+			Err:        assert.AnError,
 		},
 		"An unknown chart type": {
-			Type:   datasource.TypePostgreSQL,
-			Runner: dialectRunner(datasource.TypePostgreSQL, pg, my),
-			Args:   `{"data_source_id":"` + id + `","query":"select 1","chart_type":"donut"}`,
-			Err:    assert.AnError,
+			Type:       datasource.TypePostgreSQL,
+			PostgreSQL: pg(),
+			MySQL:      my(),
+			Args:       `{"data_source_id":"` + id + `","query":"select 1","chart_type":"donut"}`,
+			Err:        assert.AnError,
 		},
 		"An unparseable range": {
-			Type:   datasource.TypePostgreSQL,
-			Runner: dialectRunner(datasource.TypePostgreSQL, pg, my),
-			Args:   `{"data_source_id":"` + id + `","query":"select 1","from":"epoch"}`,
-			Err:    assert.AnError,
+			Type:       datasource.TypePostgreSQL,
+			PostgreSQL: pg(),
+			MySQL:      my(),
+			Args:       `{"data_source_id":"` + id + `","query":"select 1","from":"epoch"}`,
+			Err:        assert.AnError,
 		},
 		"An inverted range": {
-			Type:   datasource.TypePostgreSQL,
-			Runner: dialectRunner(datasource.TypePostgreSQL, pg, my),
-			Args:   `{"data_source_id":"` + id + `","query":"select 1","from":"2026-08-01T12:00:00Z","to":"2026-08-01T10:00:00Z"}`,
-			Err:    assert.AnError,
+			Type:       datasource.TypePostgreSQL,
+			PostgreSQL: pg(),
+			MySQL:      my(),
+			Args:       `{"data_source_id":"` + id + `","query":"select 1","from":"2026-08-01T12:00:00Z","to":"2026-08-01T10:00:00Z"}`,
+			Err:        assert.AnError,
 		},
-		"A data source that hands out no PostgreSQL client": {
-			Type:   datasource.TypePostgreSQL,
-			Runner: dialectRunner(datasource.TypePostgreSQL, nil, my),
-			Args:   `{"data_source_id":"` + id + `","query":"select 1"}`,
-			Err:    assert.AnError,
+		"Error returned by Runner.Prometheus": {
+			Type:     datasource.TypePrometheus,
+			NoClient: true,
+			Args:     `{"data_source_id":"` + id + `","query":"up"}`,
+			Err:      assert.AnError,
+			Calls:    dataSourceCalls{FetchDataSource: 1, Runner: 1, Type: 1, Prometheus: 1},
 		},
-		"A data source that hands out no MySQL client": {
-			Type:   datasource.TypeMySQL,
-			Runner: dialectRunner(datasource.TypeMySQL, pg, nil),
-			Args:   `{"data_source_id":"` + id + `","query":"select 1"}`,
-			Err:    assert.AnError,
+		"Error returned by Runner.PostgreSQL": {
+			Type:     datasource.TypePostgreSQL,
+			NoClient: true,
+			Args:     `{"data_source_id":"` + id + `","query":"select 1"}`,
+			Err:      assert.AnError,
+			Calls:    dataSourceCalls{FetchDataSource: 1, Runner: 1, Type: 1, PostgreSQL: 1},
 		},
-		"A failing PostgreSQL read": {
-			Type:   datasource.TypePostgreSQL,
-			Runner: dialectRunner(datasource.TypePostgreSQL, pg, my),
-			Args:   `{"data_source_id":"` + id + `","query":"boom"}`,
-			Err:    assert.AnError,
+		"Error returned by Runner.MySQL": {
+			Type:     datasource.TypeMySQL,
+			NoClient: true,
+			Args:     `{"data_source_id":"` + id + `","query":"select 1"}`,
+			Err:      assert.AnError,
+			Calls:    dataSourceCalls{FetchDataSource: 1, Runner: 1, Type: 1, MySQL: 1},
 		},
-		"A failing MySQL read": {
-			Type:   datasource.TypeMySQL,
-			Runner: dialectRunner(datasource.TypeMySQL, pg, my),
-			Args:   `{"data_source_id":"` + id + `","query":"boom"}`,
-			Err:    assert.AnError,
+		"Error returned by Prometheus.QueryRange": {
+			Type:       datasource.TypePrometheus,
+			Prometheus: prom(nil),
+			Args:       `{"data_source_id":"` + id + `","query":"boom"}`,
+			Err:        assert.AnError,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, Type: 1, Prometheus: 1, QueryRange: 1},
+		},
+		"Error returned by PostgreSQL.Query": {
+			Type:       datasource.TypePostgreSQL,
+			PostgreSQL: pg(),
+			MySQL:      my(),
+			Args:       `{"data_source_id":"` + id + `","query":"boom"}`,
+			Err:        assert.AnError,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, Type: 1, PostgreSQL: 1, PostgreSQLQuery: 1},
+		},
+		"Error returned by MySQL.Query": {
+			Type:       datasource.TypeMySQL,
+			PostgreSQL: pg(),
+			MySQL:      my(),
+			Args:       `{"data_source_id":"` + id + `","query":"boom"}`,
+			Err:        assert.AnError,
+			Calls:      dataSourceCalls{FetchDataSource: 1, Runner: 1, Type: 1, MySQL: 1, MySQLQuery: 1},
 		},
 	}
 
@@ -1351,7 +1203,116 @@ func Test_querySQL_Execute(t *testing.T) {
 		t.Run(cn, func(t *testing.T) {
 			t.Parallel()
 
-			runDataSourceCase(t, querySQL{}, NameQuerySQL, c)
+			runDataSourceCase(t, queryDataSource{}, NameQueryDataSource, c)
+		})
+	}
+}
+
+func Test_newRawSeries(t *testing.T) {
+	t.Parallel()
+
+	matrix := func(series, points int) model.Matrix {
+		out := make(model.Matrix, 0, series)
+
+		for range series {
+			s := &model.SampleStream{Metric: model.Metric{"job": "api"}}
+
+			for i := range points {
+				s.Values = append(s.Values, model.SamplePair{Timestamp: model.Time(i), Value: model.SampleValue(i)})
+			}
+
+			out = append(out, s)
+		}
+
+		return out
+	}
+
+	cc := map[string]struct {
+		Input     *processor.PrometheusQueryResult
+		Series    int
+		Points    int
+		Truncated string
+		Result    *rawSeries
+	}{
+		// an answer that is not a range of series has nothing to cap.
+		"An answer that is not a range of series is as it was": {
+			Input:  &processor.PrometheusQueryResult{Type: model.ValScalar, Result: &model.Scalar{Value: 1}},
+			Result: &rawSeries{Type: model.ValScalar, Result: &model.Scalar{Value: 1}},
+		},
+		"An answer within the caps is as it was": {
+			Input:  &processor.PrometheusQueryResult{Type: model.ValMatrix, Result: matrix(2, 3)},
+			Series: 2,
+			Points: 3,
+		},
+		"Too many series keeps the first ones": {
+			Input:     &processor.PrometheusQueryResult{Type: model.ValMatrix, Result: matrix(_maxRawSeries+5, 3)},
+			Series:    _maxRawSeries,
+			Points:    3,
+			Truncated: "20 of 25 series, each its latest 100 points at most; set chart_type to describe them all",
+		},
+		"Too many points keeps the latest ones": {
+			Input:     &processor.PrometheusQueryResult{Type: model.ValMatrix, Result: matrix(1, _maxRawPoints+50)},
+			Series:    1,
+			Points:    _maxRawPoints,
+			Truncated: "1 of 1 series, each its latest 100 points at most; set chart_type to describe them all",
+		},
+	}
+
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			got := newRawSeries(c.Input)
+
+			if c.Result != nil {
+				assert.Equal(t, *c.Result, got)
+				return
+			}
+
+			assert.Equal(t, c.Truncated, got.Truncated)
+
+			m, ok := got.Result.(model.Matrix)
+			require.True(t, ok)
+			require.Len(t, m, c.Series)
+			assert.Len(t, m[0].Values, c.Points)
+			// the points kept are the latest ones.
+			assert.InDelta(t, float64(len(c.Input.Result.(model.Matrix)[0].Values)-1), float64(m[0].Values[len(m[0].Values)-1].Value), 0)
+		})
+	}
+}
+
+func Test_newRawRows(t *testing.T) {
+	t.Parallel()
+
+	rows := func(n int) [][]any {
+		out := make([][]any, 0, n)
+
+		for i := range n {
+			out = append(out, []any{i})
+		}
+
+		return out
+	}
+
+	cc := map[string]struct {
+		Rows   int
+		Result rawRows
+	}{
+		"An answer within the cap is as it was": {
+			Rows:   2,
+			Result: rawRows{Columns: []string{"a"}, Rows: rows(2)},
+		},
+		"Too many rows keeps the first ones": {
+			Rows:   _maxRawRows + 50,
+			Result: rawRows{Columns: []string{"a"}, Rows: rows(_maxRawRows), TotalRows: _maxRawRows + 50},
+		},
+	}
+
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, c.Result, newRawRows([]string{"a"}, rows(c.Rows)))
 		})
 	}
 }
@@ -1446,16 +1407,13 @@ func Test_newChartPreview(t *testing.T) {
 	cc := map[string]struct {
 		Input  *processor.QueryResult
 		Result chartPreview
+		Check  func(t *testing.T, got chartPreview)
 	}{
-		"Nil result reads as no data": {
-			Input:  nil,
-			Result: chartPreview{Status: processor.QueryStatusNoData},
-		},
 		"Status without data carries no series": {
 			Input:  &processor.QueryResult{Status: processor.QueryStatusNoData},
 			Result: chartPreview{Status: processor.QueryStatusNoData},
 		},
-		"Series report their labels and endpoints, never their points": {
+		"Series report their labels and endpoints but never their points": {
 			Input: &processor.QueryResult{
 				Status: processor.QueryStatusOK,
 				Data:   series(1),
@@ -1482,26 +1440,33 @@ func Test_newChartPreview(t *testing.T) {
 				Series:      []chartPreviewSeries{{Labels: map[string]string{"i": "0"}}},
 			},
 		},
+		// the cap bounds the answer without hiding how much there was.
+		"More series than the cap are counted but not listed": {
+			Input: &processor.QueryResult{
+				Status: processor.QueryStatusOK,
+				Data:   series(_maxPreviewSeries + 5),
+			},
+			Check: func(t *testing.T, got chartPreview) {
+				t.Helper()
+
+				assert.Equal(t, _maxPreviewSeries+5, got.SeriesCount)
+				assert.Len(t, got.Series, _maxPreviewSeries)
+			},
+		},
 	}
 
 	for cn, c := range cc {
 		t.Run(cn, func(t *testing.T) {
 			t.Parallel()
 
-			assert.Equal(t, c.Result, newChartPreview(c.Input))
+			got := newChartPreview(c.Input)
+
+			if c.Check != nil {
+				c.Check(t, got)
+				return
+			}
+
+			assert.Equal(t, c.Result, got)
 		})
 	}
-
-	// the cap bounds the answer without hiding how much there was.
-	t.Run("More series than the cap are counted but not listed", func(t *testing.T) {
-		t.Parallel()
-
-		got := newChartPreview(&processor.QueryResult{
-			Status: processor.QueryStatusOK,
-			Data:   series(_maxPreviewSeries + 5),
-		})
-
-		assert.Equal(t, _maxPreviewSeries+5, got.SeriesCount)
-		assert.Len(t, got.Series, _maxPreviewSeries)
-	})
 }

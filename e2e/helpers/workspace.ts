@@ -9,6 +9,7 @@ import {
 import { type Credentials, signUpAndVerify, submitLoginForm } from "./auth"
 import { waitForEditor } from "./editor"
 import { t } from "./i18n"
+import { hydrated } from "./page"
 
 export interface Workspace {
 	name: string
@@ -17,10 +18,11 @@ export interface Workspace {
 
 // newWorkspace mints a workspace nobody else uses. The slug is what the
 // server checks for uniqueness, so it carries the random part; the name
-// only has to pass validation, which allows no spaces.
+// only has to pass validation. It holds a space, which a link has to
+// encode.
 export function newWorkspace(): Workspace {
 	return {
-		name: "Acme-Corp",
+		name: "Acme Corp",
 		slug: `ws-${randomUUID().slice(0, 8)}`,
 	}
 }
@@ -33,6 +35,10 @@ export async function submitWorkspaceForm(
 	page: Page,
 	workspace: Workspace,
 ): Promise<void> {
+	// the form is reached through the login redirect, a full page load. A
+	// submit before hydration is the browser's own, which only reloads the
+	// page with the fields in the url
+	await hydrated(page)
 	await page
 		.getByLabel(t("onboarding.welcome.form.workspace-name.label"))
 		.fill(workspace.name)

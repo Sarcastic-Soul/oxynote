@@ -7,14 +7,13 @@ import (
 	"net/http"
 	"net/url"
 	"path"
-	"unicode/utf8"
+	"time"
 
 	"github.com/guregu/null/v5"
-	"github.com/oxynote/oxynote/server/core/internal/apps/github"
-	"github.com/oxynote/oxynote/server/core/internal/apps/webchange"
 	documentCore "github.com/oxynote/oxynote/server/core/internal/document"
 	"github.com/oxynote/oxynote/server/core/internal/document/file"
 	"github.com/oxynote/oxynote/server/core/internal/document/hook"
+	"github.com/oxynote/oxynote/server/core/internal/document/hook/manager"
 	"github.com/oxynote/oxynote/server/core/internal/notification"
 	"github.com/oxynote/oxynote/server/core/internal/search"
 	"github.com/oxynote/oxynote/server/core/internal/server/internal/auth"
@@ -25,20 +24,9 @@ import (
 	"github.com/rs/xid"
 )
 
-// _searchQueryMaxLength caps a search query in characters. Every term
-// expands to a dictionary walk inside the process, so the query size
-// bounds the work one request can ask for.
-const _searchQueryMaxLength = 200
-
-// ErrInvalidSearchQuery is returned when the search query is invalid.
-var ErrInvalidSearchQuery = errutil.New(http.StatusBadRequest, "document.invalid_search_query", "invalid search query")
-
 // ErrBranchMismatch is returned when the requested branch does not belong to
 // the document identified by the request path.
 var ErrBranchMismatch = errutil.New(http.StatusNotFound, "document.branch_mismatch", "branch does not belong to the document")
-
-// ErrDefaultBranchRename is returned when a rename targets the default branch.
-var ErrDefaultBranchRename = errutil.New(http.StatusBadRequest, "document.default_branch_rename", "the default branch cannot be renamed")
 
 // ErrInvalidDocumentParent is returned when a document would be moved under
 // itself or one of its own descendants.
@@ -46,14 +34,13 @@ var ErrInvalidDocumentParent = errutil.New(http.StatusBadRequest, "document.inva
 
 // Handler holds dependencies required for tenant app-related operations.
 type Handler struct {
-	log             *slog.Logger
-	db              DB
-	githubMan       *github.Manager
-	webchangeClient *webchange.Client
-	searcher        Searcher
-	searchTrigger   SearchTrigger
-	notifPub        notification.Publisher
-	storer          Storer
+	log         *slog.Logger
+	db          DB
+	hookMan     HookManager
+	searcher    Searcher
+	searchQueue SearchQueue
+	notifPub    notification.Publisher
+	storer      Storer
 
 	tree struct {
 		changeCallback func(organizationID string, parentId null.Value[xid.ID])
@@ -76,22 +63,20 @@ type Handler struct {
 func NewHandler(
 	log *slog.Logger,
 	db DB,
-	githubMan *github.Manager,
-	webchangeClient *webchange.Client,
+	hookMan HookManager,
 	searcher Searcher,
-	searchTrigger SearchTrigger,
+	searchQueue SearchQueue,
 	notifPub notification.Publisher,
 	storer Storer,
 ) *Handler {
 	return &Handler{
-		log:             log,
-		db:              db,
-		githubMan:       githubMan,
-		webchangeClient: webchangeClient,
-		searcher:        searcher,
-		searchTrigger:   searchTrigger,
-		notifPub:        notifPub,
-		storer:          storer,
+		log:         log,
+		db:          db,
+		hookMan:     hookMan,
+		searcher:    searcher,
+		searchQueue: searchQueue,
+		notifPub:    notifPub,
+		storer:      storer,
 	}
 }
 
@@ -513,25 +498,99 @@ func (h *Handler) FetchDocumentTree(w http.ResponseWriter, r *http.Request) {
 	)
 }
 
-// SearchDocuments handles the search for documents matching a query.
+// SearchDocuments handles the search for document branches matching a
+// query, one page at a time.
 func (h *Handler) SearchDocuments(w http.ResponseWriter, r *http.Request) {
 	session, ok := auth.RequireSession(h.log, w, r)
 	if !ok {
 		return
 	}
 
-	q := r.URL.Query().Get("q")
-	if q == "" || utf8.RuneCountInString(q) > _searchQueryMaxLength {
-		httpserver.RespondError(
-			h.log,
-			w,
-			ErrInvalidSearchQuery,
-		)
+	var inp struct {
+		Query             string `schema:"q"`
+		Limit             int    `schema:"limit"`
+		HitsLimit         int    `schema:"hitsLimit"`
+		CurrentDocumentID xid.ID `schema:"currentDocId"`
+		NextToken         string `schema:"nextToken"`
+	}
 
+	if err := httpserver.DecodeForm(r, &inp); err != nil {
+		httpserver.RespondError(h.log, w, err)
 		return
 	}
 
-	data, err := h.searcher.SearchDocuments(r.Context(), session.ActiveOrganizationID, q)
+	gq := search.GroupQuery{
+		OrganizationID: session.ActiveOrganizationID,
+		Query:          inp.Query,
+		Limit:          search.GroupLimit(inp.Limit),
+		HitsLimit:      inp.HitsLimit,
+		PageToken:      inp.NextToken,
+	}
+
+	if !inp.CurrentDocumentID.IsZero() {
+		gq.CurrentDocumentID = null.ValueFrom(inp.CurrentDocumentID)
+	}
+
+	page, err := h.searcher.SearchGroups(r.Context(), gq)
+	if err != nil {
+		httpserver.RespondError(h.log, w, err)
+		return
+	}
+
+	docs, err := h.db.FetchDocumentsByBranchIDs(r.Context(), page.BranchIDs(), session.ActiveOrganizationID)
+	if err != nil {
+		httpserver.RespondError(h.log, w, err)
+		return
+	}
+
+	httpserver.Respond(h.log, w, search.NewResponse(page, docs), http.StatusOK)
+}
+
+// FetchRecentlyViewedDocuments handles the listing of the document
+// branches the user opened most recently, from anywhere unless the
+// request names an origin.
+func (h *Handler) FetchRecentlyViewedDocuments(w http.ResponseWriter, r *http.Request) {
+	session, ok := auth.RequireSession(h.log, w, r)
+	if !ok {
+		return
+	}
+
+	inp := struct {
+		From  search.ViewFrom `schema:"from"`
+		Limit int             `schema:"limit"`
+	}{
+		From: search.ViewFromAll,
+	}
+
+	if err := httpserver.DecodeForm(r, &inp); err != nil {
+		httpserver.RespondError(h.log, w, err)
+		return
+	}
+
+	docs, err := h.db.FetchRecentlyViewedDocuments(
+		r.Context(),
+		session.UserID,
+		session.ActiveOrganizationID,
+		inp.From,
+		search.GroupLimit(inp.Limit),
+	)
+	if err != nil {
+		httpserver.RespondError(h.log, w, err)
+		return
+	}
+
+	httpserver.Respond(h.log, w, search.NewRecentResponse(docs), http.StatusOK)
+}
+
+// SearchDocumentsLegacy handles the search for blocks matching a query,
+// answered as a flat list.
+func (h *Handler) SearchDocumentsLegacy(w http.ResponseWriter, r *http.Request) {
+	session, ok := auth.RequireSession(h.log, w, r)
+	if !ok {
+		return
+	}
+
+	data, err := h.searcher.SearchDocuments(r.Context(), session.ActiveOrganizationID, r.URL.Query().Get("q"))
 	if err != nil {
 		httpserver.RespondError(h.log, w, err)
 		return
@@ -557,7 +616,7 @@ func (h *Handler) CreateDocument(w http.ResponseWriter, r *http.Request) {
 
 	doc := documentCore.NewDocument(di, session.ActiveOrganizationID, session.UserID)
 
-	if err := h.insertDocumentTx(r.Context(), doc, null.Value[xid.ID]{}, session); err != nil {
+	if err := h.insertDocumentTx(r.Context(), doc, null.Value[xid.ID]{}, nil, session); err != nil {
 		httpserver.RespondError(h.log, w, err)
 		return
 	}
@@ -659,24 +718,8 @@ func (h *Handler) DeleteDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hooks, err := h.db.FetchDocumentHooksByDocumentID(r.Context(), id, session.ActiveOrganizationID)
-	if err != nil {
-		httpserver.RespondError(h.log, w, err)
-		return
-	}
-
-	for _, hk := range hooks {
-		err = hk.Delete(r.Context(), hook.NewInput(
-			session.ActiveOrganizationID,
-			h.githubMan,
-			h.webchangeClient,
-		))
-		if err != nil {
-			httpserver.RespondError(h.log, w, err)
-			return
-		}
-	}
-
+	// the document's hooks, and those of its descendants, lose their
+	// document with it. The hook manager tears down what they hold.
 	var tx Tx
 
 	err = h.db.BeginTx(r.Context(), &tx)
@@ -698,7 +741,7 @@ func (h *Handler) DeleteDocument(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, id := range ids {
-		if err = tx.InsertSearchJob(r.Context(), search.DocumentScope(session.ActiveOrganizationID, id)); err != nil {
+		if err = h.searchQueue.Enqueue(r.Context(), tx, search.DocumentScope(session.ActiveOrganizationID, id)); err != nil {
 			httpserver.RespondError(h.log, w, err)
 			return
 		}
@@ -709,8 +752,6 @@ func (h *Handler) DeleteDocument(w http.ResponseWriter, r *http.Request) {
 		httpserver.RespondError(h.log, w, err)
 		return
 	}
-
-	h.searchTrigger.Trigger()
 
 	if h.tree.changeCallback != nil {
 		h.tree.changeCallback(session.ActiveOrganizationID, doc.ParentID)
@@ -743,21 +784,12 @@ func (h *Handler) DuplicateDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	duplDoc, files, uids := doc.Duplicate(session.UserID)
+	duplDoc, files, newBlockIDs := doc.Duplicate(session.UserID)
 
-	if err = h.insertDocumentTx(r.Context(), duplDoc, null.ValueFrom(doc.BranchID), session); err != nil {
+	if err := h.insertDocumentTx(r.Context(), duplDoc, null.ValueFrom(doc.BranchID), newBlockIDs, session); err != nil {
 		httpserver.RespondError(h.log, w, err)
 		return
 	}
-
-	h.copyHooksToBranch(
-		r.Context(),
-		doc.BranchID,
-		duplDoc.BranchID,
-		duplDoc.ID,
-		session.ActiveOrganizationID,
-		uids,
-	)
 
 	h.copyDocumentFiles(r.Context(), files, duplDoc.ID, session.ActiveOrganizationID)
 
@@ -865,15 +897,18 @@ func (h *Handler) upsertBranchReviewer(
 	}
 }
 
-// insertDocumentTx inserts a new document together with its maintainer and
-// its search job, and slots it at the top of its parent's tree, all in one
-// transaction. A document duplicated from a branch also takes that branch's
-// tags. The tree-change notification is left to the caller, since it must
-// not fire before the commit.
+// insertDocumentTx inserts a new document together with its maintainer,
+// its search job and the boundary history entry of its first content, and
+// slots it at the top of its parent's tree, all in one transaction. A
+// document duplicated from a branch also takes that branch's tags and its
+// hooks, re-anchored through newBlockIDs. Copied hooks are set up after
+// the commit. The tree-change notification is left to the caller, since
+// it must not fire before the commit.
 func (h *Handler) insertDocumentTx(
 	ctx context.Context,
 	doc documentCore.Document,
 	sourceBranchID null.Value[xid.ID],
+	newBlockIDs map[string]string,
 	session auth.Session,
 ) error {
 	var tx Tx
@@ -894,13 +929,32 @@ func (h *Handler) insertDocumentTx(
 		return err
 	}
 
+	// the copies go in before the entry is recorded, so it lists them.
 	if sourceBranchID.Valid {
-		if err := tx.CopyBranchTags(ctx, session.ActiveOrganizationID, sourceBranchID.V, doc.BranchID); err != nil {
+		err := manager.CopyHooks(ctx, tx, sourceBranchID.V, doc.BranchID, doc.ID, session.ActiveOrganizationID, newBlockIDs)
+		if err != nil {
 			return err
 		}
 	}
 
-	if err := tx.UpsertDocumentMaintainers(
+	err := tx.RecordDocumentBranchHistoryEntry(
+		ctx,
+		doc.BranchID,
+		session.ActiveOrganizationID,
+		null.StringFrom(session.UserID),
+		true,
+	)
+	if err != nil {
+		return err
+	}
+
+	if sourceBranchID.Valid {
+		if err = tx.CopyBranchTags(ctx, session.ActiveOrganizationID, sourceBranchID.V, doc.BranchID); err != nil {
+			return err
+		}
+	}
+
+	if err = tx.UpsertDocumentMaintainers(
 		ctx,
 		doc.ID,
 		session.ActiveOrganizationID,
@@ -909,7 +963,7 @@ func (h *Handler) insertDocumentTx(
 		return err
 	}
 
-	if err := tx.InsertSearchJob(ctx, search.BranchScope(session.ActiveOrganizationID, doc.ID, doc.BranchID)); err != nil {
+	if err = h.searchQueue.Enqueue(ctx, tx, search.BranchScope(session.ActiveOrganizationID, doc.ID, doc.BranchID)); err != nil {
 		return err
 	}
 
@@ -931,9 +985,20 @@ func (h *Handler) insertDocumentTx(
 		return err
 	}
 
-	h.searchTrigger.Trigger()
+	if sourceBranchID.Valid {
+		h.hookMan.SetUpBranch(ctx, doc.BranchID, session.ActiveOrganizationID)
+	}
 
 	return nil
+}
+
+// HookManager sets up the hooks a branch operation copied.
+//
+//go:generate ../../../../scripts/codegen/mock -t internal HookManager hook_manager
+type HookManager interface {
+	// SetUpBranch should set up the branch's hooks that are not set up
+	// yet, leaving any it cannot to a later pass.
+	SetUpBranch(ctx context.Context, branchID xid.ID, organizationID string)
 }
 
 // DB is an interface that combines sqlutil.DB and DBAgent.
@@ -958,6 +1023,7 @@ type DBAgent interface {
 	ReviewersDBAgent
 	DocumentsDBAgent
 	BranchesDBAgent
+	BranchViewsDBAgent
 	TreeDBAgent
 	MaintainersDBAgent
 	FilesDBAgent
@@ -968,14 +1034,10 @@ type DBAgent interface {
 
 // HooksDBAgent is an interface that handles communication with the document
 // hooks database, covering the hook operations needed by document and branch
-// lifecycle handlers (branch forking, merging, and document deletion).
+// lifecycle handlers (forking, merging and duplicating).
 type HooksDBAgent interface {
 	// InsertDocumentHook should insert the document hook.
 	InsertDocumentHook(ctx context.Context, hk hook.Hook) error
-
-	// FetchDocumentHooksByDocumentID should fetch all hooks for a document across all branches.
-	// Used for full document cleanup (e.g. on document deletion).
-	FetchDocumentHooksByDocumentID(ctx context.Context, documentID xid.ID, organizationID string) ([]hook.Hook, error)
 
 	// FetchDocumentHooksByBranchID should fetch all hooks for a specific branch.
 	FetchDocumentHooksByBranchID(ctx context.Context, branchID xid.ID, organizationID string) ([]hook.Hook, error)
@@ -990,9 +1052,6 @@ type HooksDBAgent interface {
 type DocumentsDBAgent interface {
 	// InsertDocument should insert the document.
 	InsertDocument(ctx context.Context, doc documentCore.Document) error
-
-	// InsertSearchJob should queue the search job's scope.
-	InsertSearchJob(ctx context.Context, job search.Job) error
 
 	// CheckDocumentExists returns nil if the document exists and belongs to the given organization.
 	CheckDocumentExists(ctx context.Context, id xid.ID, organizationID string) error
@@ -1015,6 +1074,16 @@ type DocumentsDBAgent interface {
 
 	// UpdateDocument should update the document.
 	UpdateDocument(ctx context.Context, doc documentCore.Document) error
+
+	// RecordDocumentBranchHistoryEntry should record the branch as it
+	// stands, with its hooks.
+	RecordDocumentBranchHistoryEntry(
+		ctx context.Context,
+		branchID xid.ID,
+		organizationID string,
+		by null.String,
+		boundary bool,
+	) error
 
 	// DeleteDocument should delete the document and report the ids of
 	// the document and of every cascade-deleted descendant.
@@ -1052,6 +1121,36 @@ type BranchesDBAgent interface {
 	// ReplaceBranchTags should make the target branch carry exactly the
 	// tags the source branch carries.
 	ReplaceBranchTags(ctx context.Context, organizationID string, fromBranchID, toBranchID xid.ID) error
+
+	// FetchDocumentsByBranchIDs should fetch the documents joined against
+	// each of the given branches within the organization.
+	FetchDocumentsByBranchIDs(ctx context.Context, branchIDs []xid.ID, organizationID string) ([]documentCore.Document, error)
+}
+
+// BranchViewsDBAgent is an interface that handles communication with the
+// document branch views database.
+type BranchViewsDBAgent interface {
+	// UpsertDocumentBranchView should record that the user viewed the
+	// branch from the given origin at the given time.
+	UpsertDocumentBranchView(
+		ctx context.Context,
+		userID string,
+		organizationID string,
+		branchID xid.ID,
+		from search.ViewFrom,
+		viewedAt time.Time,
+	) error
+
+	// FetchRecentlyViewedDocuments should fetch up to limit branches the
+	// user viewed from the given origin in the organization, most recent
+	// first.
+	FetchRecentlyViewedDocuments(
+		ctx context.Context,
+		userID string,
+		organizationID string,
+		from search.ViewFrom,
+		limit int,
+	) ([]search.RecentDocument, error)
 }
 
 // TreeDBAgent is an interface that handles communication with the document
@@ -1124,12 +1223,13 @@ type Storer interface {
 	Copy(ctx context.Context, srcFolder, srcID, dstFolder, dstID string) error
 }
 
-// SearchTrigger runs the search-job worker once a job has committed.
+// SearchQueue queues search jobs.
 //
-//go:generate ../../../../scripts/codegen/mock -t internal SearchTrigger search_trigger
-type SearchTrigger interface {
-	// Trigger should run a search-job pass right away.
-	Trigger()
+//go:generate ../../../../scripts/codegen/mock -t internal SearchQueue search_queue
+type SearchQueue interface {
+	// Enqueue should queue the job on the transaction, to run once it
+	// commits.
+	Enqueue(ctx context.Context, tx sqlutil.Tx, j search.Job) error
 }
 
 // Searcher is the full-text search surface the search endpoint answers
@@ -1137,6 +1237,14 @@ type SearchTrigger interface {
 //
 //go:generate ../../../../scripts/codegen/mock -t internal Searcher searcher
 type Searcher interface {
-	// SearchDocuments should find the documents matching the query.
+	// SearchDocuments should find the blocks matching the query, as a
+	// flat JSON list.
 	SearchDocuments(ctx context.Context, organizationID, query string) ([]byte, error)
+
+	// SearchGroups should find one page of the branches matching the
+	// query.
+	SearchGroups(ctx context.Context, gq search.GroupQuery) (search.GroupPage, error)
+
+	// SearchBranch should find one page of the hits of one branch.
+	SearchBranch(ctx context.Context, bq search.BranchQuery) (search.BranchPage, error)
 }

@@ -5,6 +5,7 @@ import { beforeEach, describe, it, vi } from "vitest"
 import BlockHandle from "./BlockHandle.vue"
 import { DragHandle } from "./MainElement"
 import CoreMenu from "./menu-options/CoreMenu.vue"
+import HookMenuContent from "../hooks/HookMenuContent.vue"
 import { makeEditor } from "../test-helpers/node-view"
 import {
 	clearTeleportedOverlays,
@@ -17,7 +18,22 @@ import {
 const MENU_CLOSE_ANIMATION_MS = 150
 
 function hook(blockId: string, score: number): DocumentHook {
-	return { blockId: blockId, score: score } as unknown as DocumentHook
+	return {
+		blockId: blockId,
+		score: score,
+		state: {},
+		status: "active",
+	} as unknown as DocumentHook
+}
+
+// a hook whose last check failed
+function failedHook(blockId: string): DocumentHook {
+	return {
+		blockId: blockId,
+		score: 0,
+		state: {},
+		status: "unreachable_url",
+	} as unknown as DocumentHook
 }
 
 // the editor the handle reads the hovered node through
@@ -89,6 +105,13 @@ function grabbingCursor(): boolean {
 	return document.documentElement.classList.contains("cursor-grabbing!")
 }
 
+async function openHookMenu(wrapper: VueWrapper) {
+	const trigger = wrapper.findAll("[data-slot='dropdown-menu-trigger']")[0]
+	await trigger?.trigger("pointerdown", { button: 0 })
+	await trigger?.trigger("click")
+	await nextTick()
+}
+
 async function openBlockMenu(wrapper: VueWrapper) {
 	const triggers = wrapper.findAll("[data-slot='dropdown-menu-trigger']")
 	const trigger = triggers[triggers.length - 1]
@@ -132,13 +155,13 @@ describe("<BlockHandle>", { concurrent: false }, () => {
 		)
 	})
 
-	it("offers no hook handle in read mode", async ({ expect }) => {
+	it("keeps the hook handle in read mode", async ({ expect }) => {
 		useEditorMeta().setEditable(false)
 
 		const wrapper = await mountHandle()
 
 		expect(wrapper.findAll("[data-slot='dropdown-menu-trigger']")).toHaveLength(
-			1,
+			2,
 		)
 	})
 
@@ -158,7 +181,7 @@ describe("<BlockHandle>", { concurrent: false }, () => {
 		expect,
 	}) => {
 		const wrapper = await mountHandle({
-			documentHooks: [hook("block-1", 1)],
+			activeBranchHooks: [hook("block-1", 1)],
 		})
 		hoverNode(wrapper, 10)
 		await nextTick()
@@ -168,23 +191,51 @@ describe("<BlockHandle>", { concurrent: false }, () => {
 		).toBe("fresh")
 	})
 
-	it("marks the hook icon stale when a hook has run out", async ({
+	it("marks the hook icon triggered when a hook has run out", async ({
 		expect,
 	}) => {
 		const wrapper = await mountHandle({
-			documentHooks: [hook("block-1", 1), hook("block-1", 0)],
+			activeBranchHooks: [hook("block-1", 1), hook("block-1", 0)],
 		})
 		hoverNode(wrapper, 10)
 		await nextTick()
 
 		expect(
 			wrapper.get(".i-mingcute\\:leaf-line").attributes("data-hook-status"),
-		).toBe("stale")
+		).toBe("triggered")
+	})
+
+	it("marks the hook icon as needing attention when a hook's check failed", async ({
+		expect,
+	}) => {
+		const wrapper = await mountHandle({
+			activeBranchHooks: [hook("block-1", 1), failedHook("block-1")],
+		})
+		hoverNode(wrapper, 10)
+		await nextTick()
+
+		expect(
+			wrapper.get(".i-mingcute\\:leaf-line").attributes("data-hook-status"),
+		).toBe("needs-attention")
+	})
+
+	it("marks the hook icon mixed when one hook triggered and another failed", async ({
+		expect,
+	}) => {
+		const wrapper = await mountHandle({
+			activeBranchHooks: [hook("block-1", 0), failedHook("block-1")],
+		})
+		hoverNode(wrapper, 10)
+		await nextTick()
+
+		expect(
+			wrapper.get(".i-mingcute\\:leaf-line").attributes("data-hook-status"),
+		).toBe("mixed")
 	})
 
 	it("ignores hooks belonging to other blocks", async ({ expect }) => {
 		const wrapper = await mountHandle({
-			documentHooks: [hook("block-2", 0)],
+			activeBranchHooks: [hook("block-2", 0)],
 		})
 		hoverNode(wrapper, 10)
 		await nextTick()
@@ -218,6 +269,44 @@ describe("<BlockHandle>", { concurrent: false }, () => {
 		await nextTick()
 
 		expect(wrapper.findComponent(CoreMenu).props("hovered")).toBeNull()
+	})
+
+	it("reports the block it shows on", async ({ expect }) => {
+		const wrapper = await mountHandle()
+
+		hoverNode(wrapper, 10)
+		await nextTick()
+
+		expect(wrapper.emitted("hovered-block-change")).toEqual([["block-1"]])
+	})
+
+	it("reports no block once the pointer leaves the document", async ({
+		expect,
+	}) => {
+		const wrapper = await mountHandle()
+		hoverNode(wrapper, 10)
+		await nextTick()
+
+		hoverNode(wrapper, 10, null)
+		await nextTick()
+
+		expect(wrapper.emitted("hovered-block-change")).toEqual([
+			["block-1"],
+			[null],
+		])
+	})
+
+	it("hands the target's hooks to the hook menu", async ({ expect }) => {
+		const targetBranchHooks = [hook("block-1", 1)]
+		const wrapper = await mountHandle({ targetBranchHooks: targetBranchHooks })
+		hoverNode(wrapper, 10)
+		await nextTick()
+
+		await openHookMenu(wrapper)
+
+		expect(
+			wrapper.findComponent(HookMenuContent).props("targetBranchHooks"),
+		).toBe(targetBranchHooks)
 	})
 
 	it("forgets a block that is no longer in the document", async ({

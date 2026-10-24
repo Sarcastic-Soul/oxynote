@@ -28,6 +28,7 @@ export interface SessionResolver {
 export interface DocumentHookDeps {
 	auth: SessionResolver
 	core: CoreClient
+	log: ServiceLogger
 }
 
 // hocuspocus's Document adds the stateless broadcast the store hook uses
@@ -47,14 +48,15 @@ interface FlushableServer {
 	}
 }
 
-// the part a reset reaches into: the socket behind each of a document's
-// client connections.
+// the part a reset reaches into: each of a document's client connections
+// and the socket behind it.
 interface ResettableServer {
 	documents: {
 		get(documentName: string):
 			| {
 					connections: Map<
 						{
+							readOnly: boolean
 							webSocket: {
 								close(
 									code?: number,
@@ -77,6 +79,10 @@ const resetConnection = { code: 4205, reason: "Reset Connection" }
 // only tells the provider the document is closed, and the provider leaves
 // it closed: it reopens a document after losing its socket, not after that
 // message. Direct connections have no socket and are unaffected.
+//
+// each connection turns read-only first. It stays on the document until
+// its socket reports the close, and until then hocuspocus still applies
+// its updates.
 export function resetConnections(
 	server: ResettableServer,
 	documentName: string,
@@ -87,6 +93,7 @@ export function resetConnections(
 	}
 
 	for (const [connection] of document.connections) {
+		connection.readOnly = true
 		connection.webSocket.close(
 			resetConnection.code,
 			resetConnection.reason,
@@ -207,7 +214,7 @@ function encodeState(doc: Y.Doc): string {
 	return Buffer.from(Y.encodeStateAsUpdate(doc)).toString("base64")
 }
 
-export function createDocumentHooks({ auth, core }: DocumentHookDeps) {
+export function createDocumentHooks({ auth, core, log }: DocumentHookDeps) {
 	// who edited each open document since its last persist. Held per
 	// hooks instance so nothing carries over between servers — or, in a
 	// test, between cases.
@@ -284,6 +291,7 @@ export function createDocumentHooks({ auth, core }: DocumentHookDeps) {
 			context?: {
 				session?: AuthSession | null
 				system?: boolean
+				userId?: string
 			} | null
 			documentName: string
 		}) {
@@ -294,7 +302,8 @@ export function createDocumentHooks({ auth, core }: DocumentHookDeps) {
 					isSystemContext(context),
 			)
 
-			const userId = context?.session?.user.id
+			const userId =
+				context?.session?.user.id ?? context?.userId
 			if (!userId) {
 				return Promise.resolve()
 			}
@@ -305,6 +314,9 @@ export function createDocumentHooks({ auth, core }: DocumentHookDeps) {
 				documentMaintainers.set(documentName, set)
 			}
 
+			// core takes the last maintainer as the author, so the
+			// latest editor moves to the end.
+			set.delete(userId)
 			set.add(userId)
 
 			return Promise.resolve()
@@ -389,6 +401,7 @@ export function createDocumentHooks({ auth, core }: DocumentHookDeps) {
 		async onStoreDocument(data: {
 			documentName: string
 			document: ConnectedDocument
+			lastContext?: { system?: boolean } | null
 		}) {
 			// both maps describe the window this persist closes, so
 			// they are drained before anything that can fail: a
@@ -403,10 +416,12 @@ export function createDocumentHooks({ auth, core }: DocumentHookDeps) {
 			// nothing but core changed the document, so the persist
 			// carries core's own permission and a protected branch
 			// accepts it. One edit in the window is enough to make
-			// it an ordinary write.
+			// it an ordinary write. A window with no change at all,
+			// such as a core batch whose operations all failed, takes
+			// the permission of the connection that stores it.
 			const system =
 				documentSystemOnly.get(data.documentName) ??
-				false
+				isSystemContext(data.lastContext)
 
 			documentSystemOnly.delete(data.documentName)
 
@@ -449,12 +464,22 @@ export function createDocumentHooks({ auth, core }: DocumentHookDeps) {
 			} catch (err) {
 				Sentry.captureException(err)
 
+				// changes since the last good persist live only in
+				// memory, so the failure must show without sentry too.
+				log.error(
+					`persisting ${data.documentName} failed: ${err instanceof Error ? err.message : String(err)}`,
+				)
+
 				data.document.broadcastStateless(
 					JSON.stringify({
 						type: "error",
 						code: "hocuspocus.store_failed",
 					}),
 				)
+
+				// hocuspocus keeps a document whose store threw in
+				// memory, rather than unloading the unsaved changes.
+				throw err
 			}
 		},
 
@@ -492,10 +517,8 @@ interface HocuspocusServer {
 	resetConnections: (documentName: string) => void
 }
 
-export function createHocuspocus({
-	log,
-	...deps
-}: DocumentHookDeps & { log: ServiceLogger }): HocuspocusServer {
+export function createHocuspocus(deps: DocumentHookDeps): HocuspocusServer {
+	const { log } = deps
 	const { flushDocument, ...hooks } = createDocumentHooks(deps)
 
 	const instance = new Hocuspocus({

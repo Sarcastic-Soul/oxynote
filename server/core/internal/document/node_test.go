@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/oxynote/oxynote/server/core/pkg/testutil"
 	"github.com/rs/xid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -86,52 +87,6 @@ func Test_Block_FindByUID(t *testing.T) {
 	}
 }
 
-func Test_RootBlock_FindParentTypeByUID(t *testing.T) {
-	cc := map[string]struct {
-		UID    string
-		Parent BlockNodeType
-		Found  bool
-	}{
-		"Top-level block":     {UID: "p1", Parent: BlockNodeDoc, Found: true},
-		"Nested block":        {UID: "li1", Parent: BlockNodeBulletList, Found: true},
-		"Deeply nested block": {UID: "lp1", Parent: BlockNodeListItem, Found: true},
-		"Missing uid":         {UID: "nope"},
-	}
-
-	for cn, c := range cc {
-		t.Run(cn, func(t *testing.T) {
-			t.Parallel()
-
-			parent, ok := stubTree().FindParentTypeByUID(c.UID)
-			assert.Equal(t, c.Found, ok)
-			assert.Equal(t, c.Parent, parent)
-		})
-	}
-}
-
-func Test_Block_FindParentTypeByUID(t *testing.T) {
-	cc := map[string]struct {
-		UID    string
-		Parent BlockNodeType
-		Found  bool
-	}{
-		"Direct child":              {UID: "li1", Parent: BlockNodeBulletList, Found: true},
-		"Grandchild":                {UID: "lp1", Parent: BlockNodeListItem, Found: true},
-		"Self match is not a match": {UID: "l1"},
-		"Missing uid":               {UID: "nope"},
-	}
-
-	for cn, c := range cc {
-		t.Run(cn, func(t *testing.T) {
-			t.Parallel()
-
-			parent, ok := stubTree().Content[1].FindParentTypeByUID(c.UID)
-			assert.Equal(t, c.Found, ok)
-			assert.Equal(t, c.Parent, parent)
-		})
-	}
-}
-
 func Test_RootBlock_HasBlock(t *testing.T) {
 	t.Parallel()
 
@@ -139,11 +94,81 @@ func Test_RootBlock_HasBlock(t *testing.T) {
 	assert.False(t, stubTree().HasBlock("nope"))
 }
 
-func Test_Block_HasBlock(t *testing.T) {
+func Test_Block_FirstChild(t *testing.T) {
 	t.Parallel()
 
-	assert.True(t, stubTree().Content[1].HasBlock("li1"))
-	assert.False(t, stubTree().Content[1].HasBlock("nope"))
+	item := stubTree().Content[1].Content[0]
+
+	cc := map[string]struct {
+		Type   BlockNodeType
+		Result Block
+	}{
+		"Child of the type":    {Type: BlockNodeParagraph, Result: item.Content[0]},
+		"No child of the type": {Type: BlockNodeHeading, Result: Block{}},
+	}
+
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, c.Result, item.FirstChild(c.Type))
+		})
+	}
+}
+
+func Test_Block_PlainText(t *testing.T) {
+	t.Parallel()
+
+	cc := map[string]struct {
+		Block  Block
+		Result string
+	}{
+		"Text and other children": {
+			Block: Block{
+				Type: BlockNodeParagraph,
+				Content: []Block{
+					{Type: BlockNodeText, Text: "a "},
+					{Type: BlockNodeImageBlock},
+					{Type: BlockNodeText, Text: "b", Marks: []Mark{{Type: "bold"}}},
+				},
+			},
+			Result: "a b",
+		},
+		"No children": {Block: Block{}, Result: ""},
+	}
+
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, c.Result, c.Block.PlainText())
+		})
+	}
+}
+
+func Test_Mark_Equal(t *testing.T) {
+	t.Parallel()
+
+	link := Mark{Type: "link", Attrs: Attributes{"href": "https://x.test", "title": nil}}
+
+	cc := map[string]struct {
+		Mark   Mark
+		Other  Mark
+		Result bool
+	}{
+		"Same attributes":          {Mark: link, Other: Mark{Type: "link", Attrs: Attributes{"href": "https://x.test", "title": nil}}, Result: true},
+		"Different attributes":     {Mark: link, Other: Mark{Type: "link", Attrs: Attributes{"href": "https://y.test", "title": nil}}},
+		"Different type":           {Mark: link, Other: Mark{Type: "bold"}},
+		"Nil and empty attributes": {Mark: Mark{Type: "bold"}, Other: Mark{Type: "bold", Attrs: Attributes{}}, Result: true},
+	}
+
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, c.Result, c.Mark.Equal(c.Other))
+		})
+	}
 }
 
 // stubMarkedTree builds a tree with comment marks, nodeCommentId
@@ -184,56 +209,37 @@ func Test_Block_UID(t *testing.T) {
 	assert.False(t, ok)
 }
 
-func Test_Block_Flatten(t *testing.T) {
+func Test_Mark_UnmarshalJSON(t *testing.T) {
 	t.Parallel()
 
 	cc := map[string]struct {
-		Block    Block
-		Expected string
+		JSON   string
+		Result Mark
+		Err    error
 	}{
-		"Text leaf returns its text": {
-			Block:    Block{Type: BlockNodeText, Text: "hello"},
-			Expected: "hello",
+		"Mark without attrs": {
+			JSON:   `{"type":"bold"}`,
+			Result: Mark{Type: "bold"},
 		},
-		"Adjacent fragments are space separated": {
-			Block: Block{
-				Type: BlockNodeParagraph,
-				Content: []Block{
-					{Type: BlockNodeText, Text: "hello"},
-					{Type: BlockNodeText, Text: "world"},
-				},
-			},
-			Expected: "hello world",
+		"Mark with attrs": {
+			JSON:   `{"type":"link","attrs":{"href":"https://oxynote.test"}}`,
+			Result: Mark{Type: "link", Attrs: Attributes{"href": "https://oxynote.test"}},
 		},
-		"Nested subtrees are concatenated": {
-			Block: Block{
-				Type: BlockNodeBulletList,
-				Content: []Block{
-					{
-						Type: BlockNodeListItem,
-						Content: []Block{
-							{Type: BlockNodeText, Text: "one"},
-						},
-					},
-					{
-						Type: BlockNodeListItem,
-						Content: []Block{
-							{Type: BlockNodeText, Text: "two"},
-						},
-					},
-				},
-			},
-			Expected: "one two",
+		"Mark with attrs that are not an object": {
+			JSON:   `{"type":"bold","attrs":true}`,
+			Result: Mark{Type: "bold"},
 		},
-		"Empty text fragments are skipped": {
-			Block: Block{
-				Type: BlockNodeParagraph,
-				Content: []Block{
-					{Type: BlockNodeText, Text: ""},
-					{Type: BlockNodeText, Text: "solo"},
-				},
-			},
-			Expected: "solo",
+		"Mark with null attrs": {
+			JSON:   `{"type":"italic","attrs":null}`,
+			Result: Mark{Type: "italic"},
+		},
+		"Malformed mark": {
+			JSON: `{"type":1}`,
+			Err:  assert.AnError,
+		},
+		"Malformed attrs": {
+			JSON: `{"type":"link","attrs":{"href":}}`,
+			Err:  assert.AnError,
 		},
 	}
 
@@ -241,7 +247,16 @@ func Test_Block_Flatten(t *testing.T) {
 		t.Run(cn, func(t *testing.T) {
 			t.Parallel()
 
-			assert.Equal(t, c.Expected, c.Block.Flatten())
+			var m Mark
+
+			err := json.Unmarshal([]byte(c.JSON), &m)
+			testutil.AssertEqualError(t, c.Err, err)
+
+			if err != nil {
+				return
+			}
+
+			assert.Equal(t, c.Result, m)
 		})
 	}
 }
@@ -289,6 +304,36 @@ func Test_FilePath(t *testing.T) {
 			documentID := xid.New()
 
 			assert.Equal(t, "/api/documents/"+documentID.String()+c.Result, FilePath(documentID, c.ID, c.Name))
+		})
+	}
+}
+
+func Test_ParseFileRef(t *testing.T) {
+	cc := map[string]struct {
+		Ref  string
+		ID   string
+		Name string
+		OK   bool
+	}{
+		"Id and name":               {Ref: "f1xxxxxxxxxxxxxxxxxxx-notes.zip", ID: "f1xxxxxxxxxxxxxxxxxxx", Name: "notes.zip", OK: true},
+		"Name with dashes":          {Ref: "f1xxxxxxxxxxxxxxxxxxx-a-b-c.zip", ID: "f1xxxxxxxxxxxxxxxxxxx", Name: "a-b-c.zip", OK: true},
+		"Id with dashes":            {Ref: "f1-x_-xxxxxxxxxxxxxxx-notes.zip", ID: "f1-x_-xxxxxxxxxxxxxxx", Name: "notes.zip", OK: true},
+		"Empty name":                {Ref: "f1xxxxxxxxxxxxxxxxxxx-", ID: "f1xxxxxxxxxxxxxxxxxxx", OK: true},
+		"No dash after the id":      {Ref: "f1xxxxxxxxxxxxxxxxxxxxnotes.zip"},
+		"Id alone":                  {Ref: "f1xxxxxxxxxxxxxxxxxxx"},
+		"Short":                     {Ref: "f1-notes.zip"},
+		"Id with the wrong charset": {Ref: "f1.................xx-notes.zip"},
+		"Empty":                     {Ref: ""},
+	}
+
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			id, name, ok := ParseFileRef(c.Ref)
+			assert.Equal(t, c.OK, ok)
+			assert.Equal(t, c.ID, id)
+			assert.Equal(t, c.Name, name)
 		})
 	}
 }
@@ -342,8 +387,8 @@ func Test_RootBlock_Duplicate(t *testing.T) {
 						{
 							Type: BlockNodeImageBlock,
 							Attrs: Attributes{
-								"uid": "img1",
-								"src": "https://app.test/core" + FilePath(oldDocumentID, "img1", "shot.png"),
+								"uid": "img-1-aaaaaaaaaaaaaaa",
+								"src": "https://app.test/core" + FilePath(oldDocumentID, "img-1-aaaaaaaaaaaaaaa", "shot.png"),
 							},
 						},
 						{
@@ -356,8 +401,8 @@ func Test_RootBlock_Duplicate(t *testing.T) {
 						{
 							Type: BlockNodeImageBlock,
 							Attrs: Attributes{
-								"uid": "img3",
-								"src": "https://app.test/core" + FilePath(xid.New(), "img3", "shot.png"),
+								"uid": "img-3-aaaaaaaaaaaaaaa",
+								"src": "https://app.test/core" + FilePath(xid.New(), "img-3-aaaaaaaaaaaaaaa", "shot.png"),
 							},
 						},
 						{
@@ -367,8 +412,8 @@ func Test_RootBlock_Duplicate(t *testing.T) {
 						{
 							Type: BlockNodeFileBlock,
 							Attrs: Attributes{
-								"uid":         "file1",
-								"src":         "https://app.test/core" + FilePath(oldDocumentID, "file1", "my notes.zip"),
+								"uid":         "file-1-aaaaaaaaaaaaaa",
+								"src":         "https://app.test/core" + FilePath(oldDocumentID, "file-1-aaaaaaaaaaaaaa", "my notes.zip"),
 								"name":        "notes.zip",
 								"size":        2048,
 								"contentType": "application/zip",
@@ -381,12 +426,16 @@ func Test_RootBlock_Duplicate(t *testing.T) {
 					// document are remapped.
 					require.Len(t, files, 2)
 
-					newID, ok := files["img1"]
+					newID, ok := files["img-1-aaaaaaaaaaaaaaa"]
 					require.True(t, ok)
+					assert.Len(t, newID, 21)
 
+					// the file gets an id of its own; the block's uid is
+					// regenerated separately.
 					uid, ok := dup.Content[0].UID()
 					require.True(t, ok)
-					assert.Equal(t, newID, uid)
+					assert.NotEqual(t, newID, uid)
+					assert.NotEqual(t, "img-1-aaaaaaaaaaaaaaa", uid)
 					assert.Equal(
 						t,
 						"https://app.test/core"+FilePath(newDocumentID, newID, "shot.png"),
@@ -403,12 +452,9 @@ func Test_RootBlock_Duplicate(t *testing.T) {
 					// the file block is remapped the way the image is, keeps
 					// the file name segment of its address, and keeps what
 					// it shows.
-					newFileID, ok := files["file1"]
+					newFileID, ok := files["file-1-aaaaaaaaaaaaaa"]
 					require.True(t, ok)
-
-					fileUID, ok := dup.Content[4].UID()
-					require.True(t, ok)
-					assert.Equal(t, newFileID, fileUID)
+					assert.Len(t, newFileID, 21)
 					assert.Equal(
 						t,
 						"https://app.test/core"+FilePath(newDocumentID, newFileID, "my notes.zip"),
@@ -419,8 +465,8 @@ func Test_RootBlock_Duplicate(t *testing.T) {
 					assert.Equal(t, "application/zip", dup.Content[4].Attrs["contentType"])
 
 					// the original is untouched.
-					assert.Equal(t, "img1", orig.Content[0].Attrs["uid"])
-					assert.Equal(t, "file1", orig.Content[4].Attrs["uid"])
+					assert.Equal(t, "img-1-aaaaaaaaaaaaaaa", orig.Content[0].Attrs["uid"])
+					assert.Equal(t, "file-1-aaaaaaaaaaaaaa", orig.Content[4].Attrs["uid"])
 				},
 			}
 		}(),
@@ -476,21 +522,36 @@ func Test_RootBlock_Scan(t *testing.T) {
 	val, err := orig.Value()
 	require.NoError(t, err)
 
-	var decoded RootBlock
-
-	require.NoError(t, decoded.Scan(val))
-	assert.Equal(t, orig, decoded)
-
 	data, ok := val.([]byte)
 	require.True(t, ok)
 
-	var fromString RootBlock
+	cc := map[string]struct {
+		Src    any
+		Result RootBlock
+		Err    error
+	}{
+		"Bytes source":            {Src: val, Result: orig},
+		"String source":           {Src: string(data), Result: orig},
+		"Unsupported source type": {Src: 42, Err: assert.AnError},
+		"Malformed JSON":          {Src: []byte(`{not json`), Err: assert.AnError},
+	}
 
-	require.NoError(t, fromString.Scan(string(data)))
-	assert.Equal(t, orig, fromString)
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
 
-	assert.Error(t, decoded.Scan(42))
-	assert.Error(t, decoded.Scan([]byte(`{not json`)))
+			var rb RootBlock
+
+			err := rb.Scan(c.Src)
+			testutil.AssertEqualError(t, c.Err, err)
+
+			if err != nil {
+				return
+			}
+
+			assert.Equal(t, c.Result, rb)
+		})
+	}
 }
 
 // assertUIDsRemapped checks that the uid map pairs every block uid of the

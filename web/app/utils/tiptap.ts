@@ -1,7 +1,7 @@
 import { InputRule } from "@tiptap/core"
 import type { EditorState } from "@tiptap/pm/state"
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model"
-import { cn } from "~/lib/utils"
+import { cn } from "#layers/ui/app/lib/utils"
 import { ListItem } from "@tiptap/extension-list"
 import { ImageBlock } from "~/components/editor/blocks/image"
 
@@ -67,7 +67,16 @@ export function nodeOverlayOffset(nodeDOM: HTMLElement): NodeOverlayOffset {
 			if (!isTaskItem) {
 				return { ...defaults, extraLeft: 25 }
 			}
+
+			break
 		}
+		// a checklist paragraph is padded away from its checkbox. The
+		// panel starts at the text, as it does in any other list.
+		case "P":
+			return {
+				...defaults,
+				extraLeft: -parseFloat(getComputedStyle(nodeDOM).paddingLeft),
+			}
 	}
 
 	return defaults
@@ -76,6 +85,7 @@ export function nodeOverlayOffset(nodeDOM: HTMLElement): NodeOverlayOffset {
 export function highlightTiptapScrollElement(
 	elementId: string,
 	element: HTMLElement,
+	onRemoved?: () => void,
 ) {
 	if (typeof window === "undefined") {
 		return
@@ -85,10 +95,12 @@ export function highlightTiptapScrollElement(
 		return
 	}
 
-	const target =
+	const linked =
 		element.isConnected || !elementId
 			? element
 			: (document.getElementById(elementId) ?? element)
+
+	let target = highlightTarget(linked)
 
 	if (!target.isConnected) {
 		return
@@ -158,17 +170,65 @@ export function highlightTiptapScrollElement(
 
 	// Use ResizeObserver to efficiently update overlay on element size changes
 	const resizeObserver = new ResizeObserver(() => {
+		// the editor was unmounted with the overlay in it. Its elements
+		// lose their size then, which is reported here.
+		if (!overlay.isConnected) {
+			cleanup()
+			return
+		}
+
 		requestAnimationFrame(updateOverlayPosition)
 	})
 	resizeObserver.observe(target)
 
-	// Store cleanup function on the overlay element for later disposal
-	;(overlay as HTMLElement & { _cleanup?: () => void })._cleanup = () => {
-		resizeObserver.disconnect()
+	// the editor resizes when a block above the target grows or shrinks.
+	// That moves the target without resizing it.
+	const editorEl = target.closest(".ProseMirror")
+
+	// a moved block neither resizes itself nor always the editor, and the
+	// editor draws it as a new element
+	const mutationObserver = new MutationObserver(() => {
+		if (target.isConnected) {
+			requestAnimationFrame(updateOverlayPosition)
+			return
+		}
+
+		const moved = document.getElementById(elementId)
+		if (!moved) {
+			clearTiptapScrollElementHighlightOverlays()
+			onRemoved?.()
+			return
+		}
+
+		resizeObserver.unobserve(target)
+		target = highlightTarget(moved)
+		resizeObserver.observe(target)
+		requestAnimationFrame(updateOverlayPosition)
+	})
+
+	if (editorEl) {
+		resizeObserver.observe(editorEl)
+		mutationObserver.observe(editorEl, { childList: true, subtree: true })
 	}
+
+	const cleanup = () => {
+		resizeObserver.disconnect()
+		mutationObserver.disconnect()
+	}
+
+	// Store cleanup function on the overlay element for later disposal
+	;(overlay as HTMLElement & { _cleanup?: () => void })._cleanup = cleanup
 
 	// Initial position update
 	requestAnimationFrame(updateOverlayPosition)
+}
+
+// a code block's title and its code are drawn as one box, so a link to
+// either highlights the whole block
+function highlightTarget(linked: HTMLElement): HTMLElement {
+	const parent = linked.parentElement
+
+	return parent?.dataset.type === "titled-code-block" ? parent : linked
 }
 
 export function clearTiptapScrollElementHighlightOverlays() {

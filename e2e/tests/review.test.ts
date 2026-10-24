@@ -1,11 +1,15 @@
 import { expect, test } from "@playwright/test"
+import { defaultBranchId, documentId } from "../helpers/api"
 import { joinAsSecondUser } from "../helpers/collaboration"
 import {
 	contentEditor,
+	contentPane,
 	createDocument,
 	documentPersisted,
 	editorText,
+	openBlockMenu,
 	readModeToggle,
+	sidebarDocument,
 	titleEditor,
 	waitForEditor,
 } from "../helpers/editor"
@@ -470,7 +474,7 @@ test.describe("review workflow", () => {
 		request,
 		browser,
 	}) => {
-		await signUpWithWorkspace(page, request)
+		const { credentials } = await signUpWithWorkspace(page, request)
 		await createDocument(page)
 		const other = await joinAsSecondUser(browser, page, request)
 		// the owner's member list predates the teammate, so a reload picks
@@ -485,7 +489,9 @@ test.describe("review workflow", () => {
 
 		await expect(
 			other.page.getByText(
-				t("notification.messages.document-review-request-description"),
+				t("notification.messages.document-review-request-description", {
+					user: credentials.email.split("@")[0] ?? "",
+				}),
 			),
 		).toBeVisible()
 
@@ -571,5 +577,187 @@ test.describe("review workflow", () => {
 		).toHaveCount(0)
 
 		await other.context.close()
+	})
+
+	test("opens a copied block link on the draft, at that block", async ({
+		page,
+		request,
+	}) => {
+		await page.context().grantPermissions(["clipboard-read", "clipboard-write"])
+		await signUpWithWorkspace(page, request)
+		await createDocument(page)
+		await makeReviewable(page)
+		await switchToBranch(page, "draft")
+		// the link is built from the address, which names the draft only
+		// once the switch has reached it
+		await expect(page).toHaveURL(/New-Page-[a-z0-9]{20}\?branch=[a-z0-9]{20}$/)
+		// the linked block sits more than a screen down, so only a scroll to
+		// it brings it into view
+		await contentEditor(page).click()
+		for (let line = 0; line < 40; line += 1) {
+			await page.keyboard.press("Enter")
+		}
+		await page.keyboard.type("Only on the draft")
+		const block = contentEditor(page).getByText("Only on the draft", {
+			exact: true,
+		})
+		await openBlockMenu(page, contentPane(page), block)
+		await page
+			.getByRole("menuitem", {
+				name: t("editor.drag-handle.options.copy-link"),
+			})
+			.click()
+		await expect
+			.poll(() => page.evaluate(() => navigator.clipboard.readText()), {
+				message: "the block link reaches the clipboard",
+			})
+			.toContain("?branch=")
+		const link = await page.evaluate(() => navigator.clipboard.readText())
+		const uid = new URL(link).hash.slice(1)
+
+		const fresh = await page.context().newPage()
+		await visit(fresh, link)
+
+		await expect(fresh).toHaveURL(link)
+		await expect(branchSwitcher(fresh)).toContainText(branchLabel("draft"), {
+			timeout: 15_000,
+		})
+		await waitForEditor(fresh)
+		// the first page's caret label renders inside the paragraph, so the
+		// text is matched as a part
+		const linked = fresh.locator(`[id="${uid}"]`)
+		await expect(linked).toContainText("Only on the draft")
+		await expect(linked).toBeInViewport()
+	})
+
+	test("drops the linked block when the document is clicked", async ({
+		page,
+		request,
+	}) => {
+		await page.context().grantPermissions(["clipboard-read", "clipboard-write"])
+		await signUpWithWorkspace(page, request)
+		await createDocument(page)
+		await makeReviewable(page)
+		await switchToBranch(page, "draft")
+		await expect(page).toHaveURL(/New-Page-[a-z0-9]{20}\?branch=[a-z0-9]{20}$/)
+		// the linked block sits more than a screen down, so a jump back to
+		// the top would take it out of view
+		await contentEditor(page).click()
+		for (let line = 0; line < 40; line += 1) {
+			await page.keyboard.press("Enter")
+		}
+		await page.keyboard.type("Only on the draft")
+		const block = contentEditor(page).getByText("Only on the draft", {
+			exact: true,
+		})
+		await openBlockMenu(page, contentPane(page), block)
+		await page
+			.getByRole("menuitem", {
+				name: t("editor.drag-handle.options.copy-link"),
+			})
+			.click()
+		await expect
+			.poll(() => page.evaluate(() => navigator.clipboard.readText()), {
+				message: "the block link reaches the clipboard",
+			})
+			.toContain("?branch=")
+		const link = new URL(
+			await page.evaluate(() => navigator.clipboard.readText()),
+		)
+		await documentPersisted(page)
+		await visit(page, link.href)
+		const highlight = page.locator(".editor-scroll-highlight")
+		await expect(highlight).toBeVisible({ timeout: 15_000 })
+		const linked = page.locator(`[id="${link.hash.slice(1)}"]`)
+
+		await linked.click()
+
+		await expect(page).toHaveURL(link.href.replace(link.hash, ""))
+		await expect(highlight).toHaveCount(0)
+		await expect(linked).toBeInViewport()
+	})
+
+	test("drops the linked block when the branch is switched", async ({
+		page,
+		request,
+	}) => {
+		await page.context().grantPermissions(["clipboard-read", "clipboard-write"])
+		await signUpWithWorkspace(page, request)
+		await createDocument(page)
+		await makeReviewable(page)
+		await switchToBranch(page, "draft")
+		await expect(page).toHaveURL(/New-Page-[a-z0-9]{20}\?branch=[a-z0-9]{20}$/)
+		await contentEditor(page).click()
+		await page.keyboard.type("Only on the draft")
+		const block = contentEditor(page).getByText("Only on the draft", {
+			exact: true,
+		})
+		await openBlockMenu(page, contentPane(page), block)
+		await page
+			.getByRole("menuitem", {
+				name: t("editor.drag-handle.options.copy-link"),
+			})
+			.click()
+		await expect
+			.poll(() => page.evaluate(() => navigator.clipboard.readText()), {
+				message: "the block link reaches the clipboard",
+			})
+			.toContain("?branch=")
+		const link = await page.evaluate(() => navigator.clipboard.readText())
+		await documentPersisted(page)
+		await visit(page, link)
+		const highlight = page.locator(".editor-scroll-highlight")
+		await expect(highlight).toBeVisible({ timeout: 15_000 })
+
+		await switchToBranch(page, "main")
+
+		await expect(page).toHaveURL(/New-Page-[a-z0-9]{20}$/)
+		await expect(highlight).toHaveCount(0)
+	})
+
+	test("opens the main branch when the open page is picked in the sidebar", async ({
+		page,
+		request,
+	}) => {
+		await signUpWithWorkspace(page, request)
+		await createDocument(page)
+		await makeReviewable(page)
+		await switchToBranch(page, "draft")
+		await expect(page).toHaveURL(/New-Page-[a-z0-9]{20}\?branch=[a-z0-9]{20}$/)
+
+		await sidebarDocument(page, t("editor.new-document-name")).click()
+
+		await expect(branchSwitcher(page)).toContainText(branchLabel("main"))
+		await expect(page).toHaveURL(/New-Page-[a-z0-9]{20}$/)
+	})
+
+	test("opens a block link naming the main branch at that block", async ({
+		page,
+		request,
+	}) => {
+		await signUpWithWorkspace(page, request)
+		await createDocument(page)
+		// the linked block sits more than a screen down, so only a scroll to
+		// it brings it into view
+		await contentEditor(page).click()
+		for (let line = 0; line < 40; line += 1) {
+			await page.keyboard.press("Enter")
+		}
+		await page.keyboard.type("Linked block")
+		const block = contentEditor(page).getByText("Linked block", { exact: true })
+		await expect(block).toHaveAttribute("id", /.+/)
+		const uid = (await block.getAttribute("id")) ?? ""
+		const url = page.url()
+		const branch = await defaultBranchId(page, documentId(page))
+		await documentPersisted(page)
+		await makeReviewable(page)
+
+		const fresh = await page.context().newPage()
+		await visit(fresh, `${url}?branch=${branch}#${uid}`)
+
+		// a link that names the main branch keeps naming it
+		await expect(fresh).toHaveURL(`${url}?branch=${branch}#${uid}`)
+		await waitForEditor(fresh)
+		await expect(fresh.locator(`[id="${uid}"]`)).toBeInViewport()
 	})
 })

@@ -3,8 +3,10 @@ import { nodeViewProps, NodeViewWrapper } from "@tiptap/vue-3"
 import { nanoid } from "nanoid"
 import { showProgressToast, showToastMessage } from "~/components/toast"
 import type { ProgressToast } from "~/components/toast"
-import { cn } from "~/lib/utils"
+import { cn } from "#layers/ui/app/lib/utils"
 import { DiffStatus } from "~/components/editor/diff/position-map"
+import DiffChangeMarker from "~/components/editor/diff/DiffChangeMarker.vue"
+import FileDiffDetails from "./FileDiffDetails.vue"
 import {
 	fileKind,
 	fileKindStyle,
@@ -57,8 +59,6 @@ const diffClass = computed(() => {
 			return "diff-added"
 		case DiffStatus.Removed:
 			return "diff-removed"
-		case DiffStatus.Modified:
-			return "diff-modified"
 		default:
 			return null
 	}
@@ -99,21 +99,20 @@ async function handleFileChange(event: Event) {
 		return
 	}
 
-	const blockId = (props.node.attrs.uid as string) || nanoid()
+	const fileId = nanoid()
 
 	props.updateAttributes({ uploading: true, name: file.name, size: file.size })
 
 	try {
 		const uploaded = await uploadDocumentFile.mutateAsync({
 			documentId: documentId.value,
-			id: blockId,
+			id: fileId,
 			loc: DocumentFileLocation.Document,
 			kind: DocumentFileKind.File,
 			file,
 		})
 		props.updateAttributes({
-			src: buildDocumentFileSrc(documentId.value, blockId, uploaded.name),
-			uid: blockId,
+			src: buildDocumentFileSrc(documentId.value, fileId, uploaded.name),
 			name: uploaded.name,
 			size: uploaded.size,
 			contentType: uploaded.contentType,
@@ -177,7 +176,7 @@ async function downloadOnDesktop() {
 	<NodeViewWrapper
 		:id="props.node.attrs.uid"
 		as="figure"
-		class="not-prose flex caret-transparent"
+		class="not-prose relative flex caret-transparent"
 		data-type="fileBlock"
 		:data-uid="props.node.attrs.uid"
 		:data-node-comment-id="props.node.attrs.nodeCommentId"
@@ -249,7 +248,7 @@ async function downloadOnDesktop() {
 			"
 			@click="openFilePicker"
 		>
-			<Icon name="mingcute:attachment-line" class="size-4 text-foreground" />
+			<Icon :name="BLOCK_ICONS.fileBlock" class="size-4 text-foreground" />
 			<div class="mt-0.25 text-2sm text-muted-foreground">
 				{{
 					uploading
@@ -269,5 +268,13 @@ async function downloadOnDesktop() {
 				@change="handleFileChange"
 			/>
 		</button>
+		<!-- a sibling of the card rather than its child, so hovering the
+		marker does not trigger the card's hover style -->
+		<DiffChangeMarker
+			:node="props.node"
+			class="absolute top-1/2 right-2 -translate-y-1/2"
+		>
+			<FileDiffDetails :node="props.node" />
+		</DiffChangeMarker>
 	</NodeViewWrapper>
 </template>

@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/guregu/null/v5"
 	"github.com/oxynote/oxynote/server/core/pkg/errutil"
+	"github.com/oxynote/oxynote/server/core/pkg/strutil"
 	"github.com/oxynote/oxynote/server/core/pkg/timeutil"
 	"github.com/rs/xid"
 )
@@ -21,6 +24,9 @@ var (
 	// ErrMissingStatus is returned when a status update carries no resolved flag.
 	ErrMissingStatus = errutil.New(http.StatusBadRequest, "comment.missing_status", "comment resolved status is required")
 )
+
+// _excerptLength is the most runes an excerpt keeps of a comment's text.
+const _excerptLength = 120
 
 // Comment represents a comment on a document.
 type Comment struct {
@@ -136,6 +142,37 @@ func (c *Content) Scan(value any) error {
 	return nil
 }
 
+// Excerpt returns the start of the content's text on a single line.
+func (c Content) Excerpt() string {
+	var sb strings.Builder
+
+	writeText(&sb, c)
+
+	return strutil.Preview(strings.Join(strings.Fields(sb.String()), " "), _excerptLength)
+}
+
+// writeText appends the text of a node of the content and of its children.
+// Text runs within a node join as written, and a space follows every other
+// node.
+func writeText(sb *strings.Builder, node map[string]any) {
+	if text, ok := node["text"].(string); ok {
+		sb.WriteString(text)
+
+		return
+	}
+
+	children, ok := node["content"].([]any)
+	if ok {
+		for _, child := range children {
+			if n, ok := child.(map[string]any); ok {
+				writeText(sb, n)
+			}
+		}
+	}
+
+	sb.WriteByte(' ')
+}
+
 // NewComment creates a new comment instance with the provided input.
 func NewComment(inp Input, documentID, branchID xid.ID, userID, organizationID string) Comment {
 	return Comment{
@@ -201,6 +238,41 @@ func (c Comment) Replace() (Comment, bool) {
 	nc.Replies = c.Replies[1:]
 
 	return nc, true
+}
+
+// Participants returns the users who wrote the comment or a reply to it,
+// in that order, each once.
+func (c Comment) Participants() []string {
+	var ids []string
+
+	if c.UserID.Valid {
+		ids = append(ids, c.UserID.String)
+	}
+
+	for _, r := range c.Replies {
+		if r.UserID.Valid && !slices.Contains(ids, r.UserID.String) {
+			ids = append(ids, r.UserID.String)
+		}
+	}
+
+	return ids
+}
+
+// Recipients reduces the candidate user ids to the ones a notification
+// about the actor's change goes to: the actor is dropped, and so is
+// every repeat.
+func Recipients(userIDs []string, actor string) []string {
+	var out []string
+
+	for _, id := range userIDs {
+		if id == actor || slices.Contains(out, id) {
+			continue
+		}
+
+		out = append(out, id)
+	}
+
+	return out
 }
 
 // NewReply creates a new reply instance with the provided input.

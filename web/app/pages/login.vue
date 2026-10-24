@@ -3,10 +3,10 @@ import { toTypedSchema } from "@vee-validate/zod"
 import { useForm } from "vee-validate"
 import * as z from "zod"
 // for some reason this isn't auto imported
-import { FormField as ShadcnUiFormField } from "@/components/shadcn/ui/form"
-import { postAuthDocumentUrl } from "#imports"
+import { FormField as ShadcnUiFormField } from "#layers/ui/app/components/shadcn/ui/form"
+import { nextUrlWithHash, postAuthDocumentUrl } from "#imports"
 import { showToastMessage } from "~/components/toast"
-import { cn } from "~/lib/utils"
+import { cn } from "#layers/ui/app/lib/utils"
 
 definePageMeta({
 	name: "login",
@@ -25,7 +25,8 @@ const {
 	requestPasswordReset,
 	setupSignInRedirect,
 } = useAuthSession()
-const { fetchAuthConfig, isEmailEnabled } = useAuthAPI()
+const { fetchAuthConfig, isEmailEnabled, isSingleOrganization, defaultAdmin } =
+	useAuthAPI()
 
 const route = useRoute()
 const config = useRuntimeConfig()
@@ -50,6 +51,15 @@ const resetEmail = ref("")
 const enabledMethods = computed(
 	() => fetchAuthConfig.state.value.data?.methods ?? [],
 )
+// shown only while the default password still works.
+const defaultAdminLogin = computed(() => {
+	const admin = defaultAdmin.value
+	if (!admin?.password) {
+		return null
+	}
+
+	return { email: admin.email, password: admin.password }
+})
 const noMethodsConfigured = computed(
 	() =>
 		fetchAuthConfig.state.value.status === "success" &&
@@ -87,6 +97,9 @@ const oauthContinueUrl = computed(() => {
 
 	return `${config.public.authRealtimeAPIBaseHttpURL}/api/auth/oauth2/authorize?${params.toString()}`
 })
+const nextUrl = computed(() =>
+	nextUrlWithHash(route.query.next as string | undefined, route.hash),
+)
 
 let redirectTimeout: ReturnType<typeof setTimeout> | undefined
 
@@ -113,13 +126,10 @@ async function logInWithProvider(provider: "github" | "google" | "slack") {
 		provider,
 		callbackURL:
 			oauthContinueUrl.value ??
-			postAuthDocumentUrl(
-				config.public.appBaseURL,
-				route.query.next as string | undefined,
-			),
+			postAuthDocumentUrl(config.public.appBaseURL, nextUrl.value),
 		newUserCallbackURL: postAuthDocumentUrl(
 			config.public.appBaseURL,
-			route.query.next as string | undefined,
+			nextUrl.value,
 			"/welcome",
 		),
 		fetchOptions: { query: route.query },
@@ -142,10 +152,9 @@ const onEmailPasswordSubmit = emailPasswordForm.handleSubmit(async (values) => {
 	// middleware forwards the signed-in visitor to next. Absolute against
 	// the app origin because a relative path would resolve against the auth
 	// server's origin, which does not serve the frontend in host-dev mode.
-	const nextUrl = route.query.next as string | undefined
 	const callbackQuery = new URLSearchParams({ verified: "true" })
-	if (nextUrl) {
-		callbackQuery.set("next", nextUrl)
+	if (nextUrl.value) {
+		callbackQuery.set("next", nextUrl.value)
 	}
 
 	const res = (await signInEmailPassword({
@@ -207,7 +216,7 @@ const onEmailPasswordSubmit = emailPasswordForm.handleSubmit(async (values) => {
 	// /login
 	await fetchAuthSession.refetch()
 
-	void navigateTo(nextUrl ? decodeURIComponent(nextUrl) : "/", {
+	void navigateTo(nextUrl.value ? decodeURIComponent(nextUrl.value) : "/", {
 		replace: true,
 	})
 })
@@ -349,6 +358,28 @@ function methodVariant(method: AuthMethod) {
 				class="flex w-full flex-col gap-3"
 				@submit="onEmailPasswordSubmit"
 			>
+				<div
+					v-if="defaultAdminLogin"
+					class="flex items-start gap-2 rounded-md bg-accent px-3 py-2.5 text-2sm text-accent-foreground"
+				>
+					<Icon name="mingcute:key-2-line" class="mt-1 size-3.5 shrink-0" />
+					<div class="flex flex-col gap-1.5 leading-relaxed">
+						<p>{{ $t("onboarding.login.default-admin.intro") }}</p>
+						<ul class="list-disc pl-4">
+							<li>
+								<code class="inline-code break-all">
+									{{ defaultAdminLogin.email }}
+								</code>
+							</li>
+							<li>
+								<code class="inline-code break-all">
+									{{ defaultAdminLogin.password }}
+								</code>
+							</li>
+						</ul>
+						<p>{{ $t("onboarding.login.default-admin.outro") }}</p>
+					</div>
+				</div>
 				<ShadcnUiFormField
 					v-slot="{ componentField, meta }"
 					name="email"
@@ -547,7 +578,14 @@ function methodVariant(method: AuthMethod) {
 					</ShadcnUiButton>
 				</template>
 			</i18n-t>
+			<div
+				v-if="isSingleOrganization && !isInvitationRedirect(route.query.next)"
+				class="text-center text-xs text-accent-foreground"
+			>
+				{{ $t("onboarding.login.no-account.invitation-only") }}
+			</div>
 			<i18n-t
+				v-else
 				scope="global"
 				keypath="onboarding.login.no-account.main"
 				tag="div"

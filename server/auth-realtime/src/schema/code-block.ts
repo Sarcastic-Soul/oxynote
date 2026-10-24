@@ -11,7 +11,7 @@ export const CodeBlockTitle = Node.create({
 	name: "codeBlockTitle",
 	content: "text*",
 	marks: `${CommentMark.name} ${AddedMark.name} ${DeletedMark.name}`,
-	group: "block",
+	group: "codeBlockTitle",
 	selectable: true,
 	defining: true,
 	isolating: true,
@@ -73,6 +73,24 @@ export const CodeBlock = CodeBlockLowlight.extend<CodeBlockOptions>({
 			],
 		]
 	},
+	addAttributes() {
+		return {
+			...this.parent?.(),
+			auto: {
+				default: false,
+				parseHTML: (element) =>
+					element.getAttribute("data-auto") ===
+					"true",
+				renderHTML: (attrs) => {
+					if (!attrs.auto) {
+						return {}
+					}
+
+					return { "data-auto": "true" }
+				},
+			},
+		}
+	},
 	addOptions(): CodeBlockOptions {
 		const parent = this.parent ? this.parent() : null
 		return {
@@ -93,7 +111,7 @@ export const CodeBlock = CodeBlockLowlight.extend<CodeBlockOptions>({
 
 export const TitledCodeBlock = Node.create({
 	name: "titledCodeBlock",
-	group: "block",
+	group: "titledCodeBlock",
 	content: `${CodeBlockTitle.name} ${CodeBlock.name}`,
 	defining: true,
 	isolating: true,

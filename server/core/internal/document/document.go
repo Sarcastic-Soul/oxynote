@@ -2,11 +2,13 @@
 package document
 
 import (
+	"bytes"
 	_ "embed"
 	"encoding/json"
 	"fmt"
 	"maps"
 	"math/rand"
+	"slices"
 	"time"
 
 	"github.com/guregu/null/v5"
@@ -26,16 +28,6 @@ var (
 
 // DefaultBranch is the name of the default branch for a document.
 const DefaultBranch = "main"
-
-const (
-
-	// _aggregationDuration is the duration for which document changes are aggregated.
-	_aggregationDuration = 30 * time.Minute
-
-	// _historyEntryTimeLayout is the layout used for timestamps in history
-	// entry IDs.
-	_historyEntryTimeLayout = "2006-01-02T15:04:05"
-)
 
 // Branch holds branch-specific content and metadata for a document.
 type Branch struct {
@@ -198,31 +190,14 @@ func (d Document) ApplyProtection(protected bool, updatedBy string) Document {
 	return nd
 }
 
-// Content is a lightweight view of one document at one branch:
-// just the identity, display name, and parsed content. Used by
-// downstream pipelines that need to walk the content tree without
-// pulling raw_content or other branch metadata.
-type Content struct {
-	// OrganizationID is the identifier of the organization that
-	// owns this document.
-	OrganizationID string `db:"fk_organization_id"`
-
-	// DocumentID is the identifier of the document.
-	DocumentID xid.ID `db:"fk_document_id"`
-
-	// DocumentName is the document's display name on the branch
-	// this content was loaded from.
-	DocumentName string `db:"document_name"`
-
-	// Content is the parsed ProseMirror tree for the branch.
-	Content RootBlock `db:"content"`
-}
-
 // BranchSummary holds summary information for a document branch.
 // It omits content and raw content and is used for listing branches.
 type BranchSummary struct {
 	// BranchID is the unique identifier for this branch row.
 	BranchID xid.ID `json:"branchId" db:"branch_id"`
+
+	// DocumentID is the identifier of the document the branch belongs to.
+	DocumentID xid.ID `json:"documentId" db:"document_id"`
 
 	// BranchName is the branch identifier (e.g. "main", "feature-x").
 	BranchName string `json:"branchName" db:"branch_name"`
@@ -276,46 +251,27 @@ func (d Document) Title() string {
 	return d.DocumentName + " on branch " + d.BranchName
 }
 
-// HistoryEntry returns a history entry for the current state of the document.
-// Entries aggregate per branch and per time bucket: the branch is part of the
-// ID so that two branches of one document edited within the same bucket keep
-// separate entries instead of overwriting each other.
-func (d Document) HistoryEntry() HistoryEntry {
-	id := fmt.Sprintf(
-		"%s-%s-%s",
-		d.ID,
-		d.BranchID,
-		d.UpdatedAt.Truncate(_aggregationDuration).
-			Format(_historyEntryTimeLayout),
-	)
-
-	return HistoryEntry{
-		ID:         id,
-		DocumentID: d.ID,
-		Content:    d.Content,
-		RawContent: d.RawContent,
-		CreatedAt:  d.UpdatedAt,
+// SnapshotEqual reports whether the other document would produce the same
+// snapshot: the same name, icon and content. Content is compared as
+// JSON, which encoding/json emits with sorted keys.
+func (d Document) SnapshotEqual(o Document) bool {
+	if d.DocumentName != o.DocumentName || d.Icon != o.Icon {
+		return false
 	}
-}
 
-// HistoryEntry represents one entry in a document's history.
-type HistoryEntry struct {
-	// ID is the unique identifier for the entry.
-	ID string `json:"id" db:"id"`
+	dc, err := json.Marshal(d.Content)
+	if err != nil {
+		// NOCOV: a block tree of plain values always marshals.
+		return false
+	}
 
-	// DocumentID is the identifier for the document associated
-	// with this entry.
-	DocumentID xid.ID `json:"documentId" db:"fk_document_id"`
+	oc, err := json.Marshal(o.Content)
+	if err != nil {
+		// NOCOV: a block tree of plain values always marshals.
+		return false
+	}
 
-	// Content is the content of the document at the time of the entry.
-	Content RootBlock `json:"content" db:"content"`
-
-	// RawContent is the raw content of the document, typically in
-	// a text format.
-	RawContent []byte `json:"rawContent" db:"raw_content"`
-
-	// CreatedAt is the timestamp when the entry was created.
-	CreatedAt time.Time `json:"createdAt" db:"created_at"`
+	return bytes.Equal(dc, oc)
 }
 
 // CreateInput is the input structure for document operations.
@@ -374,6 +330,39 @@ type UpdateInput struct {
 
 	// Branch is the target branch for the update (e.g. "main" or "feature-x").
 	Branch string `json:"branch"`
+}
+
+// AddsMaintainers reports whether the update names anyone the stored
+// maintainers do not include. The update carries the editors of one
+// persist, so the set is only ever added to: diffing it against the
+// stored maintainers would drop everyone who happens not to be editing
+// right now.
+func (ui UpdateInput) AddsMaintainers(stored []string) bool {
+	for _, maintainer := range ui.Maintainers {
+		if !slices.Contains(stored, maintainer) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// NewWelcomeDocument creates the document a fresh organization starts
+// with: the getting-started content, its charts reading the given data
+// source or dropped when there is none.
+func NewWelcomeDocument(organizationID, createdBy string, dataSourceID null.Value[xid.ID]) (Document, error) {
+	content, err := InitialDocumentContent(dataSourceID)
+	if err != nil {
+		return Document{}, err
+	}
+
+	doc := NewDocument(CreateInput{
+		Name: "Welcome to Oxynote!",
+		Icon: "mingcute:flag-4-fill",
+	}, organizationID, createdBy)
+	doc.Content = content
+
+	return doc, nil
 }
 
 // InitialDocumentContent returns the initial content for a new document.

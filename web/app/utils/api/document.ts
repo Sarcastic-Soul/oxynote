@@ -56,13 +56,20 @@ export interface Document {
 
 export interface DocumentHook {
 	id: string
+	// the id a hook shares with its copies on the document's other branches.
+	// A new hook's crossBranchId is its own id.
+	crossBranchId: string
 	type: DocumentHookType
 	documentId: string
 	organizationId: string
 	branchId: string
 	blockId: string | null
 	settings: DocumentHookSettings
-	state: DocumentHookState
+	// null until the hook is set up
+	state: DocumentHookState | null
+	// active, initializing, or why the last check failed. Score and state
+	// keep their last values while a check fails.
+	status: DocumentHookStatus
 	score: string // decimal; between 0 and 100 (default: 100)
 	createdAt: Date | string
 	updatedAt?: Date | string | null
@@ -107,6 +114,27 @@ export type DocumentHookState =
 	| DocumentHookStateGitHubTracking
 	| DocumentHookStateURLWatcher
 	| DocumentHookStateContainerImageWatcher
+export type DocumentHookSummary = DocumentHookSummaryGitHubTracking
+export type DocumentHookStatus =
+	| DocumentHookStatusScheduledReminder
+	| DocumentHookStatusGitHubTracking
+	| DocumentHookStatusURLWatcher
+	| DocumentHookStatusContainerImageWatcher
+
+// initializing marks a copied hook before its first run.
+export type DocumentHookStatusScheduledReminder = "active" | "initializing"
+export type DocumentHookStatusGitHubTracking =
+	| "active"
+	| "initializing"
+	| "unconfigured"
+	| "missing_installation"
+	| "missing_repository"
+	| "missing_branch"
+	| "tree_truncated"
+export type DocumentHookStatusURLWatcher =
+	"active" | "initializing" | "unconfigured" | "unreachable_url"
+export type DocumentHookStatusContainerImageWatcher =
+	"active" | "initializing" | "unauthorized" | "image_not_found"
 
 export interface DocumentHookSettingsScheduledReminder {
 	scale: "linear"
@@ -126,8 +154,10 @@ export interface DocumentHookSettingsGitHubTracking {
 
 export interface DocumentHookStateGitHubTracking {
 	pathsChecksums: Record<string, string>
-	status:
-		"active" | "missing_installation" | "missing_repository" | "missing_branch"
+}
+
+export interface DocumentHookSummaryGitHubTracking {
+	changedPaths: number
 }
 
 export interface DocumentHookSettingsURLWatcher {
@@ -140,12 +170,10 @@ export interface DocumentHookSettingsContainerImageWatcher {
 
 export interface DocumentHookStateURLWatcher {
 	lastCheckedAt?: Date | string
-	status: "active" | "unreachable_url"
 }
 
 export interface DocumentHookStateContainerImageWatcher {
 	digest: string
-	status: "active" | "unauthorized"
 }
 
 export type DocumentTreeResponse = DocumentTreeElement[]
@@ -238,34 +266,122 @@ export function defaultDocumentHookState(
 		case DocumentHookType.GitHubTracking:
 			return {
 				pathsChecksums: {},
-				status: "active",
 			}
 		case DocumentHookType.URLWatcher:
 			return {
 				lastCheckedAt: new Date(),
-				status: "active",
 			}
 		case DocumentHookType.ContainerImageWatcher:
 			return {
-				status: "active",
 				digest: "",
 			}
 	}
 }
 
-export interface DocumentSearchResult {
-	id: string // branch-scoped index entry ID
-	documentId: string
-	organizationId: string
-	branchId: string
-	branchName: string
-	branchDefault: boolean
-	type: string
-	text: string
+// the search endpoints refuse a query outside these lengths
+export const DOCUMENT_SEARCH_QUERY_MIN_LENGTH = 2
+export const DOCUMENT_SEARCH_QUERY_MAX_LENGTH = 200
+
+export interface DocumentSearchParams {
+	q: string
+	currentDocId: string | null
 }
 
-export type DocumentSearchResponse = DocumentSearchResult[]
+// which one a hit carries follows from its block type
+export type DocumentSearchHitAttrs =
+	DocumentSearchHitAttrsCodeBlock | DocumentSearchHitAttrsMetricBlock
+
+export interface DocumentSearchHitAttrsCodeBlock {
+	language: string
+}
+
+export interface DocumentSearchHitAttrsMetricBlock {
+	dataSourceId?: string
+	visualizationType?: GenericQueryChartType
+}
+
+export interface DocumentSearchHit {
+	id: string // block uid
+	type: string
+	text: string // escaped HTML with the matches wrapped in <mark>
+	attrs?: DocumentSearchHitAttrs
+}
+
+export interface DocumentSearchDocument {
+	id: string
+	title: string
+	titleHtml: string | null // set only when the name matched
+	icon: string
+	branch: {
+		id: string
+		name: string
+		default: boolean
+	}
+	updatedAt: Date | string
+	updatedBy: string | null
+}
+
+// one branch of a document, so a document with a draft can come back twice etc.
+export interface DocumentSearchResult {
+	document: DocumentSearchDocument
+	hits: DocumentSearchHit[]
+	totalHits: number
+	nextHitsToken: string | null
+}
+
+export interface DocumentSearchResponse {
+	total: {
+		hits: number
+		documents: number
+		capped: boolean
+	}
+	nextToken: string | null
+	results: DocumentSearchResult[]
+}
+
+export type DocumentViewSource = "all" | "search"
+
+export interface DocumentRecent extends DocumentSearchDocument {
+	viewedAt: Date | string
+}
+
+export interface DocumentRecentsResponse {
+	results: DocumentRecent[]
+}
+
+export interface DocumentBranchSearchResponse {
+	totalHits: number
+	nextToken: string | null
+	hits: DocumentSearchHit[]
+}
+
 export type DocumentMaintainersResponse = string[]
+
+// the name the review workflow gives the branch it creates
+export const DOCUMENT_DRAFT_BRANCH_NAME = "draft"
+
+// the name a branch goes by in the UI. The default branch and the review
+// workflow's draft have fixed names, in a long and a short form. Any other
+// branch shows its own.
+export function documentBranchLabel(
+	branch: { name: string; default: boolean },
+	t: (key: string) => string,
+	short = false,
+): string {
+	if (branch.default) {
+		return short
+			? t("general.branch-labels.main-short")
+			: t("general.branch-labels.main")
+	}
+
+	if (branch.name !== DOCUMENT_DRAFT_BRANCH_NAME) {
+		return branch.name
+	}
+
+	return short
+		? t("general.branch-labels.draft-short")
+		: t("general.branch-labels.draft")
+}
 
 export interface DocumentBranch {
 	branchId: string

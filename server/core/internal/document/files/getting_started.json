@@ -633,8 +633,8 @@
 										"legendFormat": ""
 									}
 								],
-								"timeRange": "last_5_minutes",
-								"refreshInterval": "5m",
+								"timeRange": "$metric_range",
+								"refreshInterval": "$metric_refresh",
 								"baseThresholdColor": "oklch(62.7% .194 149.214)"
 							}
 						},
@@ -651,8 +651,8 @@
 										"legendFormat": ""
 									}
 								],
-								"timeRange": "last_5_minutes",
-								"refreshInterval": "5m",
+								"timeRange": "$metric_range",
+								"refreshInterval": "$metric_refresh",
 								"baseThresholdColor": "oklch(62.7% .194 149.214)"
 							}
 						}

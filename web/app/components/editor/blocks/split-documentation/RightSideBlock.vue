@@ -1,6 +1,6 @@
 <script lang="ts" setup>
 import { NodeViewContent, nodeViewProps, NodeViewWrapper } from "@tiptap/vue-3"
-import { cn } from "~/lib/utils"
+import { cn } from "#layers/ui/app/lib/utils"
 import { SUPPRESS_SCROLL_TO_SELECTION_META } from "../../scroll-control"
 import type { RightSideBlockType } from "."
 import type { ShortcutAction } from "~/utils/shortcuts"
@@ -30,7 +30,7 @@ const buttons = computed(
 			text: t(
 				"editor.split-documentation.right-side-bottom-action-buttons.add-metrics",
 			),
-			icon: "lucide:chart-line",
+			icon: BLOCK_ICONS.metricBlock,
 			shortcut: SHORTCUT_ACTIONS.addMetricsToSplitDocRightSide,
 		},
 		{
@@ -38,7 +38,7 @@ const buttons = computed(
 			text: t(
 				"editor.split-documentation.right-side-bottom-action-buttons.add-diagram",
 			),
-			icon: "lucide:network",
+			icon: BLOCK_ICONS.mermaidBlock,
 			shortcut: SHORTCUT_ACTIONS.addDiagramToSplitDocRightSide,
 		},
 	],

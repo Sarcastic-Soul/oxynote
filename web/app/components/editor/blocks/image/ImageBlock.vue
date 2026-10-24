@@ -2,8 +2,10 @@
 import { nodeViewProps, NodeViewWrapper } from "@tiptap/vue-3"
 import { nanoid } from "nanoid"
 import { showToastMessage } from "~/components/toast"
-import { cn } from "~/lib/utils"
+import { cn } from "#layers/ui/app/lib/utils"
 import { DiffStatus } from "~/components/editor/diff/position-map"
+import DiffChangeMarker from "~/components/editor/diff/DiffChangeMarker.vue"
+import ImageDiffDetails from "./ImageDiffDetails.vue"
 
 const MIN_WIDTH = 128
 
@@ -37,8 +39,6 @@ const diffClass = computed(() => {
 			return "diff-added"
 		case DiffStatus.Removed:
 			return "diff-removed"
-		case DiffStatus.Modified:
-			return "diff-modified"
 		default:
 			return null
 	}
@@ -176,24 +176,24 @@ async function handleFileChange(event: Event) {
 		return
 	}
 
-	const blockId = (props.node.attrs.uid as string) || nanoid()
+	const fileId = nanoid()
 
 	props.updateAttributes({ uploading: true })
 
 	try {
 		const uploaded = await uploadDocumentFile.mutateAsync({
 			documentId: documentId.value,
-			id: blockId,
+			id: fileId,
 			loc: DocumentFileLocation.Document,
 			kind: DocumentFileKind.Image,
 			file,
 		})
 		const nextSrc = buildDocumentFileSrc(
 			documentId.value,
-			blockId,
+			fileId,
 			uploaded.name,
 		)
-		props.updateAttributes({ src: nextSrc, uid: blockId, uploading: false })
+		props.updateAttributes({ src: nextSrc, uploading: false })
 	} catch (error) {
 		props.updateAttributes({ uploading: false })
 		if (!handleStorageError(error, t)) {
@@ -249,6 +249,9 @@ onBeforeUnmount(() => {
 				]"
 				draggable="false"
 			/>
+			<DiffChangeMarker :node="props.node" class="absolute top-1.5 right-1.5">
+				<ImageDiffDetails :node="props.node" />
+			</DiffChangeMarker>
 			<div
 				v-if="showResizeHandle"
 				aria-hidden="true"
@@ -271,7 +274,13 @@ onBeforeUnmount(() => {
 			"
 			@click="openFilePicker"
 		>
-			<Icon name="lucide:image" class="size-4.5 text-foreground" />
+			<Icon :name="BLOCK_ICONS.imageBlock" class="size-4.5 text-foreground" />
+			<DiffChangeMarker
+				:node="props.node"
+				class="absolute top-1/2 right-2 -translate-y-1/2"
+			>
+				<ImageDiffDetails :node="props.node" />
+			</DiffChangeMarker>
 			<div class="mt-0.25 text-2sm text-muted-foreground">
 				{{
 					uploading

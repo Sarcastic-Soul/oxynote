@@ -3,8 +3,8 @@ import { toTypedSchema } from "@vee-validate/zod"
 import { useForm } from "vee-validate"
 import * as z from "zod"
 // for some reason this isn't auto imported
-import { FormField as ShadcnUiFormField } from "@/components/shadcn/ui/form"
-import { cn } from "~/lib/utils"
+import { FormField as ShadcnUiFormField } from "#layers/ui/app/components/shadcn/ui/form"
+import { cn } from "#layers/ui/app/lib/utils"
 import { showToastMessage } from "../toast"
 
 const emit = defineEmits<{
@@ -21,19 +21,19 @@ const form = useForm({
 })
 const { fetchAuthSession, fetchOrganization, inviteOrganizationMember } =
 	useAuthSession()
-const { isEmailEnabled } = useAuthAPI()
+const { isEmailEnabled, maxOrganizationMembers } = useAuthAPI()
 const { t } = useI18n({ useScope: "global" })
 const loading = ref(false)
 const isMaxMembersReached = computed(() => {
 	const org = fetchOrganization.state.value.data?.data
-	if (!org) {
+	if (!org || maxOrganizationMembers.value === null) {
 		return false
 	}
 
 	return (
 		org.members.length +
 			org.invitations.filter((inv) => inv.status === "pending").length >=
-		ORGANIZATION_MAX_MEMBERS
+		maxOrganizationMembers.value
 	)
 })
 

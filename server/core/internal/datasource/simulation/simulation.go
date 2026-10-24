@@ -14,6 +14,7 @@ import (
 	datasourceCore "github.com/oxynote/oxynote/server/core/internal/datasource"
 	"github.com/oxynote/oxynote/server/core/internal/datasource/processor"
 	"github.com/oxynote/oxynote/server/core/internal/document"
+	"github.com/oxynote/oxynote/server/core/internal/variable"
 	"github.com/oxynote/oxynote/server/core/pkg/errutil"
 	"github.com/oxynote/oxynote/server/core/pkg/memkit"
 	"github.com/oxynote/oxynote/server/core/pkg/timeutil"
@@ -106,7 +107,8 @@ type Checker struct {
 	// log is the component logger.
 	log *slog.Logger
 
-	// db reads the data source the block names.
+	// db reads the data source the block names and the variables its
+	// queries reference.
 	db DB
 
 	// runners hands out the client that speaks to a data source.
@@ -206,11 +208,30 @@ func (c *Checker) checkMetricActive(
 		return false
 	}
 
-	now := timeutil.Now()
-	tr := processor.TimeRange{From: now.Add(-probeSpan(block)), To: now}
+	queries := extractQueries(block)
+	timeRange := block.Attrs.Get(document.AttrTimeRange).String()
 
-	for _, q := range extractQueries(block) {
-		res, qerr := c.query(ctx, *ds, q, tr)
+	// the probe acts for no user, so every variable takes its default.
+	if variable.HasReference(queries...) || variable.HasReference(timeRange) {
+		vars, verr := c.db.FetchVariableTree(ctx, organizationID, "")
+		if verr != nil {
+			c.log.DebugContext(ctx, "cannot fetch the variables the block references", "error", verr)
+
+			return false
+		}
+
+		queries = vars.Substitute(nil, queries...)
+		timeRange = vars.Substitute(nil, timeRange)[0]
+	}
+
+	now := timeutil.Now()
+	tr := processor.TimeRange{From: now.Add(-probeSpan(timeRange)), To: now}
+
+	// the probe transforms as a gauge because that shape accepts every
+	// result a source can answer with, scalar, vector and matrix alike,
+	// and only asks whether anything came back, not how it would be drawn.
+	for _, q := range queries {
+		res, qerr := datasourceCore.Query(ctx, c.runners.Runner(*ds), q, tr, processor.ChartTypeGauge)
 		if qerr != nil {
 			c.log.DebugContext(ctx, "the block's query did not answer", "error", qerr)
 
@@ -249,61 +270,6 @@ func (c *Checker) fetchDataSource(
 	return c.db.FetchDataSource(ctx, id, organizationID)
 }
 
-// query runs one query against the data source and returns it in the
-// unified shape, whatever the source speaks. It transforms as a gauge
-// because that shape accepts every result a source can answer with —
-// scalar, vector and matrix alike — and the probe only asks whether
-// anything came back, not how it would be drawn.
-func (c *Checker) query(
-	ctx context.Context,
-	ds datasourceCore.DataSource,
-	q string,
-	tr processor.TimeRange,
-) (*processor.QueryResult, error) {
-	runner := c.runners.Runner(ds)
-
-	switch ds.Type {
-	case datasourceCore.TypePrometheus:
-		client, err := runner.Prometheus(ctx)
-		if err != nil {
-			return nil, err
-		}
-
-		res, err := client.QueryRange(ctx, q, tr)
-		if err != nil || res == nil {
-			return nil, err
-		}
-
-		return res.Transform(processor.ChartTypeGauge), nil
-	case datasourceCore.TypePostgreSQL:
-		client, err := runner.PostgreSQL(ctx)
-		if err != nil {
-			return nil, err
-		}
-
-		res, err := client.Query(ctx, q, tr)
-		if err != nil || res == nil {
-			return nil, err
-		}
-
-		return res.Transform(processor.ChartTypeGauge), nil
-	case datasourceCore.TypeMariaDB, datasourceCore.TypeMySQL:
-		client, err := runner.MySQL(ctx)
-		if err != nil {
-			return nil, err
-		}
-
-		res, err := client.Query(ctx, q, tr)
-		if err != nil || res == nil {
-			return nil, err
-		}
-
-		return res.Transform(processor.ChartTypeGauge), nil
-	default:
-		return nil, fmt.Errorf("data source type %q cannot be queried", ds.Type)
-	}
-}
-
 // clear switches the block's simulation off on the live document. The
 // preset stays, so the block remembers which series it drew.
 func (c *Checker) clear(
@@ -311,11 +277,18 @@ func (c *Checker) clear(
 	documentID, branchID xid.ID,
 	blockUID string,
 ) error {
-	res, err := c.applier.Apply(ctx, documentID, branchID, []edit.Operation{
-		edit.UpdateAttrs(blockUID, map[string]any{
-			document.AttrSimulationActive: false,
-		}),
-	}, true)
+	res, err := c.applier.Apply(
+		ctx,
+		documentID,
+		branchID,
+		[]edit.Operation{
+			edit.UpdateAttrs(blockUID, map[string]any{
+				document.AttrSimulationActive: false,
+			}),
+		},
+		"",
+		true,
+	)
 	if err != nil {
 		return err
 	}
@@ -350,26 +323,11 @@ func simulated(block document.Block) bool {
 		return false
 	}
 
-	active, ok := block.Attrs.Get(document.AttrSimulationActive)
-	if !ok {
-		return false
-	}
-
-	return active.Bool()
+	return block.Attrs.Get(document.AttrSimulationActive).Bool()
 }
 
-// probeSpan reads how far back the block's window reaches.
-func probeSpan(block document.Block) time.Duration {
-	raw, ok := block.Attrs.Value(document.AttrTimeRange)
-	if !ok {
-		return _defaultProbeSpan
-	}
-
-	preset, isString := raw.(string)
-	if !isString {
-		return _defaultProbeSpan
-	}
-
+// probeSpan returns how far back the time range preset reaches.
+func probeSpan(preset string) time.Duration {
 	span, known := _probeSpans[preset]
 	if !known {
 		return _defaultProbeSpan
@@ -414,6 +372,11 @@ type DB interface {
 	// FetchDataSource should retrieve a data source by ID and
 	// organization ID.
 	FetchDataSource(ctx context.Context, id xid.ID, organizationID string) (*datasourceCore.DataSource, error)
+
+	// FetchVariableTree should return the organization's variables, each
+	// with the value the user set. An empty user sets none, so every
+	// variable takes its default.
+	FetchVariableTree(ctx context.Context, organizationID, userID string) (variable.Tree, error)
 }
 
 // Runners hands out the runner for a data source. The datasource
@@ -434,5 +397,5 @@ type Applier interface {
 	// the (documentID, branchID) document and return the per-op
 	// outcome. The clear is core's own write, so this package always
 	// asks for a system one.
-	Apply(ctx context.Context, documentID, branchID xid.ID, ops []edit.Operation, system bool) (edit.Result, error)
+	Apply(ctx context.Context, documentID, branchID xid.ID, ops []edit.Operation, userID string, system bool) (edit.Result, error)
 }

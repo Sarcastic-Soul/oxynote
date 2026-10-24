@@ -15,6 +15,9 @@ export type StubStore = {
 export function stubStore(): StubStore {
 	return {
 		totalOrganizationCount: vi.fn().mockResolvedValue(0),
+		organizationMemberCount: vi.fn().mockResolvedValue(2),
+		hasPendingInvitation: vi.fn().mockResolvedValue(true),
+		credentialPasswordHash: vi.fn().mockResolvedValue(null),
 		userOrganizationId: vi.fn().mockResolvedValue("org-1"),
 		hasOAuthConsent: vi.fn().mockResolvedValue(true),
 		isOrganizationMember: vi.fn().mockResolvedValue(true),

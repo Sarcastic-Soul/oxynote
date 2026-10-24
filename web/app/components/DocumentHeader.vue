@@ -1,5 +1,5 @@
 <script lang="ts" setup>
-import { cn } from "~/lib/utils"
+import { cn } from "#layers/ui/app/lib/utils"
 import type { DocumentBreadcrumb } from "./sidebar"
 import { showToastMessage } from "./toast"
 
@@ -32,8 +32,11 @@ const { updateDocumentBranch, createDocumentBranch, deleteDocumentBranch } =
 	useDocumentAPI()
 const isReviewable = computed(() => {
 	// NOTE this will be removed in the future
+	//
+	// a branch that is still being created has a temporary id and does not
+	// count. A switch to it would be undone once the server answers
 	const branches = fetchBranches.state.value.data
-	return !!branches && branches.length > 1
+	return !!branches && branches.filter((b) => isXid(b.branchId)).length > 1
 })
 const modeTooltip = computed(() => {
 	if (isBranchProtected.value) {
@@ -71,6 +74,7 @@ const activeBranchMode = computed(() => {
 
 	return activeBranch.default ? "main" : "draft"
 })
+const pendingReviewabilityDisable = ref<(() => Promise<void>) | null>(null)
 
 if (import.meta.client) {
 	watchImmediate(height, (v) => {
@@ -79,6 +83,15 @@ if (import.meta.client) {
 			`${v}px`,
 		)
 	})
+}
+
+function requestToggleReviewability() {
+	if (isReviewable.value) {
+		pendingReviewabilityDisable.value = toggleReviewability
+		return
+	}
+
+	void toggleReviewability()
 }
 
 async function toggleReviewability() {
@@ -93,7 +106,7 @@ async function toggleReviewability() {
 			await createDocumentBranch.mutateAsync({
 				docId: editorStore.activeDocumentId,
 				req: {
-					branch: "draft",
+					branch: DOCUMENT_DRAFT_BRANCH_NAME,
 					sourceBranchId: editorStore.mappedDefaultBranchId,
 				},
 			})
@@ -162,7 +175,7 @@ function activateBranch(branch: "default" | "draft") {
 						side="bottom"
 						:shortcut="SHORTCUT_ACTIONS.toggleSidebar"
 					>
-						<ShadcnUiSidebarTrigger />
+						<ShadcnUiSidebarTrigger :label="$t('sidebar.toggle-sidebar')" />
 					</ShortcutTooltip>
 					<HeaderBreadcrumbs
 						v-if="editorStore.activeDocumentId && props.breadcrumbs"
@@ -201,7 +214,7 @@ function activateBranch(branch: "default" | "draft") {
 										<span class="font-bold">
 											{{
 												props.timestamps[editorStore.activeBranchId]!.updated
-													.user?.name || $t("editor.navbar.unknown-user")
+													.user?.name || $t("general.deleted-user")
 											}}
 										</span>
 									</template>
@@ -224,7 +237,7 @@ function activateBranch(branch: "default" | "draft") {
 										<span class="font-bold">
 											{{
 												props.timestamps[editorStore.activeBranchId]!.created
-													.user?.name || $t("editor.navbar.unknown-user")
+													.user?.name || $t("general.deleted-user")
 											}}
 										</span>
 									</template>
@@ -249,9 +262,7 @@ function activateBranch(branch: "default" | "draft") {
 									size="sm"
 									:class="cn('h-fit gap-0.75 px-2 py-1')"
 								>
-									{{
-										$t(`editor.navbar.document-modes.${activeBranchMode}.title`)
-									}}
+									{{ $t(`general.branch-labels.${activeBranchMode}`) }}
 									<Icon name="lucide:chevron-down" class="mt-0.5" />
 								</ShadcnUiButton>
 							</ShadcnUiDropdownMenuTrigger>
@@ -264,7 +275,7 @@ function activateBranch(branch: "default" | "draft") {
 								<ShadcnUiDropdownMenuItem @click="activateBranch('default')">
 									<div class="flex flex-col gap-0.5">
 										<div class="text-2sm font-medium">
-											{{ $t(`editor.navbar.document-modes.main.title`) }}
+											{{ $t(`general.branch-labels.main`) }}
 										</div>
 										<div class="text-xs text-muted-foreground">
 											{{ $t(`editor.navbar.document-modes.main.description`) }}
@@ -275,7 +286,7 @@ function activateBranch(branch: "default" | "draft") {
 								<ShadcnUiDropdownMenuItem @click="activateBranch('draft')">
 									<div class="flex flex-col gap-0.5">
 										<div class="text-2sm font-medium">
-											{{ $t(`editor.navbar.document-modes.draft.title`) }}
+											{{ $t(`general.branch-labels.draft`) }}
 										</div>
 										<div class="text-xs text-muted-foreground">
 											{{ $t(`editor.navbar.document-modes.draft.description`) }}
@@ -360,7 +371,7 @@ function activateBranch(branch: "default" | "draft") {
 										}}
 									</span>
 								</ShadcnUiDropdownMenuItem>
-								<ShadcnUiDropdownMenuItem @click="toggleReviewability">
+								<ShadcnUiDropdownMenuItem @click="requestToggleReviewability">
 									<Icon
 										:name="
 											isReviewable
@@ -433,4 +444,5 @@ function activateBranch(branch: "default" | "draft") {
 			</div>
 		</Transition>
 	</header>
+	<DisableReviewabilityModal v-model="pendingReviewabilityDisable" />
 </template>

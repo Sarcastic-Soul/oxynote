@@ -3,11 +3,11 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/oxynote/oxynote/server/core/internal/assistant/tools"
-	"github.com/rs/xid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -18,16 +18,18 @@ type stubRunner struct {
 	// out is what Run reports as its output.
 	out string
 
-	// docs is what Run reports as the branches it changed.
-	docs []tools.Touched
-
 	// runErr fails Run when set.
 	runErr error
+
+	// calls records the arguments of every Run call.
+	calls []json.RawMessage
 }
 
-// Run returns the configured outcome.
-func (s *stubRunner) Run(context.Context, json.RawMessage) (tools.Result, error) {
-	return tools.Result{Output: s.out, Documents: s.docs}, s.runErr
+// Run records the call and returns the configured outcome.
+func (s *stubRunner) Run(_ context.Context, args json.RawMessage) (string, error) {
+	s.calls = append(s.calls, args)
+
+	return s.out, s.runErr
 }
 
 func Test_annotations(t *testing.T) {
@@ -36,25 +38,42 @@ func Test_annotations(t *testing.T) {
 	cc := map[string]struct {
 		Entry       tools.Entry
 		ReadOnly    bool
+		OpenWorld   bool
 		Destructive *bool
+		Idempotent  bool
 	}{
 		"Read tool": {
 			Entry:    tools.Entry{},
 			ReadOnly: true,
 		},
+		"Data-source tool reaches an open world": {
+			Entry:     tools.Entry{Info: tools.Info{Traits: tools.Traits{DataSource: true}}},
+			ReadOnly:  true,
+			OpenWorld: true,
+		},
 		"Additive write tool": {
-			Entry:       tools.Entry{Traits: tools.Traits{Write: true}},
+			Entry:       tools.Entry{Info: tools.Info{Traits: tools.Traits{Write: true}}},
 			Destructive: new(bool),
 		},
 		"Destructive write tool": {
-			Entry: tools.Entry{Traits: tools.Traits{Write: true, Destructive: true}},
+			Entry: tools.Entry{Info: tools.Info{Traits: tools.Traits{Write: true, Destructive: true}}},
 			Destructive: func() *bool {
 				v := true
 				return &v
 			}(),
 		},
+		"Idempotent write tool": {
+			Entry:       tools.Entry{Info: tools.Info{Traits: tools.Traits{Write: true, Idempotent: true}}},
+			Destructive: new(bool),
+			Idempotent:  true,
+		},
+		// only a write says whether repeating it matters.
+		"Idempotent trait on a read is not reported": {
+			Entry:    tools.Entry{Info: tools.Info{Traits: tools.Traits{Idempotent: true}}},
+			ReadOnly: true,
+		},
 		"Overwriting write tool is destructive to a client": {
-			Entry: tools.Entry{Traits: tools.Traits{Write: true, Overwrites: true}},
+			Entry: tools.Entry{Info: tools.Info{Traits: tools.Traits{Write: true, Overwrites: true}}},
 			Destructive: func() *bool {
 				v := true
 				return &v
@@ -70,8 +89,9 @@ func Test_annotations(t *testing.T) {
 
 			assert.Equal(t, c.ReadOnly, got.ReadOnlyHint)
 			assert.Equal(t, c.Destructive, got.DestructiveHint)
+			assert.Equal(t, c.Idempotent, got.IdempotentHint)
 			require.NotNil(t, got.OpenWorldHint)
-			assert.False(t, *got.OpenWorldHint)
+			assert.Equal(t, c.OpenWorld, *got.OpenWorldHint)
 		})
 	}
 }
@@ -79,26 +99,13 @@ func Test_annotations(t *testing.T) {
 func Test_Handler_toolHandler(t *testing.T) {
 	t.Parallel()
 
-	doc1, doc2 := xid.New(), xid.New()
-	branch1, branch2 := xid.New(), xid.New()
-
-	hdl := &Handler{log: discardLog()}
-
-	req := func(args string) *mcp.CallToolRequest {
-		return &mcp.CallToolRequest{
-			Params: &mcp.CallToolParamsRaw{
-				Name:      "stub",
-				Arguments: json.RawMessage(args),
-			},
-		}
-	}
+	hdl := &Handler{log: slog.New(slog.DiscardHandler)}
 
 	cc := map[string]struct {
-		Entry    tools.Entry
-		Args     string
-		IsError  bool
-		Text     string
-		LinkURIs []string
+		Entry   tools.Entry
+		Args    string
+		IsError bool
+		Text    string
 	}{
 		"Tool failure becomes an isError result": {
 			Entry:   tools.Entry{Tool: &stubRunner{runErr: assert.AnError}},
@@ -106,25 +113,8 @@ func Test_Handler_toolHandler(t *testing.T) {
 			IsError: true,
 			Text:    assert.AnError.Error(),
 		},
-		"A call that changed nothing carries no link": {
-			Entry: tools.Entry{Tool: &stubRunner{out: `{"ok":true}`}},
-			Args:  `{"document_id":"doc1"}`,
-			Text:  `{"ok":true}`,
-		},
-		"A call links the document it changed": {
-			Entry:    tools.Entry{Tool: &stubRunner{out: `{"ok":true}`, docs: []tools.Touched{{DocumentID: doc1, BranchID: branch1}}}, Traits: tools.Traits{Write: true}},
-			Args:     `{"document_id":"` + doc1.String() + `"}`,
-			Text:     `{"ok":true}`,
-			LinkURIs: []string{_resourceURIPrefix + doc1.String() + _resourceBranchSegment + branch1.String()},
-		},
-		"A call links every document it changed": {
-			Entry:    tools.Entry{Tool: &stubRunner{out: `{"ok":true}`, docs: []tools.Touched{{DocumentID: doc1, BranchID: branch1}, {DocumentID: doc2, BranchID: branch2}}}, Traits: tools.Traits{Write: true}},
-			Args:     `{}`,
-			Text:     `{"ok":true}`,
-			LinkURIs: []string{_resourceURIPrefix + doc1.String() + _resourceBranchSegment + branch1.String(), _resourceURIPrefix + doc2.String() + _resourceBranchSegment + branch2.String()},
-		},
-		"A write that changed nothing has no link to offer": {
-			Entry: tools.Entry{Tool: &stubRunner{out: `{"ok":true}`}, Traits: tools.Traits{Write: true}},
+		"Output of a call is its text": {
+			Entry: tools.Entry{Tool: &stubRunner{out: `{"ok":true}`}, Info: tools.Info{Traits: tools.Traits{Write: true}}},
 			Args:  `{}`,
 			Text:  `{"ok":true}`,
 		},
@@ -134,7 +124,12 @@ func Test_Handler_toolHandler(t *testing.T) {
 		t.Run(cn, func(t *testing.T) {
 			t.Parallel()
 
-			res, err := hdl.toolHandler(c.Entry)(context.Background(), req(c.Args))
+			res, err := hdl.toolHandler(c.Entry)(context.Background(), &mcp.CallToolRequest{
+				Params: &mcp.CallToolParamsRaw{
+					Name:      "stub",
+					Arguments: json.RawMessage(c.Args),
+				},
+			})
 			require.NoError(t, err)
 			require.NotNil(t, res)
 
@@ -146,13 +141,11 @@ func Test_Handler_toolHandler(t *testing.T) {
 			require.True(t, ok)
 			assert.Equal(t, c.Text, text.Text)
 
-			require.Len(t, res.Content, 1+len(c.LinkURIs))
+			assert.Len(t, res.Content, 1)
 
-			for n, want := range c.LinkURIs {
-				link, lok := res.Content[1+n].(*mcp.ResourceLink)
-				require.True(t, lok)
-				assert.Equal(t, want, link.URI)
-			}
+			runner, ok := c.Entry.Tool.(*stubRunner)
+			require.True(t, ok)
+			assert.Equal(t, []json.RawMessage{json.RawMessage(c.Args)}, runner.calls)
 		})
 	}
 }

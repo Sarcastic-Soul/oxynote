@@ -59,7 +59,11 @@ function seededDocument(name = "Runbook"): ConnectedDocument {
 }
 
 function hooksWith(core: StubCore, session: AuthSession | null = SESSION) {
-	return createDocumentHooks({ auth: stubAuth(session), core })
+	return createDocumentHooks({
+		auth: stubAuth(session),
+		core,
+		log: stubLog(),
+	})
 }
 
 describe("parseDocumentName", () => {
@@ -168,7 +172,11 @@ describe("createDocumentHooks", () => {
 		}) => {
 			const core = stubCore()
 			const auth = stubAuth()
-			const hooks = createDocumentHooks({ auth, core })
+			const hooks = createDocumentHooks({
+				auth,
+				core,
+				log: stubLog(),
+			})
 
 			const result = await hooks.onAuthenticate({
 				connectionConfig: { readOnly: false },
@@ -424,6 +432,56 @@ describe("createDocumentHooks", () => {
 				core.storeBranchContent.mock.calls[0]?.[2]
 					.maintainers,
 			).toEqual(["user-1", "user-2"])
+		})
+
+		it("moves the latest editor to the end", async ({ expect }) => {
+			const core = stubCore()
+			const hooks = hooksWith(core)
+
+			await hooks.onChange({
+				context: { session: SESSION },
+				documentName: "doc1-branch1",
+			})
+			await hooks.onChange({
+				context: {
+					session: { user: { id: "user-2" } },
+				},
+				documentName: "doc1-branch1",
+			})
+			await hooks.onChange({
+				context: { session: SESSION },
+				documentName: "doc1-branch1",
+			})
+			await hooks.onStoreDocument({
+				documentName: "doc1-branch1",
+				document: seededDocument(),
+			})
+
+			expect(
+				core.storeBranchContent.mock.calls[0]?.[2]
+					.maintainers,
+			).toEqual(["user-2", "user-1"])
+		})
+
+		it("records the user a direct connection acts for", async ({
+			expect,
+		}) => {
+			const core = stubCore()
+			const hooks = hooksWith(core)
+
+			await hooks.onChange({
+				context: { userId: "user-3" },
+				documentName: "doc1-branch1",
+			})
+			await hooks.onStoreDocument({
+				documentName: "doc1-branch1",
+				document: seededDocument(),
+			})
+
+			expect(
+				core.storeBranchContent.mock.calls[0]?.[2]
+					.maintainers,
+			).toEqual(["user-3"])
 		})
 
 		it("ignores a change carrying no session", async ({
@@ -829,22 +887,94 @@ describe("createDocumentHooks", () => {
 			).toBe(false)
 		})
 
-		// the editors keep their unsaved work either way; telling them
-		// the persist failed is the only thing left to do
-		it("warns the connected editors instead of throwing when the persist fails", async ({
+		// a direct connection stores on disconnect even when its batch
+		// changed nothing, so the window has no provenance of its own
+		it.for([
+			{
+				name: "a system connection",
+				input: { system: true },
+				expected: true,
+			},
+			{
+				name: "an ordinary connection",
+				input: { userId: "user-1" },
+				expected: false,
+			},
+			{
+				name: "no connection context",
+				input: undefined,
+				expected: false,
+			},
+		])(
+			"persists an unchanged window with the permission of $name",
+			async ({ input, expected }, { expect }) => {
+				const core = stubCore()
+				const hooks = hooksWith(core)
+
+				await hooks.onStoreDocument({
+					documentName: "doc1-branch1",
+					document: seededDocument(),
+					lastContext: input,
+				})
+
+				expect(
+					core.storeBranchContent.mock
+						.calls[0]?.[2].system,
+				).toBe(expected)
+			},
+		)
+
+		it("persists an edited window as an ordinary write whoever stores it", async ({
+			expect,
+		}) => {
+			const core = stubCore()
+			const hooks = hooksWith(core)
+
+			await hooks.onChange({
+				context: { session: SESSION },
+				documentName: "doc1-branch1",
+			})
+			await hooks.onStoreDocument({
+				documentName: "doc1-branch1",
+				document: seededDocument(),
+				lastContext: { system: true },
+			})
+
+			expect(
+				core.storeBranchContent.mock.calls[0]?.[2]
+					.system,
+			).toBe(false)
+		})
+
+		// rethrowing is what makes hocuspocus keep the document, and its
+		// unsaved changes, in memory
+		it("warns the connected editors, logs and rethrows when the persist fails", async ({
 			expect,
 		}) => {
 			const core = stubCore()
 			core.storeBranchContent.mockRejectedValue(
 				new Error("core unreachable"),
 			)
-			const hooks = hooksWith(core)
+			const log = stubLog()
+			const hooks = createDocumentHooks({
+				auth: stubAuth(),
+				core,
+				log,
+			})
 			const document = seededDocument()
 
-			await hooks.onStoreDocument({
-				documentName: "doc1-branch1",
-				document,
-			})
+			await expect(
+				hooks.onStoreDocument({
+					documentName: "doc1-branch1",
+					document,
+				}),
+			).rejects.toThrow("core unreachable")
+
+			expect(log.error.mock.calls).toEqual([
+				[
+					"persisting doc1-branch1 failed: core unreachable",
+				],
+			])
 
 			expect(
 				document.broadcastStateless,
@@ -856,6 +986,30 @@ describe("createDocumentHooks", () => {
 			)
 		})
 
+		it("logs a persist failure that is not an Error by its value", async ({
+			expect,
+		}) => {
+			const core = stubCore()
+			core.storeBranchContent.mockRejectedValue("core gone")
+			const log = stubLog()
+			const hooks = createDocumentHooks({
+				auth: stubAuth(),
+				core,
+				log,
+			})
+
+			await expect(
+				hooks.onStoreDocument({
+					documentName: "doc1-branch1",
+					document: seededDocument(),
+				}),
+			).rejects.toBe("core gone")
+
+			expect(log.error.mock.calls).toEqual([
+				["persisting doc1-branch1 failed: core gone"],
+			])
+		})
+
 		it("warns the connected editors when the branch cannot be resolved", async ({
 			expect,
 		}) => {
@@ -864,10 +1018,12 @@ describe("createDocumentHooks", () => {
 			const hooks = hooksWith(core)
 			const document = seededDocument()
 
-			await hooks.onStoreDocument({
-				documentName: "doc1-default",
-				document,
-			})
+			await expect(
+				hooks.onStoreDocument({
+					documentName: "doc1-default",
+					document,
+				}),
+			).rejects.toThrow()
 
 			expect(
 				document.broadcastStateless,
@@ -879,7 +1035,8 @@ describe("createDocumentHooks", () => {
 	describe("flushDocument", () => {
 		// a server holding one open document whose store may be pending
 		// or running. executeNow stands in for hocuspocus running the
-		// debounced store: it calls the hook the way the server would.
+		// debounced store: it calls the hook the way the server would,
+		// catching what the hook throws.
 		function stubServer(
 			hooks: ReturnType<typeof hooksWith>,
 			document: ConnectedDocument | null,
@@ -892,11 +1049,13 @@ describe("createDocumentHooks", () => {
 
 			const executeNow = vi.fn(() =>
 				document
-					? hooks.onStoreDocument({
-							documentName:
-								"doc1-branch1",
-							document,
-						})
+					? hooks
+							.onStoreDocument({
+								documentName:
+									"doc1-branch1",
+								document,
+							})
+							.catch(() => undefined)
 					: undefined,
 			)
 
@@ -1050,10 +1209,12 @@ describe("createDocumentHooks", () => {
 			)
 			const hooks = hooksWith(core)
 			const document = seededDocument()
-			await hooks.onStoreDocument({
-				documentName: "doc1-branch1",
-				document,
-			})
+			await expect(
+				hooks.onStoreDocument({
+					documentName: "doc1-branch1",
+					document,
+				}),
+			).rejects.toThrow("core unreachable")
 			const { server } = stubServer(hooks, document, "idle")
 
 			await expect(
@@ -1064,8 +1225,21 @@ describe("createDocumentHooks", () => {
 })
 
 describe("resetConnections", () => {
+	// socket builds a writable connection whose close records whether the
+	// connection was already read-only when its socket was closed.
 	function socket() {
-		return { webSocket: { close: vi.fn() } }
+		const connection = {
+			readOnly: false,
+			readOnlyAtClose: undefined as boolean | undefined,
+			webSocket: {
+				close: vi.fn(() => {
+					connection.readOnlyAtClose =
+						connection.readOnly
+				}),
+			},
+		}
+
+		return connection
 	}
 
 	// the provider reopens a document after losing its socket, which is
@@ -1090,14 +1264,15 @@ describe("resetConnections", () => {
 
 		resetConnections(server, "doc1-branch1")
 
-		expect(first.webSocket.close).toHaveBeenCalledWith(
-			4205,
-			"Reset Connection",
-		)
-		expect(second.webSocket.close).toHaveBeenCalledWith(
-			4205,
-			"Reset Connection",
-		)
+		// an update that arrives before the socket reports the close is
+		// refused, so the connection turns read-only before the close.
+		for (const connection of [first, second]) {
+			expect(connection.webSocket.close.mock.calls).toEqual([
+				[4205, "Reset Connection"],
+			])
+			expect(connection.readOnlyAtClose).toBe(true)
+			expect(connection.readOnly).toBe(true)
+		}
 	})
 
 	it("leaves other documents' sockets alone", ({ expect }) => {
@@ -1114,6 +1289,7 @@ describe("resetConnections", () => {
 		resetConnections(server, "doc1-branch1")
 
 		expect(other.webSocket.close).toHaveBeenCalledTimes(0)
+		expect(other.readOnly).toBe(false)
 	})
 })
 

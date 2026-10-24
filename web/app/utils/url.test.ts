@@ -3,6 +3,7 @@ import {
 	addDeletionSuccessStatusToUrl,
 	createNameSlug,
 	createNameSlugWithId,
+	displayURL,
 	ensureHttps,
 	equalNameSlugs,
 	extractDocInfoFromSlug,
@@ -10,6 +11,7 @@ import {
 	isDeletionSuccessInUrl,
 	isOptimisticInsertId,
 	isXid,
+	withDefaultScheme,
 } from "./url"
 
 // default length of https://github.com/rs/xid
@@ -167,6 +169,29 @@ describe("ensureHttps", () => {
 	})
 })
 
+describe("withDefaultScheme", () => {
+	it.for([
+		{
+			name: "prefixes an address without a scheme",
+			input: "example.com",
+			expected: "https://example.com",
+		},
+		{
+			name: "keeps an http address",
+			input: "http://example.com",
+			expected: "http://example.com",
+		},
+		{
+			name: "keeps another scheme",
+			input: "mailto:team@example.com",
+			expected: "mailto:team@example.com",
+		},
+		{ name: "leaves an empty address empty", input: "", expected: "" },
+	])("$name", ({ input, expected }, { expect }) => {
+		expect(withDefaultScheme(input)).toBe(expected)
+	})
+})
+
 describe("extractDomain", () => {
 	it.for([
 		{
@@ -187,6 +212,28 @@ describe("extractDomain", () => {
 		{ name: "returns unparseable input unchanged", input: "", expected: "" },
 	])("$name", ({ input, expected }, { expect }) => {
 		expect(extractDomain(input)).toBe(expected)
+	})
+})
+
+describe("displayURL", () => {
+	it.for([
+		{
+			name: "drops the scheme and keeps the path",
+			input: "https://docs.example.com/guide?x=1",
+			expected: "docs.example.com/guide?x=1",
+		},
+		{
+			name: "drops a trailing slash",
+			input: "HTTP://example.com/",
+			expected: "example.com",
+		},
+		{
+			name: "keeps a url without a scheme as it is",
+			input: "example.com/guide",
+			expected: "example.com/guide",
+		},
+	])("$name", ({ input, expected }, { expect }) => {
+		expect(displayURL(input)).toBe(expected)
 	})
 })
 

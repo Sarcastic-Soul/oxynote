@@ -16,24 +16,17 @@ import (
 // surfaced to callers.
 const _maxErrorPreviewBytes = 1024
 
-// Result is the outcome of an Apply call. Applied counts the
-// operations Node committed to the Y.Doc; Errors lists per-op
-// failures (e.g. uid not found, malformed block). A partial-success
-// response has Applied < len(ops) and at least one entry in Errors.
+// Result is the outcome of an Apply call. A batch applies whole or not
+// at all: Errors is empty only when every operation landed.
 type Result struct {
-	// Applied is the number of operations the Node side committed
-	// to the live Y.Doc.
-	Applied int `json:"applied"`
-
-	// Errors contains one entry per failed operation, in input
-	// order. An empty slice means every operation succeeded.
+	// Errors holds the operation that failed, if any. The batch stops
+	// at the first failure.
 	Errors []OpError `json:"errors"`
 }
 
-// Client posts batched operations to the Node hocuspocus service's
-// internal operations endpoint. The base URL points at the Node
-// service (e.g. http://auth-realtime:8081); endpoint replaces its
-// path with the per-document operations path.
+// Client calls the Node hocuspocus service's internal per-branch
+// endpoints: batched operations and flushes. The base URL points at the
+// Node service (e.g. http://auth-realtime:8081).
 type Client struct {
 	// httpClient is the underlying HTTP client. Callers should
 	// pass one with a reasonable timeout configured.
@@ -44,8 +37,8 @@ type Client struct {
 }
 
 // NewClient constructs an edit-RPC client. The baseURL must include
-// the scheme and host of the Node service; the operations path is
-// appended per request.
+// the scheme and host of the Node service; the action path is appended
+// per request.
 func NewClient(httpClient *http.Client, baseURL string) *Client {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
@@ -58,47 +51,40 @@ func NewClient(httpClient *http.Client, baseURL string) *Client {
 }
 
 // Apply submits the given operations to the Node service for the
-// (documentID, branchID) document and returns the per-op outcome.
+// (documentID, branchID) document and returns the outcome.
 //
 // A system batch is one core originated rather than a person: its persist
 // is allowed onto a protected branch, where the writes an editor or the
 // assistant makes are refused. Only a caller acting for core itself may
-// pass true — nothing reachable from a prompt may.
-// Any transport-level failure (bad status, malformed response,
-// canonical expansion error) is returned as an error and no
-// operations are considered applied; failures of individual
-// operations within an otherwise successful HTTP response are
-// surfaced via Result.Errors.
+// pass true — nothing reachable from a prompt may. The userID is the
+// person an ordinary batch is made for, and its persist credits them. It
+// is empty for a system batch.
+// Any transport-level failure (bad status, malformed response) is
+// returned as an error and no
+// operations are considered applied; an operation the service
+// refused within an otherwise successful HTTP response is surfaced
+// via Result.Errors.
 func (c *Client) Apply(
 	ctx context.Context,
 	documentID, branchID xid.ID,
 	ops []Operation,
+	userID string,
 	system bool,
 ) (Result, error) {
 	if len(ops) == 0 {
 		return Result{}, nil
 	}
 
-	wires := make([]wireOp, 0, len(ops))
-
-	for i, op := range ops {
-		w, err := op()
-		if err != nil {
-			return Result{}, fmt.Errorf("operation %d: %w", i, err)
-		}
-
-		wires = append(wires, w)
-	}
-
 	body, err := json.Marshal(struct {
-		Operations []wireOp `json:"operations"`
-		System     bool     `json:"system"`
-	}{Operations: wires, System: system})
+		Operations []Operation `json:"operations"`
+		UserID     string      `json:"userId,omitempty"`
+		System     bool        `json:"system"`
+	}{Operations: ops, UserID: userID, System: system})
 	if err != nil {
 		return Result{}, fmt.Errorf("marshaling operations: %w", err)
 	}
 
-	endpoint, err := c.endpoint(documentID, branchID)
+	endpoint, err := c.endpoint(documentID, branchID, "operations")
 	if err != nil {
 		return Result{}, err
 	}
@@ -138,16 +124,50 @@ func (c *Client) Apply(
 	return out, nil
 }
 
-// endpoint builds the per-document operations URL.
-func (c *Client) endpoint(documentID, branchID xid.ID) (string, error) {
+// Flush has the Node service store what the editors of the branch hold
+// and returns once core has it.
+func (c *Client) Flush(ctx context.Context, documentID, branchID xid.ID) error {
+	endpoint, err := c.endpoint(documentID, branchID, "flush")
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, http.NoBody)
+	if err != nil {
+		// NOCOV: the URL is pre-validated by endpoint, so the only
+		// remaining failure is a nil context.
+		return fmt.Errorf("building request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("posting flush: %w", err)
+	}
+	defer resp.Body.Close() //nolint:errcheck // error provides no meaningful info
+
+	if resp.StatusCode != http.StatusNoContent {
+		preview, err := io.ReadAll(io.LimitReader(resp.Body, _maxErrorPreviewBytes))
+		if err != nil {
+			return fmt.Errorf("node flush endpoint: status %d: reading response body: %w", resp.StatusCode, err)
+		}
+
+		return fmt.Errorf("node flush endpoint: status %d: %s", resp.StatusCode, string(preview))
+	}
+
+	return nil
+}
+
+// endpoint builds the URL of a per-branch action.
+func (c *Client) endpoint(documentID, branchID xid.ID, action string) (string, error) {
 	base, err := url.Parse(c.baseURL)
 	if err != nil {
 		return "", fmt.Errorf("parsing base url: %w", err)
 	}
 
-	base.Path = fmt.Sprintf("/api/internal/documents/%s/branches/%s/operations",
+	base.Path = fmt.Sprintf("/api/internal/documents/%s/branches/%s/%s",
 		documentID,
 		branchID,
+		action,
 	)
 
 	return base.String(), nil

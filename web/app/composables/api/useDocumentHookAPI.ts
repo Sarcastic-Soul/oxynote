@@ -66,8 +66,10 @@ export default function () {
 			const oldHooks = clone(
 				queryCache.getQueryData<DocumentHooksResponse>(key),
 			)
+			const id = nanoid()
 			const newHook: DocumentHook = {
-				id: nanoid(),
+				id: id,
+				crossBranchId: id,
 				type: req.type,
 				documentId: docId,
 				branchId: req.branchId,
@@ -75,6 +77,7 @@ export default function () {
 				blockId: req.blockId,
 				settings: req.settings,
 				state: defaultDocumentHookState(req.type),
+				status: "active",
 				score: "100",
 				createdAt: new Date(),
 				updatedAt: new Date(),
@@ -320,6 +323,7 @@ export default function () {
 			for (const h of newHooks) {
 				if (h.id === hookId) {
 					h.state = defaultDocumentHookState(h.type)
+					h.status = "active"
 					h.updatedAt = new Date()
 
 					break

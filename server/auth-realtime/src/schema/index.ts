@@ -46,6 +46,7 @@ import {
 
 // Custom marks
 import { AddedMark, DeletedMark, CommentMark } from "./marks.js"
+import { NodeComment } from "./node-comment.js"
 
 const contentExtensionsWithIDs: Extensions = [
 	Paragraph,
@@ -104,7 +105,7 @@ export function getEditorExtensions(): Extensions {
 		Link.configure({
 			openOnClick: false,
 			HTMLAttributes: {
-				class: "text-primary underline underline-offset-2 hover:text-primary/80 cursor-pointer",
+				class: "text-link underline underline-offset-2 hover:text-link/80 cursor-pointer",
 			},
 		}).extend({
 			inclusive: false,
@@ -123,6 +124,9 @@ export function getEditorExtensions(): Extensions {
 			// them. Annotated because tiptap declares generateID as
 			// returning any, which propagates to the arrow.
 			generateID: (): string => nanoid(),
+		}),
+		NodeComment.configure({
+			types: contentExtensionsWithIDs.map((v) => v.name),
 		}),
 	]
 }

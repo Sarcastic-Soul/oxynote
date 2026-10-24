@@ -22,16 +22,31 @@ func TestMain(m *testing.M) {
 func Test_NewClient(t *testing.T) {
 	t.Parallel()
 
-	// nil http client falls back to the default client
-	c := NewClient(nil, "http://test.com")
-	require.NotNil(t, c)
-	assert.Same(t, http.DefaultClient, c.httpClient)
-	assert.Equal(t, "http://test.com", c.baseURL)
-
-	// explicit http client is kept
 	hc := &http.Client{}
-	c = NewClient(hc, "http://test.com")
-	assert.Same(t, hc, c.httpClient)
+
+	cc := map[string]struct {
+		HTTPClient *http.Client
+		Result     *http.Client
+	}{
+		"Nil http client falls back to the default client": {
+			Result: http.DefaultClient,
+		},
+		"Given http client is kept": {
+			HTTPClient: hc,
+			Result:     hc,
+		},
+	}
+
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			client := NewClient(c.HTTPClient, "http://test.com")
+			require.NotNil(t, client)
+			assert.Same(t, c.Result, client.httpClient)
+			assert.Equal(t, "http://test.com", client.baseURL)
+		})
+	}
 }
 
 func Test_Client_Apply(t *testing.T) {
@@ -47,38 +62,29 @@ func Test_Client_Apply(t *testing.T) {
 	}
 
 	cc := map[string]struct {
-		Ops             []Operation
-		System          bool
-		BaseURL         string
-		CloseEarly      bool
-		TruncateBody    bool
-		StatusCode      int
-		ResponseBody    string
-		ExpectedApplied int
-		ExpectedErrors  []OpError
-		ExpectedPath    string
-		Err             error
-
-		// NoRequest asserts Apply returned before any HTTP round trip.
-		NoRequest bool
+		Ops            []Operation
+		UserID         string
+		System         bool
+		BaseURL        string
+		CloseEarly     bool
+		TruncateBody   bool
+		StatusCode     int
+		ResponseBody   string
+		ExpectedErrors []OpError
+		ExpectedPath   string
+		Requests       int
+		Err            error
 	}{
-		"Operation failure skips the request": {
-			// an operation that cannot produce its wire form fails before
-			// the client builds a request at all.
-			Ops:       []Operation{func() (wireOp, error) { return wireOp{}, assert.AnError }},
-			Err:       assert.AnError,
-			NoRequest: true,
-		},
-		"Successful batch reports applied count": {
+		"Successful batch": {
 			Ops: []Operation{
 				Append(paragraph()),
 				Delete("uid-1"),
 			},
-			StatusCode:      200,
-			ResponseBody:    `{"applied": 2, "errors": []}`,
-			ExpectedApplied: 2,
-			ExpectedErrors:  []OpError{},
-			ExpectedPath:    path,
+			StatusCode:     200,
+			ResponseBody:   `{"errors": []}`,
+			ExpectedErrors: []OpError{},
+			ExpectedPath:   path,
+			Requests:       1,
 		},
 		// the mark is what a protected branch accepts a persist on, so
 		// it has to reach the wire rather than stay a caller's intent.
@@ -86,25 +92,36 @@ func Test_Client_Apply(t *testing.T) {
 			Ops: []Operation{
 				Append(paragraph()),
 			},
-			System:          true,
-			StatusCode:      200,
-			ResponseBody:    `{"applied": 1, "errors": []}`,
-			ExpectedApplied: 1,
-			ExpectedErrors:  []OpError{},
-			ExpectedPath:    path,
+			System:         true,
+			StatusCode:     200,
+			ResponseBody:   `{"errors": []}`,
+			ExpectedErrors: []OpError{},
+			ExpectedPath:   path,
+			Requests:       1,
+		},
+		"An ordinary batch names its user": {
+			Ops: []Operation{
+				Append(paragraph()),
+			},
+			UserID:         "user-1",
+			StatusCode:     200,
+			ResponseBody:   `{"errors": []}`,
+			ExpectedErrors: []OpError{},
+			ExpectedPath:   path,
+			Requests:       1,
 		},
 		"Partial failure surfaces per-op errors": {
 			Ops: []Operation{
 				Delete("missing"),
 				Append(paragraph()),
 			},
-			StatusCode:      200,
-			ResponseBody:    `{"applied": 1, "errors": [{"index": 0, "message": "block_uid not found: missing"}]}`,
-			ExpectedApplied: 1,
+			StatusCode:   200,
+			ResponseBody: `{"errors": [{"index": 0, "message": "block_uid not found: missing"}]}`,
 			ExpectedErrors: []OpError{
 				{Index: 0, Message: "block_uid not found: missing"},
 			},
 			ExpectedPath: path,
+			Requests:     1,
 		},
 		"HTTP error becomes a Go error": {
 			Ops: []Operation{
@@ -112,42 +129,45 @@ func Test_Client_Apply(t *testing.T) {
 			},
 			StatusCode:   500,
 			ResponseBody: `{"error": "boom"}`,
+			Requests:     1,
 			Err:          assert.AnError,
 		},
 		"Empty ops returns empty result without HTTP call": {
-			Ops:             nil,
-			StatusCode:      0,
-			ExpectedApplied: 0,
-			NoRequest:       true,
+			Ops:        nil,
+			StatusCode: 0,
+			Requests:   0,
 		},
 		"Invalid base URL fails before the request": {
-			Ops:       []Operation{Delete("x")},
-			BaseURL:   "://bad",
-			Err:       assert.AnError,
-			NoRequest: true,
+			Ops:      []Operation{Delete("x")},
+			BaseURL:  "://bad",
+			Requests: 0,
+			Err:      assert.AnError,
 		},
 		"Unencodable attrs fail at marshal time": {
 			Ops: []Operation{
 				UpdateAttrs("uid", map[string]any{"bad": make(chan int)}),
 			},
-			Err:       assert.AnError,
-			NoRequest: true,
+			Requests: 0,
+			Err:      assert.AnError,
 		},
 		"Transport failure becomes a Go error": {
 			Ops:        []Operation{Delete("x")},
 			CloseEarly: true,
+			Requests:   0,
 			Err:        assert.AnError,
 		},
 		"Unreadable error body still reports the status": {
 			Ops:          []Operation{Delete("x")},
 			StatusCode:   500,
 			TruncateBody: true,
+			Requests:     1,
 			Err:          assert.AnError,
 		},
 		"Malformed success response fails decoding": {
 			Ops:          []Operation{Delete("x")},
 			StatusCode:   200,
 			ResponseBody: `{not json`,
+			Requests:     1,
 			Err:          assert.AnError,
 		},
 	}
@@ -156,9 +176,13 @@ func Test_Client_Apply(t *testing.T) {
 		t.Run(cn, func(t *testing.T) {
 			t.Parallel()
 
-			var captured capture
+			var (
+				captured capture
+				requests int
+			)
 
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests++
 				captured.path = r.URL.Path
 				captured.method = r.Method
 
@@ -190,18 +214,14 @@ func Test_Client_Apply(t *testing.T) {
 
 			client := NewClient(srv.Client(), baseURL)
 
-			res, err := client.Apply(context.Background(), docID, branchID, c.Ops, c.System)
+			res, err := client.Apply(context.Background(), docID, branchID, c.Ops, c.UserID, c.System)
 			testutil.AssertEqualError(t, c.Err, err)
-
-			if c.NoRequest {
-				assert.Empty(t, captured.method, "Apply must return before any HTTP request is made")
-			}
+			assert.Equal(t, c.Requests, requests)
 
 			if c.Err != nil {
 				return
 			}
 
-			assert.Equal(t, c.ExpectedApplied, res.Applied)
 			assert.Equal(t, c.ExpectedErrors, res.Errors)
 
 			if len(c.Ops) > 0 {
@@ -212,6 +232,107 @@ func Test_Client_Apply(t *testing.T) {
 				require.True(t, ok, "request body should carry operations array")
 				assert.Len(t, ops, len(c.Ops))
 				assert.Equal(t, c.System, captured.body["system"])
+
+				if c.UserID == "" {
+					assert.NotContains(t, captured.body, "userId")
+				} else {
+					assert.Equal(t, c.UserID, captured.body["userId"])
+				}
+			}
+		})
+	}
+}
+
+func Test_Client_Flush(t *testing.T) {
+	t.Parallel()
+
+	docID, branchID := xid.New(), xid.New()
+	path := "/api/internal/documents/" + docID.String() + "/branches/" + branchID.String() + "/flush"
+
+	cc := map[string]struct {
+		BaseURL      string
+		CloseEarly   bool
+		StatusCode   int
+		Body         string
+		TruncateBody bool
+		Requests     int
+		Err          error
+	}{
+		"Invalid base URL": {
+			BaseURL:  "://bad",
+			Requests: 0,
+			Err:      assert.AnError,
+		},
+		"Transport error": {
+			CloseEarly: true,
+			Requests:   0,
+			Err:        assert.AnError,
+		},
+		"Non-204 status surfaces the body": {
+			StatusCode: http.StatusInternalServerError,
+			Body:       `{"error":"pending changes could not be stored"}`,
+			Requests:   1,
+			Err:        assert.AnError,
+		},
+		"Unreadable error body": {
+			StatusCode:   http.StatusInternalServerError,
+			TruncateBody: true,
+			Requests:     1,
+			Err:          assert.AnError,
+		},
+		"Successful flush": {
+			StatusCode: http.StatusNoContent,
+			Requests:   1,
+		},
+	}
+
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			var (
+				gotPath, gotMethod string
+				requests           int
+			)
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests++
+				gotPath, gotMethod = r.URL.Path, r.Method
+
+				// declare a longer body than is written, so the client's
+				// read of the error body fails.
+				if c.TruncateBody {
+					w.Header().Set("Content-Length", "100")
+				}
+
+				w.WriteHeader(c.StatusCode)
+				_, err := w.Write([]byte(c.Body))
+				assert.NoError(t, err)
+			}))
+			defer srv.Close()
+
+			base := srv.URL
+			if c.BaseURL != "" {
+				base = c.BaseURL
+			}
+
+			if c.CloseEarly {
+				srv.Close()
+			}
+
+			err := NewClient(srv.Client(), base).Flush(context.Background(), docID, branchID)
+			testutil.AssertEqualError(t, c.Err, err)
+			assert.Equal(t, c.Requests, requests)
+
+			if c.StatusCode == 0 {
+				return
+			}
+
+			assert.Equal(t, path, gotPath)
+			assert.Equal(t, http.MethodPost, gotMethod)
+
+			if c.Body != "" {
+				assert.Contains(t, err.Error(), c.Body)
 			}
 		})
 	}
@@ -241,7 +362,7 @@ func Test_Client_endpoint(t *testing.T) {
 		t.Run(cn, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := NewClient(nil, c.BaseURL).endpoint(docID, branchID)
+			got, err := NewClient(nil, c.BaseURL).endpoint(docID, branchID, "operations")
 			testutil.AssertEqualError(t, c.Err, err)
 			assert.Equal(t, c.Expected, got)
 		})

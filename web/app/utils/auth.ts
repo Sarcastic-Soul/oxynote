@@ -17,6 +17,16 @@ export function postAuthDocumentUrl(
 	return `${baseUrl || ""}${next ? decodeURIComponent(next) : defaultPath}`
 }
 
+// a server redirect to the login page cannot put the hash in next, because
+// the server never sees one. The browser keeps it on the login url instead,
+// so it is added back here
+export function nextUrlWithHash(
+	next: string | undefined,
+	hash: string,
+): string | undefined {
+	return next ? next + encodeURIComponent(hash) : undefined
+}
+
 // the accept page renders from these parameters before the invitee has a
 // session. auth-realtime builds the same link for the invitation email
 // (invitationLink in server/auth-realtime/src/auth.ts).
@@ -39,6 +49,21 @@ export function acceptInvitationUrl(
 	})
 
 	return `${baseUrl || ""}/accept-invite?${query.toString()}`
+}
+
+// whether a login or signup page was opened on the way to accepting an
+// invitation. The next path arrives URI-encoded, and a malformed one is no
+// invitation.
+export function isInvitationRedirect(next: unknown): boolean {
+	if (typeof next !== "string") {
+		return false
+	}
+
+	try {
+		return decodeURIComponent(next).startsWith("/accept-invite")
+	} catch {
+		return false
+	}
 }
 
 export function postEmailVerificationUrl(

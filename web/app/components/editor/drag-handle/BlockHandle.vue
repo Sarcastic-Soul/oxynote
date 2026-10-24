@@ -4,8 +4,9 @@ import { DragHandle } from "./MainElement"
 import type { Editor } from "@tiptap/vue-3"
 import type { Node } from "@tiptap/pm/model"
 import type { HocuspocusProvider } from "@hocuspocus/provider"
-import { cn } from "~/lib/utils"
+import { cn } from "#layers/ui/app/lib/utils"
 import HookMenuContent from "../hooks/HookMenuContent.vue"
+import { HOOK_ICON_STATUS_CLASS, hookGroupStatus } from "../hooks/hook-status"
 import CoreMenu from "./menu-options/CoreMenu.vue"
 import { useHighlightOverlay } from "../highlight-overlay"
 
@@ -15,7 +16,9 @@ const MENU_CLOSE_ANIMATION_DURATION = 150
 
 const props = defineProps<{
 	editor: Editor
-	documentHooks?: DocumentHook[]
+	activeBranchHooks?: DocumentHook[]
+	// given only where the diff can be shown
+	targetBranchHooks?: DocumentHook[]
 	dataSyncProvider?: HocuspocusProvider | null
 }>()
 const emit = defineEmits<{
@@ -24,23 +27,21 @@ const emit = defineEmits<{
 		pos: number,
 	): void
 	(e: "open-settings", target: "github"): void
+	// the uid of the block the handle shows on, null once it hides
+	(e: "hovered-block-change", blockId: string | null): void
 }>()
 
-const { isLocked, updateLock, isEditable } = useEditorMeta()
+const { isLocked, updateLock, isReadOnlyOrDiff } = useEditorMeta()
 const { isScrolling } = useWindowScroll()
 const isMinWidth1024px = useMediaQuery("(min-width: 1024px)")
-const editorStore = useEditorStore()
 
-const isEditingDisabled = computed(() => {
-	return !isEditable.value || editorStore.reviewableDiffActive
-})
 const { show: showHighlight, hide: hideHighlight } = useHighlightOverlay()
 const nodeActionMenuOpen = ref(false)
 const hookMenuOpen = ref(false)
 const hoveringDrag = ref(false)
 
-const processedDocumentHooks = computed(() => {
-	return props.documentHooks ?? []
+const processedActiveBranchHooks = computed(() => {
+	return props.activeBranchHooks ?? []
 })
 const hoveredNodePos = ref<number | null>(null)
 const hoveredMetadata = computed(() => {
@@ -54,7 +55,7 @@ const hoveredMetadata = computed(() => {
 	}
 
 	const nodeId = node.attrs.uid as string
-	const hooks = processedDocumentHooks.value.filter((h) => {
+	const hooks = processedActiveBranchHooks.value.filter((h) => {
 		return h.blockId === nodeId
 	})
 
@@ -63,11 +64,7 @@ const hoveredMetadata = computed(() => {
 		nodePos: hoveredNodePos.value,
 		nodeId: nodeId,
 		nodeHooks: hooks.length ? hooks : null,
-		nodeHookStatus: hooks.length
-			? hooks.some((h) => Number(h.score) === 0)
-				? ("stale" as const)
-				: ("fresh" as const)
-			: null,
+		nodeHookStatus: hookGroupStatus(hooks),
 	}
 })
 const compactHandles = computed(() => {
@@ -101,6 +98,12 @@ watch([nodeActionMenuOpen, hookMenuOpen], ([nodeOpen, hookOpen]) => {
 whenever(isScrolling, () => {
 	removeDragOverlay()
 })
+watch(
+	() => hoveredMetadata.value?.nodeId ?? null,
+	(blockId) => {
+		emit("hovered-block-change", blockId)
+	},
+)
 
 function handleNodeHover(data: { pos: number; node: Node | null }) {
 	if (!data.node) {
@@ -163,7 +166,7 @@ function removeDragOverlay() {
 }
 
 function dragStart(e: DragEvent) {
-	if (isEditingDisabled.value) {
+	if (isReadOnlyOrDiff.value) {
 		e.preventDefault()
 		return
 	}
@@ -188,7 +191,7 @@ function dragEnd() {
 		:provider="props.dataSyncProvider"
 		:locked="isLocked"
 		:on-drag-cancel="dragEnd"
-		class="z-drag-handle pr-1.5"
+		class="z-drag-handle pr-1 transition-[opacity,visibility] duration-100 lg:pr-1.5"
 		@node-change="handleNodeHover"
 		@mouseenter="handleDragHoverEnter"
 		@mouseleave="handleDragHoverLeave"
@@ -197,11 +200,15 @@ function dragEnd() {
 		@dragstart="dragStart"
 		@dragend="dragEnd"
 	>
+		<!--
+			the narrow handle keeps a smaller gap to the block, which centres it
+			over the hook diff marker below it
+		-->
 		<div
 			class="flex flex-col items-center gap-0.25 rounded-md bg-background-translucent lg:flex-row"
 		>
 			<ShadcnUiDropdownMenu
-				v-if="!compactHandles && !isEditingDisabled"
+				v-if="!compactHandles"
 				@update:open="(value: boolean) => (hookMenuOpen = value)"
 			>
 				<ShadcnUiDropdownMenuTrigger as-child>
@@ -219,12 +226,7 @@ function dragEnd() {
 						<Icon
 							:data-hook-status="hoveredMetadata?.nodeHookStatus"
 							name="mingcute:leaf-line"
-							:class="
-								cn(
-									'mt-0.25 size-4.5',
-									'data-[hook-status=fresh]:text-hook-status-fresh data-[hook-status=stale]:text-hook-status-stale',
-								)
-							"
+							:class="cn('mt-0.25 size-4.5', HOOK_ICON_STATUS_CLASS)"
 						/>
 					</div>
 					<span class="sr-only">
@@ -233,7 +235,8 @@ function dragEnd() {
 				</ShadcnUiDropdownMenuTrigger>
 				<ShadcnUiDropdownMenuContent side="right" align="start" loop>
 					<HookMenuContent
-						:document-hooks="processedDocumentHooks"
+						:active-branch-hooks="processedActiveBranchHooks"
+						:target-branch-hooks="props.targetBranchHooks"
 						:node-id="hoveredMetadata?.nodeId || null"
 						@open-settings="(target: 'github') => emit('open-settings', target)"
 					/>
@@ -249,7 +252,7 @@ function dragEnd() {
 							cn(
 								'flex h-5 w-3 items-center justify-center rounded-sm text-foreground/50 lg:h-5.5 lg:w-4 lg:rounded-md',
 								'hover:bg-sidebar-accent/50 active:bg-sidebar-accent data-menu-open:bg-sidebar-accent/50 data-menu-open:active:bg-sidebar-accent/50',
-								isEditingDisabled ? 'cursor-pointer' : 'cursor-grab',
+								isReadOnlyOrDiff ? 'cursor-pointer' : 'cursor-grab',
 							)
 						"
 					>
@@ -265,9 +268,10 @@ function dragEnd() {
 					</span>
 				</ShadcnUiDropdownMenuTrigger>
 				<ShadcnUiDropdownMenuContent side="left" align="start" loop>
-					<template v-if="compactHandles && !isEditingDisabled">
+					<template v-if="compactHandles">
 						<HookMenuContent
-							:document-hooks="processedDocumentHooks"
+							:active-branch-hooks="processedActiveBranchHooks"
+							:target-branch-hooks="props.targetBranchHooks"
 							:node-id="hoveredMetadata?.nodeId || null"
 							@open-settings="
 								(target: 'github') => emit('open-settings', target)

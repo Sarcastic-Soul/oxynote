@@ -262,27 +262,90 @@ func Test_Document_ApplyBranchUpdate(t *testing.T) {
 	}
 }
 
-func Test_Document_HistoryEntry(t *testing.T) {
+func Test_Document_Title(t *testing.T) {
 	t.Parallel()
 
-	doc := stubDocument()
-	doc.UpdatedAt = time.Date(2026, 1, 1, 10, 44, 30, 0, time.UTC)
+	cc := map[string]struct {
+		BranchName string
+		Default    bool
+		Result     string
+	}{
+		"Default branch shows the name only": {
+			BranchName: DefaultBranch,
+			Default:    true,
+			Result:     "Runbook",
+		},
+		"Other branch appends the branch name": {
+			BranchName: "feature-x",
+			Result:     "Runbook on branch feature-x",
+		},
+	}
 
-	entry := doc.HistoryEntry()
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
 
-	// the timestamp is truncated to the 30-minute aggregation window.
-	assert.Equal(t, doc.ID.String()+"-"+doc.BranchID.String()+"-2026-01-01T10:30:00", entry.ID)
-	assert.Equal(t, doc.ID, entry.DocumentID)
-	assert.Equal(t, doc.Content, entry.Content)
-	assert.Equal(t, doc.RawContent, entry.RawContent)
-	assert.Equal(t, doc.UpdatedAt, entry.CreatedAt)
+			doc := stubDocument()
+			doc.BranchName = c.BranchName
+			doc.Default = c.Default
 
-	// a second branch of the same document updated within the same window
-	// keeps an entry of its own.
-	other := doc
-	other.BranchID = xid.New()
+			assert.Equal(t, c.Result, doc.Title())
+		})
+	}
+}
 
-	assert.NotEqual(t, entry.ID, other.HistoryEntry().ID)
+func Test_Document_SnapshotEqual(t *testing.T) {
+	t.Parallel()
+
+	cc := map[string]struct {
+		Mutate func(d *Document)
+		Equal  bool
+	}{
+		"Identical": {
+			Mutate: func(_ *Document) {},
+			Equal:  true,
+		},
+		"Different name": {
+			Mutate: func(d *Document) {
+				d.DocumentName = "Other"
+			},
+		},
+		"Different icon": {
+			Mutate: func(d *Document) {
+				d.Icon = "📕"
+			},
+		},
+		"Different block": {
+			Mutate: func(d *Document) {
+				d.Content.Content = d.Content.Content[1:]
+			},
+		},
+		"Different attribute": {
+			Mutate: func(d *Document) {
+				d.Content.Content[0].Attrs = map[string]any{"uid": "changed"}
+			},
+		},
+		"Different raw content only": {
+			Mutate: func(d *Document) {
+				d.RawContent = []byte("other")
+			},
+			Equal: true,
+		},
+	}
+
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			doc := stubDocument()
+			other := stubDocument()
+			other.ID = doc.ID
+			other.BranchID = doc.BranchID
+			c.Mutate(&other)
+
+			assert.Equal(t, c.Equal, doc.SnapshotEqual(other))
+		})
+	}
 }
 
 func Test_Document_Duplicate(t *testing.T) {
@@ -327,8 +390,8 @@ func Test_Document_Duplicate(t *testing.T) {
 			doc.Content.Content[0] = Block{
 				Type: BlockNodeImageBlock,
 				Attrs: Attributes{
-					"uid": "img1",
-					"src": "https://app.test/core" + FilePath(doc.ID, "img1", "shot.png"),
+					"uid": "img-1-aaaaaaaaaaaaaaa",
+					"src": "https://app.test/core" + FilePath(doc.ID, "img-1-aaaaaaaaaaaaaaa", "shot.png"),
 				},
 			}
 
@@ -337,7 +400,7 @@ func Test_Document_Duplicate(t *testing.T) {
 				Check: func(t *testing.T, _, dup Document, files map[string]string) {
 					require.Len(t, files, 1)
 
-					newID, ok := files["img1"]
+					newID, ok := files["img-1-aaaaaaaaaaaaaaa"]
 					require.True(t, ok)
 
 					// the duplicate refers to its own copy under its own document.
@@ -377,54 +440,116 @@ func Test_NewDocumentContent(t *testing.T) {
 	assert.Len(t, uid, 21)
 }
 
+func Test_UpdateInput_AddsMaintainers(t *testing.T) {
+	cc := map[string]struct {
+		Maintainers []string
+		Stored      []string
+		Result      bool
+	}{
+		"New maintainer":         {Maintainers: []string{"u1", "u2"}, Stored: []string{"u1"}, Result: true},
+		"Known maintainers only": {Maintainers: []string{"u1"}, Stored: []string{"u1", "u2"}},
+		"No maintainers":         {Stored: []string{"u1"}},
+		"Nobody stored yet":      {Maintainers: []string{"u1"}, Result: true},
+	}
+
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, c.Result, UpdateInput{Maintainers: c.Maintainers}.AddsMaintainers(c.Stored))
+		})
+	}
+}
+
+func Test_NewWelcomeDocument(t *testing.T) {
+	t.Parallel()
+
+	doc, err := NewWelcomeDocument("org1", "u1", null.Value[xid.ID]{})
+	require.NoError(t, err)
+
+	assert.Equal(t, "Welcome to Oxynote!", doc.DocumentName)
+	assert.Equal(t, "mingcute:flag-4-fill", doc.Icon)
+	assert.Equal(t, "org1", doc.OrganizationID)
+	assert.Equal(t, null.StringFrom("u1"), doc.CreatedBy)
+	assert.True(t, doc.Default)
+	assert.Equal(t, BlockNodeDoc, doc.Content.Type)
+	assert.NotEmpty(t, doc.Content.Content)
+}
+
 func Test_InitialDocumentContent(t *testing.T) {
 	t.Parallel()
 
 	dataSourceID := xid.New()
 
-	rb, err := InitialDocumentContent(null.ValueFrom(dataSourceID))
-	require.NoError(t, err)
+	cc := map[string]struct {
+		DataSourceID null.Value[xid.ID]
+		Check        func(t *testing.T, rb RootBlock)
+	}{
+		"Charts read the data source": {
+			DataSourceID: null.ValueFrom(dataSourceID),
+			Check: func(t *testing.T, rb RootBlock) {
+				assert.Equal(t, BlockNodeDoc, rb.Type)
 
-	assert.Equal(t, BlockNodeDoc, rb.Type)
-	assert.NotEmpty(t, rb.Content)
+				// every dataSourceId attribute in the tree points at the given
+				// data source, and every uid is regenerated (21 chars).
+				var (
+					dataSourceAttrs int
+					metrics         int
+					checkBlock      func(b Block)
+				)
 
-	// every dataSourceId attribute in the tree points at the given
-	// data source, and every uid is regenerated (21 chars).
-	var (
-		dataSourceAttrs int
-		checkBlock      func(b Block)
-	)
+				checkBlock = func(b Block) {
+					if v, ok := b.Attrs["dataSourceId"]; ok {
+						dataSourceAttrs++
 
-	checkBlock = func(b Block) {
-		if v, ok := b.Attrs["dataSourceId"]; ok {
-			dataSourceAttrs++
+						assert.Equal(t, dataSourceID.String(), v)
+					}
 
-			assert.Equal(t, dataSourceID.String(), v)
-		}
+					if uid, ok := b.UID(); ok {
+						assert.Len(t, uid, 21)
+					}
 
-		if uid, ok := b.UID(); ok {
-			assert.Len(t, uid, 21)
-		}
+					// every chart follows the built-in metric variables.
+					if b.Type == BlockNodeMetricBlock {
+						metrics++
 
-		for _, cb := range b.Content {
-			checkBlock(cb)
-		}
+						assert.Equal(t, "$metric_range", b.Attrs[AttrTimeRange])
+						assert.Equal(t, "$metric_refresh", b.Attrs[AttrRefreshInterval])
+					}
+
+					for _, cb := range b.Content {
+						checkBlock(cb)
+					}
+				}
+
+				for _, b := range rb.Content {
+					checkBlock(b)
+				}
+
+				assert.NotZero(t, dataSourceAttrs, "the seeded content should reference the data source")
+				assert.NotZero(t, metrics)
+			},
+		},
+		// without a data source the charts have nothing to read, so they are
+		// dropped instead of pointing at an id that was never stored.
+		"Charts dropped without a data source": {
+			Check: func(t *testing.T, rb RootBlock) {
+				for _, b := range rb.Content {
+					assert.NotEqual(t, BlockNodeMetricBlock, b.Type)
+				}
+			},
+		},
 	}
 
-	for _, b := range rb.Content {
-		checkBlock(b)
-	}
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
 
-	assert.NotZero(t, dataSourceAttrs, "the seeded content should reference the data source")
+			rb, err := InitialDocumentContent(c.DataSourceID)
+			require.NoError(t, err)
 
-	// without a data source the charts have nothing to read, so they are
-	// dropped instead of pointing at an id that was never stored.
-	rb, err = InitialDocumentContent(null.Value[xid.ID]{})
-	require.NoError(t, err)
-
-	assert.NotEmpty(t, rb.Content)
-
-	for _, b := range rb.Content {
-		assert.NotEqual(t, BlockNodeMetricBlock, b.Type)
+			assert.NotEmpty(t, rb.Content)
+			c.Check(t, rb)
+		})
 	}
 }

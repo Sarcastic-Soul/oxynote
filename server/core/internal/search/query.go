@@ -4,15 +4,29 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/blevesearch/bleve/v2"
 	bleveSearch "github.com/blevesearch/bleve/v2/search"
 	"github.com/blevesearch/bleve/v2/search/query"
+	"github.com/oxynote/oxynote/server/core/pkg/errutil"
 	"github.com/rs/xid"
 )
 
 const (
+	// MaxQueryLength caps a search query in characters. Every term
+	// expands to a dictionary walk inside the process, so the query size
+	// bounds the work one request can ask for.
+	MaxQueryLength = 200
+
+	// _minPagedQueryLength is the fewest characters a query of the paged
+	// searches holds, surrounding spaces excluded. Shorter terms match
+	// too much of the dictionary to rank.
+	_minPagedQueryLength = 2
+
 	// _searchResultLimit caps the number of hits the search endpoint
 	// returns.
 	_searchResultLimit = 30
@@ -45,6 +59,30 @@ const (
 	_maxTermSearchers = 1024
 )
 
+// ErrInvalidQuery is returned when a search query is empty or over
+// MaxQueryLength, or when a paged search query is too short.
+var ErrInvalidQuery = errutil.New(http.StatusBadRequest, "document.invalid_search_query", "invalid search query")
+
+// ValidateQuery reports whether the query is one the index will run.
+func ValidateQuery(q string) error {
+	if q == "" || utf8.RuneCountInString(q) > MaxQueryLength {
+		return ErrInvalidQuery
+	}
+
+	return nil
+}
+
+// validatePagedQuery reports whether the query is one the paged searches
+// run. On top of ValidateQuery, they refuse one under
+// _minPagedQueryLength.
+func validatePagedQuery(q string) error {
+	if utf8.RuneCountInString(strings.TrimSpace(q)) < _minPagedQueryLength {
+		return ErrInvalidQuery
+	}
+
+	return ValidateQuery(q)
+}
+
 // SearchDocuments searches the organization's entries and returns them as
 // the search endpoint's JSON: the matched terms wrapped in mark tags and
 // the text cropped to a fragment around the best match.
@@ -72,6 +110,10 @@ func (i *Index) SearchDocumentBlocks(ctx context.Context, organizationID, q stri
 
 // search runs the query and decodes the hits.
 func (i *Index) search(ctx context.Context, organizationID, q string, limit int, highlight bool) ([]Block, error) {
+	if err := ValidateQuery(q); err != nil {
+		return nil, err
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, _searchTimeout)
 	defer cancel()
 
@@ -219,6 +261,21 @@ func (i *Index) decodeHit(id string, fields map[string]any) (Block, error) {
 			Warn("search entry field is not a boolean")
 	}
 
+	var attrs map[string]string
+
+	for field := range fields {
+		key, ok := strings.CutPrefix(field, _fieldAttrs+".")
+		if !ok {
+			continue
+		}
+
+		if attrs == nil {
+			attrs = make(map[string]string)
+		}
+
+		attrs[key] = str(field)
+	}
+
 	return Block{
 		ID:             id,
 		OrganizationID: str(_fieldOrganizationID),
@@ -228,5 +285,6 @@ func (i *Index) decodeHit(id string, fields map[string]any) (Block, error) {
 		BranchDefault:  def,
 		Type:           str(_fieldType),
 		Text:           str(_fieldText),
+		Attrs:          attrs,
 	}, nil
 }

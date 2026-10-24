@@ -1,8 +1,10 @@
 <script lang="ts" setup>
 import { NodeViewContent, nodeViewProps, NodeViewWrapper } from "@tiptap/vue-3"
-import { cn } from "~/lib/utils"
+import { cn } from "#layers/ui/app/lib/utils"
 import { explicitContentPlaceholder } from "../../placeholder"
 import { DiffStatus } from "../../diff/position-map"
+import DiffChangeMarker from "../../diff/DiffChangeMarker.vue"
+import MermaidDiffDetails from "./MermaidDiffDetails.vue"
 import MermaidPreview from "./MermaidPreview.vue"
 
 const props = defineProps(nodeViewProps)
@@ -55,9 +57,6 @@ const diffStatus = computed(
 	() => props.node.attrs.diffStatus as DiffStatus | null,
 )
 
-// for added/removed, apply node-level diff class always.
-// for modified, only apply when the code is hidden (otherwise
-// text-level inline diffs are shown).
 const diffClass = computed(() => {
 	if (diffStatus.value === DiffStatus.Added) {
 		return "diff-added"
@@ -65,10 +64,6 @@ const diffClass = computed(() => {
 
 	if (diffStatus.value === DiffStatus.Removed) {
 		return "diff-removed"
-	}
-
-	if (diffStatus.value === DiffStatus.Modified && !showCode.value) {
-		return "diff-modified"
 	}
 
 	return null
@@ -124,7 +119,10 @@ watch(showCode, () => {
 		>
 			{{ lastOtherEditingUser?.name }}
 		</div>
-		<div class="absolute top-1 right-1.5 z-1">
+		<div class="absolute top-1 right-1.5 z-1 flex items-center gap-1">
+			<DiffChangeMarker :node="props.node">
+				<MermaidDiffDetails :node="props.node" />
+			</DiffChangeMarker>
 			<ShadcnUiButton
 				variant="ghost-plain"
 				size="icon-sm"

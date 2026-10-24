@@ -14,6 +14,7 @@ func (a *agent) InsertDocumentHook(ctx context.Context, hk hook.Hook) error {
 	q, args := a.builder.Insert("document_hooks").
 		SetMap(map[string]any{
 			"id":                 hk.ID,
+			"cross_branch_id":    hk.CrossBranchID,
 			"type":               hk.Type,
 			"fk_document_id":     hk.DocumentID,
 			"fk_organization_id": hk.OrganizationID,
@@ -21,6 +22,7 @@ func (a *agent) InsertDocumentHook(ctx context.Context, hk hook.Hook) error {
 			"block_id":           hk.BlockID,
 			"settings":           hk.Settings,
 			"state":              hk.State,
+			"status":             hk.Status,
 			"score":              hk.Score,
 			"created_at":         hk.CreatedAt,
 			"updated_at":         hk.UpdatedAt,
@@ -48,24 +50,6 @@ func (a *agent) FetchDocumentHook(ctx context.Context, id xid.ID, organizationID
 	}
 
 	return hk, nil
-}
-
-// FetchDocumentHooksByDocumentID retrieves all document hooks associated
-// with a specific document ID from the database.
-func (a *agent) FetchDocumentHooksByDocumentID(ctx context.Context, documentID xid.ID, organizationID string) ([]hook.Hook, error) {
-	q, args := a.selectDocumentHook(a.builder.Select()).
-		Where(sq.Eq{
-			"document_hooks.fk_document_id":     documentID,
-			"document_hooks.fk_organization_id": organizationID,
-		}).
-		MustSql()
-
-	hooks := []hook.Hook{}
-	if err := sqlx.SelectContext(ctx, a.sql, &hooks, q, args...); err != nil {
-		return nil, err
-	}
-
-	return hooks, nil
 }
 
 // FetchDocumentHooksByOrganizationID retrieves every hook of an organization.
@@ -111,6 +95,7 @@ func (a *agent) UpdateDocumentHook(ctx context.Context, hk hook.Hook) error {
 		SetMap(map[string]any{
 			"settings":        hk.Settings,
 			"state":           hk.State,
+			"status":          hk.Status,
 			"score":           hk.Score,
 			"updated_at":      hk.UpdatedAt,
 			"soft_deleted_at": hk.SoftDeletedAt,
@@ -186,6 +171,7 @@ func (a *agent) DetachDocumentHooksByBranchID(ctx context.Context, branchID xid.
 func (a *agent) selectDocumentHook(b sq.SelectBuilder) sq.SelectBuilder {
 	return b.Columns(
 		`document_hooks.id AS "id"`,
+		`document_hooks.cross_branch_id AS "cross_branch_id"`,
 		`document_hooks.type AS "type"`,
 		`document_hooks.fk_document_id AS "fk_document_id"`,
 		`document_hooks.fk_organization_id AS "fk_organization_id"`,
@@ -197,5 +183,6 @@ func (a *agent) selectDocumentHook(b sq.SelectBuilder) sq.SelectBuilder {
 		`document_hooks.created_at AS "created_at"`,
 		`document_hooks.updated_at AS "updated_at"`,
 		`document_hooks.soft_deleted_at AS "soft_deleted_at"`,
+		`document_hooks.status AS "status"`,
 	).From("document_hooks")
 }

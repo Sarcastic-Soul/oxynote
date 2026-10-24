@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -38,6 +40,9 @@ const _sendTimeout = 30 * time.Second
 // _linkKey is the template argument carrying the action URL.
 const _linkKey = "link"
 
+// _hostKey is the template argument carrying the instance's host.
+const _hostKey = "host"
+
 // Config holds SMTP connection settings for the email sender.
 type Config struct {
 	// Host is the SMTP server host. When empty, email sending is
@@ -61,6 +66,10 @@ type Config struct {
 	// FromAddress is the address emails are sent from, in
 	// "Name <address>" or plain "address" form.
 	FromAddress string
+
+	// PublicURL is the instance's public URL. Its host is named in the
+	// footer of every email.
+	PublicURL string
 }
 
 // _maxSendRetries caps the retries of one delivery.
@@ -75,21 +84,28 @@ type Sender struct {
 	// field so tests can substitute a faster one.
 	backoffStrategy func() backoff.BackOff
 
-	supv      *xync.Supervisor
-	fromEmail string
+	supv       *xync.Supervisor
+	fromEmail  string
+	publicHost string
 }
 
 // NewSender creates a fresh instance of email sender.
 // An empty cfg.Host yields a sender with sending disabled: every email
 // is logged instead of sent.
 func NewSender(log *slog.Logger, cfg Config) (*Sender, error) {
+	publicURL, err := url.Parse(cfg.PublicURL)
+	if err != nil || publicURL.Host == "" {
+		return nil, fmt.Errorf("invalid public url %q", cfg.PublicURL)
+	}
+
 	sender := &Sender{
 		log: log,
 		backoffStrategy: func() backoff.BackOff {
 			return backoff.NewExponentialBackOff()
 		},
-		supv:      xync.NewSupervisor(),
-		fromEmail: cfg.FromAddress,
+		supv:       xync.NewSupervisor(),
+		fromEmail:  cfg.FromAddress,
+		publicHost: publicURL.Host,
 	}
 
 	if cfg.Host == "" {
@@ -151,7 +167,10 @@ func (s *Sender) send(toEmail, subject string, tmpl Template, args map[string]st
 		return
 	}
 
-	body, err := render(tmpl, args)
+	vars := map[string]string{_hostKey: s.publicHost}
+	maps.Copy(vars, args)
+
+	body, err := render(tmpl, vars)
 	if err != nil {
 		s.log.Error(
 			"cannot render email template",
@@ -238,98 +257,24 @@ func (s *Sender) deliver(ctx context.Context, msg *mail.Msg, toEmail, subject st
 	)
 }
 
-// SendEmailVerification sends an email regarding new email
-// verification with the token, embedded into a full URL, to the
-// specified email address.
-func (s *Sender) SendEmailVerification(eml, link string) {
-	s.send(
-		eml,
-		"Verify your new email address",
-		TemplateEmailVerification,
-		map[string]string{
-			_linkKey: link,
-		},
-	)
-}
+// Send sends the given template to the recipient in d, rendered with the
+// values d carries. Delivery runs on its own and never reports back: the
+// only error is a template that cannot be sent.
+func (s *Sender) Send(tmpl Template, d Data) error {
+	if err := tmpl.Validate(); err != nil {
+		return err
+	}
 
-// SendEmailChangeConfirmation sends an email asking the current address to
-// approve a change of address, with the approval link.
-func (s *Sender) SendEmailChangeConfirmation(eml, link string) {
-	s.send(
-		eml,
-		"Approve your email address change",
-		TemplateEmailChangeConfirmation,
-		map[string]string{
-			_linkKey: link,
-		},
-	)
-}
+	sp := _specs[tmpl]
 
-// SendOrganizationInvitation sends an email regarding
-// organization invitation with the token, embedded into a full URL, to the
-// specified email address.
-func (s *Sender) SendOrganizationInvitation(eml, org, link string) {
-	s.send(
-		eml,
-		fmt.Sprintf("Join %s on Oxynote", org),
-		TemplateOrganizationInvitation,
-		map[string]string{
-			_linkKey:       link,
-			"organization": org,
-		},
-	)
-}
+	subject := sp.subject
+	if sp.subjectFrom != nil {
+		subject = sp.subjectFrom(d)
+	}
 
-// SendUserDeletionConfirmation sends an email to confirm account deletion
-// with a verification link.
-func (s *Sender) SendUserDeletionConfirmation(eml, link string) {
-	s.send(
-		eml,
-		"Confirm your account deletion",
-		TemplateUserDeletion,
-		map[string]string{
-			_linkKey: link,
-		},
-	)
-}
+	s.send(d.Email, subject, tmpl, sp.args(d))
 
-// SendPasswordReset sends an email with a password reset link to the
-// specified email address.
-func (s *Sender) SendPasswordReset(eml, link string) {
-	s.send(
-		eml,
-		"Reset your password",
-		TemplatePasswordReset,
-		map[string]string{
-			_linkKey: link,
-		},
-	)
-}
-
-// SendSignupVerification sends the initial account-activation email
-// with a verification link to a freshly signed-up email address.
-func (s *Sender) SendSignupVerification(eml, link string) {
-	s.send(
-		eml,
-		"Confirm your email address",
-		TemplateSignupVerification,
-		map[string]string{
-			_linkKey: link,
-		},
-	)
-}
-
-// SendAccountExists notifies the owner of an existing account that a
-// signup was attempted with their email address, with a login link.
-func (s *Sender) SendAccountExists(eml, link string) {
-	s.send(
-		eml,
-		"You already have an Oxynote account",
-		TemplateAccountExists,
-		map[string]string{
-			_linkKey: link,
-		},
-	)
+	return nil
 }
 
 // client is an interface that handles communication with the SMTP

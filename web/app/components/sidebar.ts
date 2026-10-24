@@ -1,13 +1,19 @@
+import type { Component } from "vue"
+
 export type PlainActionFn = (() => void) | (() => Promise<void>)
 
 // SidebarItemAction is one entry of a row's dropdown menu. A row with no
-// actions renders no menu at all.
-export interface SidebarItemAction {
+// actions renders no menu at all. An entry either runs fn when pressed or
+// opens menu to the side, a component with controls of its own that emits
+// close once it is done with the whole menu.
+export type SidebarItemAction = {
 	id: string
 	name: string
 	icon: string
-	fn: PlainActionFn
-}
+} & (
+	| { fn: PlainActionFn }
+	| { menu: { component: Component; props: Record<string, unknown> } }
+)
 
 export const SIDEBAR_ITEM_PLACEHOLDER_ID = "placeholder"
 const TAG_DRAG_GROUP = "tags"
@@ -38,7 +44,9 @@ export interface SidebarItem {
 	icon?: string | null
 	dotColor?: string // a coloured dot rendered in place of the icon
 	count?: number | null
+	countTooltip?: string
 	active: boolean
+	disabled?: boolean
 	draggable: boolean
 	// items may only be dropped onto or next to items sharing this group,
 	// which keeps each section's rows out of every other section
@@ -248,4 +256,30 @@ export function documentTreeBreadcrumbs(
 	}
 
 	return []
+}
+
+// documentTreeByLevel lists the tree one level at a time, the roots first.
+// Within a level every parent gives its first child before any parent
+// gives its second, so no branch of the tree fills the front alone.
+export function documentTreeByLevel(
+	tree: DocumentTreeElement[],
+): DocumentTreeElement[] {
+	const res: DocumentTreeElement[] = []
+	let level = tree
+
+	while (level.length) {
+		res.push(...level)
+
+		const families = level.map((elem) => elem.children ?? [])
+		const longest = Math.max(...families.map((family) => family.length))
+		const next: DocumentTreeElement[] = []
+
+		for (let i = 0; i < longest; i++) {
+			next.push(...families.flatMap((family) => family[i] ?? []))
+		}
+
+		level = next
+	}
+
+	return res
 }

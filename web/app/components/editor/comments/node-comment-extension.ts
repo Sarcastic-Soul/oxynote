@@ -1,13 +1,11 @@
 import { Extension, type Editor } from "@tiptap/core"
 import type { Node } from "@tiptap/pm/model"
 import { type EditorState, Plugin, PluginKey } from "@tiptap/pm/state"
-import { cn } from "~/lib/utils"
+import { cn } from "#layers/ui/app/lib/utils"
 import { isPendingCommentId, pendingCommentBelongsToActiveUser } from "./utils"
 import { DIFF_COMMENT_TX_META } from "../diff/diff-content-lock"
 import { DiffStatus, type PositionMap } from "../diff/position-map"
 import type { DocumentComment } from "~/utils/api/comment"
-
-export const NODE_COMMENT_ID_ATTR = "nodeCommentId"
 
 export interface NodeCommentAttrs {
 	nodeCommentId: string

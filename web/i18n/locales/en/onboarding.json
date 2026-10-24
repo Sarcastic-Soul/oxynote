@@ -65,8 +65,13 @@
 					"reset": "Reset it"
 				}
 			},
+			"default-admin": {
+				"intro": "Log in with the default credentials:",
+				"outro": "Then change both in the settings."
+			},
 			"no-account": {
 				"main": "Don't have an account? {sign-up} or {learn-more}.",
+				"invitation-only": "Don't have an account? Ask a workspace member to invite you.",
 				"placeholders": {
 					"sign-up": "Sign up",
 					"learn-more": "learn more"
@@ -155,7 +160,7 @@
 				"logout": "Log out"
 			},
 			"errors": {
-				"workspace-name-regex": "Only letters, numbers, hyphens, and underscores can be used",
+				"workspace-name-regex": "Only letters, numbers, spaces, hyphens, and underscores can be used",
 				"workspace-url-regex": "Only letters, numbers, hyphens, and underscores can be used",
 				"workspace-url-taken": "This workspace URL is already taken",
 				"workspace-url-invalid": "This workspace URL is invalid",

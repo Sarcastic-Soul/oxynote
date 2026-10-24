@@ -5,6 +5,7 @@ import (
 
 	"github.com/guregu/null/v5"
 	"github.com/oxynote/oxynote/server/core/internal/document/hook"
+	"github.com/oxynote/oxynote/server/core/internal/document/hook/processor"
 	"github.com/rs/xid"
 	"github.com/stretchr/testify/assert"
 )
@@ -33,18 +34,49 @@ func Test_NewDocumentHookTriggeredNotification(t *testing.T) {
 
 	nc := NewDocumentHookTriggeredNotification(
 		documentID,
-		hook.TypeScheduledReminder,
+		hook.TypeGithubTracking,
 		null.StringFrom("blk1"),
 		branchID,
+		processor.Settings(`{"repository":"repo"}`),
+		processor.GithubTrackingSummary{ChangedPaths: 2},
 	)
 
 	assert.Equal(t, Core{
 		Code: NotificationDocumentHookTriggered,
 		Metadata: Metadata{
-			MetaKeyDocumentID: documentID,
-			MetaKeyBlockID:    null.StringFrom("blk1"),
-			MetaKeyType:       hook.TypeScheduledReminder,
-			MetaKeyBranchID:   branchID,
+			MetaKeyDocumentID:   documentID,
+			MetaKeyBlockID:      null.StringFrom("blk1"),
+			MetaKeyType:         hook.TypeGithubTracking,
+			MetaKeyBranchID:     branchID,
+			MetaKeyHookSettings: processor.Settings(`{"repository":"repo"}`),
+			MetaKeyHookSummary:  processor.GithubTrackingSummary{ChangedPaths: 2},
+		},
+	}, nc)
+}
+
+func Test_NewDocumentHookNeedsAttentionNotification(t *testing.T) {
+	t.Parallel()
+
+	documentID, branchID := xid.New(), xid.New()
+
+	nc := NewDocumentHookNeedsAttentionNotification(
+		documentID,
+		hook.TypeGithubTracking,
+		null.StringFrom("blk1"),
+		branchID,
+		processor.StatusMissingRepository,
+		processor.Settings(`{"repository":"repo"}`),
+	)
+
+	assert.Equal(t, Core{
+		Code: NotificationDocumentHookNeedsAttention,
+		Metadata: Metadata{
+			MetaKeyDocumentID:   documentID,
+			MetaKeyBlockID:      null.StringFrom("blk1"),
+			MetaKeyType:         hook.TypeGithubTracking,
+			MetaKeyBranchID:     branchID,
+			MetaKeyStatus:       processor.StatusMissingRepository,
+			MetaKeyHookSettings: processor.Settings(`{"repository":"repo"}`),
 		},
 	}, nc)
 }
@@ -60,16 +92,18 @@ func Test_NewDocumentNewCommentNotification(t *testing.T) {
 		commentID,
 		null.StringFrom("blk1"),
 		branchID,
+		"Worth a second look",
 	)
 
 	assert.Equal(t, Core{
 		Code: NotificationDocumentNewComment,
 		Metadata: Metadata{
-			MetaKeyUserID:        "user1",
-			MetaKeyDocumentID:    documentID,
-			MetaKeyCommentID:     commentID,
-			MetaKeyAnchorBlockID: null.StringFrom("blk1"),
-			MetaKeyBranchID:      branchID,
+			MetaKeyUserID:         "user1",
+			MetaKeyDocumentID:     documentID,
+			MetaKeyCommentID:      commentID,
+			MetaKeyAnchorBlockID:  null.StringFrom("blk1"),
+			MetaKeyBranchID:       branchID,
+			MetaKeyCommentExcerpt: "Worth a second look",
 		},
 	}, nc)
 }
@@ -86,6 +120,7 @@ func Test_NewDocumentNewCommentReplyNotification(t *testing.T) {
 		commentReplyID,
 		null.StringFrom("blk1"),
 		branchID,
+		"Agreed",
 	)
 
 	assert.Equal(t, Core{
@@ -97,6 +132,34 @@ func Test_NewDocumentNewCommentReplyNotification(t *testing.T) {
 			MetaKeyCommentReplyID: commentReplyID,
 			MetaKeyAnchorBlockID:  null.StringFrom("blk1"),
 			MetaKeyBranchID:       branchID,
+			MetaKeyCommentExcerpt: "Agreed",
+		},
+	}, nc)
+}
+
+func Test_NewDocumentCommentResolvedNotification(t *testing.T) {
+	t.Parallel()
+
+	documentID, commentID, branchID := xid.New(), xid.New(), xid.New()
+
+	nc := NewDocumentCommentResolvedNotification(
+		"user1",
+		documentID,
+		commentID,
+		null.StringFrom("blk1"),
+		branchID,
+		"Worth a second look",
+	)
+
+	assert.Equal(t, Core{
+		Code: NotificationDocumentCommentResolved,
+		Metadata: Metadata{
+			MetaKeyUserID:         "user1",
+			MetaKeyDocumentID:     documentID,
+			MetaKeyCommentID:      commentID,
+			MetaKeyAnchorBlockID:  null.StringFrom("blk1"),
+			MetaKeyBranchID:       branchID,
+			MetaKeyCommentExcerpt: "Worth a second look",
 		},
 	}, nc)
 }

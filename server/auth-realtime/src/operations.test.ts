@@ -3,12 +3,9 @@ import * as Y from "yjs"
 import { replaceYdocContent } from "./ydocument.js"
 import {
 	applyOperations,
-	findByUid,
-	pmBlockToY,
 	type InsertOp,
 	type MoveOp,
 	type Operation,
-	type PMInline,
 	type PMNode,
 } from "./operations.js"
 
@@ -44,22 +41,6 @@ function sampleBlocks(): PMNode[] {
 			content: [{ type: "text", text: "Section" }],
 		},
 	]
-}
-
-// a bullet list carrying one item, whose paragraph holds the text. The
-// three uids let a test address the list, the item, or the paragraph.
-function bulletList(listUID: string, itemUID: string, text: string): PMNode {
-	return {
-		type: "bulletList",
-		attrs: { uid: listUID },
-		content: [
-			{
-				type: "listItem",
-				attrs: { uid: itemUID },
-				content: [textParagraph("text", text)],
-			},
-		],
-	}
 }
 
 // builds a live document through the same path the Hocuspocus server
@@ -113,15 +94,28 @@ function topUids(doc: Y.Doc): (string | undefined)[] {
 		)
 }
 
-// resolves a block for assertions, throwing rather than returning null
-// so callers keep a non-nullable element.
+// the block carrying uid anywhere in the content, if there is one.
+function findBlock(doc: Y.Doc, uid: string): Y.XmlElement | undefined {
+	const [found] = doc
+		.getXmlFragment("content")
+		.createTreeWalker(
+			(node) =>
+				node instanceof Y.XmlElement &&
+				node.getAttribute("uid") === uid,
+		)
+
+	return found instanceof Y.XmlElement ? found : undefined
+}
+
+// resolves a block for assertions, throwing rather than returning
+// undefined so callers keep a non-nullable element.
 function blockByUid(doc: Y.Doc, uid: string): Y.XmlElement {
-	const found = findByUid(doc.getXmlFragment("content"), uid)
+	const found = findBlock(doc, uid)
 	if (!found) {
 		throw new Error(`test fixture has no block: ${uid}`)
 	}
 
-	return found.element
+	return found
 }
 
 // getAttributes is declared as a string map, but the runtime keeps
@@ -131,17 +125,6 @@ function attrsOf(el: Y.XmlElement): Record<string, unknown> {
 	return el.getAttributes()
 }
 
-// Y.XmlText.toDelta is declared as returning any; narrowing it in one
-// place keeps every call site free of unsafe values.
-function inlineDelta(el: Y.XmlElement): unknown[] {
-	const child = el.get(0)
-	if (!(child instanceof Y.XmlText)) {
-		throw new Error("block carries no inline text")
-	}
-
-	return child.toDelta() as unknown[]
-}
-
 // neither Y.XmlElement nor Y.Text declares a string-returning toString
 // in its type definitions, though both serialize properly at runtime.
 // Narrowing it once here keeps the assertions readable.
@@ -149,20 +132,8 @@ function serialize(node: Y.XmlElement | Y.Text): string {
 	return (node as unknown as { toString(): string }).toString()
 }
 
-// a detached Y.XmlElement keeps its attributes and children in prelim
-// state, invisible to the public getters, so assertions read it after
-// attaching it to a throwaway host — which is what the operations do
-// with it anyway.
-function attached(el: Y.XmlElement): Y.XmlElement {
-	new Y.Doc().getXmlFragment("content").insert(0, [el])
-
-	return el
-}
-
 describe("applyOperations", () => {
-	it("keeps applying later operations after one of them fails", ({
-		expect,
-	}) => {
+	it("applies nothing when one operation fails", ({ expect }) => {
 		const doc = docWith(sampleBlocks())
 
 		const result = applyOperations(doc, [
@@ -177,16 +148,60 @@ describe("applyOperations", () => {
 			},
 		])
 
-		expect(result.applied).toBe(2)
-		expect(result.errors).toEqual([
-			{ index: 1, message: "block_uid not found: ghost" },
+		expect(result).toEqual({
+			errors: [
+				{
+					index: 1,
+					message: "block_uid not found: ghost",
+				},
+			],
+		})
+		expect(topUids(doc)).toEqual(["intro", "callout", "head"])
+	})
+
+	it("reports only the first failure of a batch", ({ expect }) => {
+		const doc = docWith(sampleBlocks())
+
+		const result = applyOperations(doc, [
+			{ kind: "delete", block_uid: "ghost" },
+			{ kind: "delete", block_uid: "phantom" },
 		])
+
+		expect(result).toEqual({
+			errors: [
+				{
+					index: 0,
+					message: "block_uid not found: ghost",
+				},
+			],
+		})
+	})
+
+	it("applies a batch whose operations build on each other", ({
+		expect,
+	}) => {
+		const doc = docWith(sampleBlocks())
+
+		const result = applyOperations(doc, [
+			{
+				kind: "prepend",
+				block: textParagraph("first", "First"),
+			},
+			{
+				kind: "insert",
+				position: "after",
+				reference_uid: "first",
+				block: textParagraph("second", "Second"),
+			},
+		])
+
+		expect(result).toEqual({ errors: [] })
 		expect(topUids(doc)).toEqual([
 			"first",
+			"second",
 			"intro",
 			"callout",
 			"head",
-			"last",
 		])
 	})
 
@@ -215,7 +230,6 @@ describe("applyOperations", () => {
 		const doc = docWith(sampleBlocks())
 
 		expect(applyOperations(doc, [])).toEqual({
-			applied: 0,
 			errors: [],
 		})
 		expect(topUids(doc)).toEqual(["intro", "callout", "head"])
@@ -233,7 +247,6 @@ describe("applyOperations", () => {
 			{ kind: "transmogrify" } as unknown as Operation,
 		])
 
-		expect(result.applied).toBe(0)
 		expect(result.errors).toEqual([
 			{
 				index: 0,
@@ -244,6 +257,36 @@ describe("applyOperations", () => {
 	})
 
 	describe("insert", () => {
+		it("refuses a block the parent does not take, leaving the document as it was", ({
+			expect,
+		}) => {
+			const doc = docWith(sampleBlocks())
+
+			const result = applyOperations(doc, [
+				{
+					kind: "insert",
+					position: "after",
+					reference_uid: "intro",
+					block: {
+						type: "metricBlock",
+						attrs: { uid: "metric" },
+					},
+				},
+			])
+
+			expect(result.errors[0]?.message).toContain(
+				"metricBlock is not allowed there in the document root",
+			)
+			expect(result.errors[0]?.message).toContain(
+				"Choose a reference block in a container that takes it.",
+			)
+			expect(topUids(doc)).toEqual([
+				"intro",
+				"callout",
+				"head",
+			])
+		})
+
 		const positionCases: {
 			name: string
 			input: InsertOp["position"]
@@ -278,7 +321,7 @@ describe("applyOperations", () => {
 					},
 				])
 
-				expect(result.applied).toBe(1)
+				expect(result.errors).toEqual([])
 				expect(topUids(doc)).toEqual(expected)
 			},
 		)
@@ -336,7 +379,6 @@ describe("applyOperations", () => {
 				} as unknown as Operation,
 			])
 
-			expect(result.applied).toBe(0)
 			expect(result.errors[0]?.message).toBe(
 				'insert position must be "before" or "after", got: beforeX',
 			)
@@ -362,7 +404,6 @@ describe("applyOperations", () => {
 			])
 
 			expect(result).toEqual({
-				applied: 0,
 				errors: [
 					{
 						index: 0,
@@ -379,6 +420,31 @@ describe("applyOperations", () => {
 	})
 
 	describe("append", () => {
+		it("refuses a block the document root does not take", ({
+			expect,
+		}) => {
+			const doc = docWith(sampleBlocks())
+
+			const result = applyOperations(doc, [
+				{
+					kind: "append",
+					block: {
+						type: "metricBlock",
+						attrs: { uid: "metric" },
+					},
+				},
+			])
+
+			expect(result.errors[0]?.message).toContain(
+				"Insert it before or after a block in a container that takes it.",
+			)
+			expect(topUids(doc)).toEqual([
+				"intro",
+				"callout",
+				"head",
+			])
+		})
+
 		it("adds the block after a last block that is not a paragraph", ({
 			expect,
 		}) => {
@@ -534,15 +600,94 @@ describe("applyOperations", () => {
 				},
 			])
 
-			expect(result.applied).toBe(1)
+			expect(result.errors).toEqual([])
 			expect(topUids(doc)).toEqual(["added"])
 			expect(serialize(blockByUid(doc, "added"))).toBe(
 				'<paragraph uid="added">Added</paragraph>',
 			)
 		})
+		it("keeps attribute values that are not strings", ({
+			expect,
+		}) => {
+			const doc = docWith(sampleBlocks())
+
+			applyOperations(doc, [
+				{
+					kind: "append",
+					block: {
+						type: "metricGrid",
+						attrs: { uid: "grid" },
+						content: [
+							{
+								type: "metricBlock",
+								attrs: {
+									uid: "metric",
+									queries: [
+										{
+											query: "up",
+										},
+									],
+								},
+							},
+						],
+					},
+				},
+			])
+
+			// the simulation flag is the one metric attribute whose
+			// schema default is not null, so it is written out too.
+			expect(attrsOf(blockByUid(doc, "metric"))).toEqual({
+				uid: "metric",
+				queries: [{ query: "up" }],
+				simulationActive: false,
+			})
+		})
+
+		it("reports an error for a bare text node", ({ expect }) => {
+			const doc = docWith(sampleBlocks())
+
+			const result = applyOperations(doc, [
+				{
+					kind: "append",
+					block: { type: "text", text: "loose" },
+				},
+			])
+
+			expect(result.errors).toEqual([
+				{ index: 0, message: "text is not a block" },
+			])
+			expect(topUids(doc)).toEqual([
+				"intro",
+				"callout",
+				"head",
+			])
+		})
 	})
 
 	describe("prepend", () => {
+		it("refuses a block the document root does not take", ({
+			expect,
+		}) => {
+			const doc = docWith(sampleBlocks())
+
+			const result = applyOperations(doc, [
+				{
+					kind: "prepend",
+					block: {
+						type: "metricBlock",
+						attrs: { uid: "metric" },
+					},
+				},
+			])
+
+			expect(result.errors).toHaveLength(1)
+			expect(topUids(doc)).toEqual([
+				"intro",
+				"callout",
+				"head",
+			])
+		})
+
 		it("adds the block at index 0", ({ expect }) => {
 			const doc = docWith(sampleBlocks())
 
@@ -553,7 +698,7 @@ describe("applyOperations", () => {
 				},
 			])
 
-			expect(result.applied).toBe(1)
+			expect(result.errors).toEqual([])
 			expect(topUids(doc)).toEqual([
 				"added",
 				"intro",
@@ -564,6 +709,42 @@ describe("applyOperations", () => {
 	})
 
 	describe("replace", () => {
+		it("refuses a block its container does not take, leaving the old one", ({
+			expect,
+		}) => {
+			const doc = docWith(sampleBlocks())
+
+			const result = applyOperations(doc, [
+				{
+					kind: "replace",
+					block_uid: "nested",
+					block: {
+						type: "heading",
+						attrs: {
+							uid: "nested",
+							level: 2,
+						},
+						content: [
+							{
+								type: "text",
+								text: "Heading",
+							},
+						],
+					},
+				},
+			])
+
+			expect(result.errors[0]?.message).toContain(
+				"heading is not allowed there in calloutBlock",
+			)
+			expect(result.errors[0]?.message).not.toContain(
+				"Choose",
+			)
+			expect(blockByUid(doc, "nested").nodeName).toBe(
+				"paragraph",
+			)
+		})
+
 		it("swaps the block in place, keeping its index", ({
 			expect,
 		}) => {
@@ -577,14 +758,9 @@ describe("applyOperations", () => {
 				},
 			])
 
-			expect(result.applied).toBe(1)
+			expect(result.errors).toEqual([])
 			expect(topUids(doc)).toEqual(["intro", "fresh", "head"])
-			expect(
-				findByUid(
-					doc.getXmlFragment("content"),
-					"nested",
-				),
-			).toBeNull()
+			expect(findBlock(doc, "nested")).toBeUndefined()
 		})
 
 		it("swaps a nested block inside that block's own parent", ({
@@ -600,12 +776,9 @@ describe("applyOperations", () => {
 				},
 			])
 
-			const found = findByUid(
-				doc.getXmlFragment("content"),
-				"fresh",
+			expect(blockByUid(doc, "callout").get(0)).toBe(
+				blockByUid(doc, "fresh"),
 			)
-			expect(found?.index).toBe(0)
-			expect(found?.parent).toBe(blockByUid(doc, "callout"))
 			expect(topUids(doc)).toEqual([
 				"intro",
 				"callout",
@@ -627,7 +800,6 @@ describe("applyOperations", () => {
 			])
 
 			expect(result).toEqual({
-				applied: 0,
 				errors: [
 					{
 						index: 0,
@@ -640,280 +812,6 @@ describe("applyOperations", () => {
 				"callout",
 				"head",
 			])
-		})
-	})
-
-	describe("update_text", () => {
-		it("swaps the inline content while keeping the block's type, attrs and uid", ({
-			expect,
-		}) => {
-			const doc = docWith(sampleBlocks())
-
-			const result = applyOperations(doc, [
-				{
-					kind: "update_text",
-					block_uid: "head",
-					content: [
-						{
-							type: "text",
-							text: "Rewritten",
-						},
-					],
-				},
-			])
-
-			const head = blockByUid(doc, "head")
-			expect(result.applied).toBe(1)
-			expect(head.nodeName).toBe("heading")
-			expect(attrsOf(head)).toEqual({ uid: "head", level: 2 })
-			expect(head.length).toBe(1)
-			expect(inlineDelta(head)).toEqual([
-				{ insert: "Rewritten" },
-			])
-		})
-
-		it("turns marks into format attributes on the inline text", ({
-			expect,
-		}) => {
-			const doc = docWith(sampleBlocks())
-
-			applyOperations(doc, [
-				{
-					kind: "update_text",
-					block_uid: "intro",
-					content: [
-						{
-							type: "text",
-							text: "plain ",
-						},
-						{
-							type: "text",
-							text: "bold",
-							marks: [
-								{
-									type: "bold",
-								},
-							],
-						},
-						{
-							type: "text",
-							text: "link",
-							marks: [
-								{
-									type: "link",
-									attrs: {
-										href: "https://oxynote.test",
-									},
-								},
-							],
-						},
-					],
-				},
-			])
-
-			expect(inlineDelta(blockByUid(doc, "intro"))).toEqual([
-				{ insert: "plain " },
-				{ insert: "bold", attributes: { bold: true } },
-				{
-					insert: "link",
-					attributes: {
-						link: {
-							href: "https://oxynote.test",
-						},
-					},
-				},
-			])
-		})
-
-		it("leaves the block without children when the content is empty", ({
-			expect,
-		}) => {
-			const doc = docWith(sampleBlocks())
-
-			applyOperations(doc, [
-				{
-					kind: "update_text",
-					block_uid: "intro",
-					content: [],
-				},
-			])
-
-			const intro = blockByUid(doc, "intro")
-			expect(intro.length).toBe(0)
-			expect(serialize(intro)).toBe(
-				'<paragraph uid="intro"></paragraph>',
-			)
-		})
-
-		it("leaves the block without children when no inline node carries text", ({
-			expect,
-		}) => {
-			const doc = docWith(sampleBlocks())
-
-			applyOperations(doc, [
-				{
-					kind: "update_text",
-					block_uid: "intro",
-					content: [
-						{
-							type: "hardBreak",
-						} as unknown as PMInline,
-						{ type: "text", text: "" },
-					],
-				},
-			])
-
-			expect(blockByUid(doc, "intro").length).toBe(0)
-		})
-
-		it("writes into a callout's first paragraph, keeping its other children", ({
-			expect,
-		}) => {
-			const doc = docWith([
-				{
-					type: "calloutBlock",
-					attrs: {
-						uid: "callout",
-						icon: "lucide:zap",
-					},
-					content: [
-						textParagraph(
-							"first",
-							"First line",
-						),
-						textParagraph(
-							"second",
-							"Second line",
-						),
-					],
-				},
-			])
-
-			const result = applyOperations(doc, [
-				{
-					kind: "update_text",
-					block_uid: "callout",
-					content: [
-						{
-							type: "text",
-							text: "Rewritten",
-						},
-					],
-				},
-			])
-
-			const callout = blockByUid(doc, "callout")
-			expect(result.applied).toBe(1)
-			expect(callout.length).toBe(2)
-			expect(inlineDelta(blockByUid(doc, "first"))).toEqual([
-				{ insert: "Rewritten" },
-			])
-			expect(inlineDelta(blockByUid(doc, "second"))).toEqual([
-				{ insert: "Second line" },
-			])
-		})
-
-		it("reports an error when a callout holds no paragraph to write in", ({
-			expect,
-		}) => {
-			const doc = docWith([
-				{
-					type: "calloutBlock",
-					attrs: {
-						uid: "callout",
-						icon: "lucide:zap",
-					},
-					content: [
-						bulletList(
-							"list",
-							"item",
-							"Item",
-						),
-					],
-				},
-			])
-
-			const result = applyOperations(doc, [
-				{
-					kind: "update_text",
-					block_uid: "callout",
-					content: [
-						{
-							type: "text",
-							text: "Rewritten",
-						},
-					],
-				},
-			])
-
-			expect(result.applied).toBe(0)
-			expect(result.errors[0]?.message).toContain(
-				"no paragraph to write in",
-			)
-		})
-
-		it.for([
-			{ name: "a bullet list", uid: "list" },
-			{ name: "a list item", uid: "item" },
-		])(
-			"refuses to overwrite $name, which carries blocks rather than text",
-			({ uid }, { expect }) => {
-				const doc = docWith([
-					bulletList("list", "item", "Item"),
-				])
-
-				const result = applyOperations(doc, [
-					{
-						kind: "update_text",
-						block_uid: uid,
-						content: [
-							{
-								type: "text",
-								text: "Rewritten",
-							},
-						],
-					},
-				])
-
-				expect(result.applied).toBe(0)
-				expect(result.errors[0]?.message).toContain(
-					"carries blocks rather than text",
-				)
-				// the item, and the uid any comment or hook hangs off,
-				// both survive the refusal.
-				expect(
-					inlineDelta(blockByUid(doc, "text")),
-				).toEqual([{ insert: "Item" }])
-			},
-		)
-
-		it("reports an error when the block is absent", ({
-			expect,
-		}) => {
-			const doc = docWith(sampleBlocks())
-
-			const result = applyOperations(doc, [
-				{
-					kind: "update_text",
-					block_uid: "ghost",
-					content: [
-						{
-							type: "text",
-							text: "Rewritten",
-						},
-					],
-				},
-			])
-
-			expect(result).toEqual({
-				applied: 0,
-				errors: [
-					{
-						index: 0,
-						message: "block_uid not found: ghost",
-					},
-				],
-			})
 		})
 	})
 
@@ -934,7 +832,7 @@ describe("applyOperations", () => {
 				},
 			])
 
-			expect(result.applied).toBe(1)
+			expect(result.errors).toEqual([])
 			expect(attrsOf(blockByUid(doc, "callout"))).toEqual({
 				uid: "callout",
 				icon: "lucide:bug",
@@ -959,12 +857,7 @@ describe("applyOperations", () => {
 				uid: "head",
 				level: 3,
 			})
-			expect(
-				findByUid(
-					doc.getXmlFragment("content"),
-					"stolen",
-				),
-			).toBeNull()
+			expect(findBlock(doc, "stolen")).toBeUndefined()
 		})
 
 		it("reports an error when the block is absent", ({
@@ -981,7 +874,6 @@ describe("applyOperations", () => {
 			])
 
 			expect(result).toEqual({
-				applied: 0,
 				errors: [
 					{
 						index: 0,
@@ -993,6 +885,21 @@ describe("applyOperations", () => {
 	})
 
 	describe("delete", () => {
+		it("refuses to delete a container's last block", ({
+			expect,
+		}) => {
+			const doc = docWith(sampleBlocks())
+
+			const result = applyOperations(doc, [
+				{ kind: "delete", block_uid: "nested" },
+			])
+
+			expect(result.errors[0]?.message).toContain(
+				"calloutBlock would end without",
+			)
+			expect(blockByUid(doc, "callout").length).toBe(1)
+		})
+
 		it("removes the block and everything nested inside it", ({
 			expect,
 		}) => {
@@ -1002,14 +909,9 @@ describe("applyOperations", () => {
 				{ kind: "delete", block_uid: "callout" },
 			])
 
-			expect(result.applied).toBe(1)
+			expect(result.errors).toEqual([])
 			expect(topUids(doc)).toEqual(["intro", "head"])
-			expect(
-				findByUid(
-					doc.getXmlFragment("content"),
-					"nested",
-				),
-			).toBeNull()
+			expect(findBlock(doc, "nested")).toBeUndefined()
 		})
 
 		it("reports an error when the block is absent", ({
@@ -1022,7 +924,6 @@ describe("applyOperations", () => {
 			])
 
 			expect(result).toEqual({
-				applied: 0,
 				errors: [
 					{
 						index: 0,
@@ -1070,7 +971,7 @@ describe("applyOperations", () => {
 					},
 				])
 
-				expect(result.applied).toBe(1)
+				expect(result.errors).toEqual([])
 				expect(topUids(doc)).toEqual(expected)
 			},
 		)
@@ -1089,7 +990,7 @@ describe("applyOperations", () => {
 				},
 			])
 
-			expect(result.applied).toBe(1)
+			expect(result.errors).toEqual([])
 			expect(topUids(doc)).toEqual([
 				"head",
 				"intro",
@@ -1111,7 +1012,7 @@ describe("applyOperations", () => {
 				},
 			])
 
-			expect(result.applied).toBe(1)
+			expect(result.errors).toEqual([])
 			expect(topUids(doc)).toEqual([
 				"intro",
 				"head",
@@ -1124,14 +1025,35 @@ describe("applyOperations", () => {
 				icon: "lucide:zap",
 			})
 
-			const nested = findByUid(
-				doc.getXmlFragment("content"),
-				"nested",
-			)
-			expect(nested?.parent).toBe(callout)
+			expect(blockByUid(doc, "nested").parent).toBe(callout)
 		})
 
 		it("moves a block into a different parent next to a nested reference", ({
+			expect,
+		}) => {
+			const doc = docWith(sampleBlocks())
+
+			const result = applyOperations(doc, [
+				{
+					kind: "move",
+					block_uid: "intro",
+					position: "after",
+					reference_uid: "nested",
+				},
+			])
+
+			expect(result.errors).toEqual([])
+			expect(topUids(doc)).toEqual(["callout", "head"])
+
+			expect(blockByUid(doc, "intro").parent).toBe(
+				blockByUid(doc, "callout"),
+			)
+			expect(attrsOf(blockByUid(doc, "intro"))).toEqual({
+				uid: "intro",
+			})
+		})
+
+		it("refuses a move into a container that does not take the block, leaving the document as it was", ({
 			expect,
 		}) => {
 			const doc = docWith(sampleBlocks())
@@ -1145,21 +1067,60 @@ describe("applyOperations", () => {
 				},
 			])
 
-			expect(result.applied).toBe(1)
-			expect(topUids(doc)).toEqual(["intro", "callout"])
-
-			const head = findByUid(
-				doc.getXmlFragment("content"),
-				"head",
+			expect(result.errors[0]?.message).toContain(
+				"heading is not allowed there in calloutBlock",
 			)
-			expect(head?.parent).toBe(blockByUid(doc, "callout"))
-			expect(attrsOf(blockByUid(doc, "head"))).toEqual({
-				uid: "head",
-				level: 2,
-			})
+			expect(topUids(doc)).toEqual([
+				"intro",
+				"callout",
+				"head",
+			])
+			expect(blockByUid(doc, "callout").length).toBe(1)
 		})
 
 		it("moves a nested block out to the document root", ({
+			expect,
+		}) => {
+			const doc = docWith([
+				textParagraph("intro", "Intro line"),
+				{
+					type: "calloutBlock",
+					attrs: {
+						uid: "callout",
+						icon: "lucide:zap",
+					},
+					content: [
+						textParagraph(
+							"nested",
+							"Nested line",
+						),
+						textParagraph(
+							"second",
+							"Second line",
+						),
+					],
+				},
+			])
+
+			const result = applyOperations(doc, [
+				{
+					kind: "move",
+					block_uid: "nested",
+					position: "before",
+					reference_uid: "intro",
+				},
+			])
+
+			expect(result.errors).toEqual([])
+			expect(topUids(doc)).toEqual([
+				"nested",
+				"intro",
+				"callout",
+			])
+			expect(blockByUid(doc, "callout").length).toBe(1)
+		})
+
+		it("refuses a move that would leave its container empty", ({
 			expect,
 		}) => {
 			const doc = docWith(sampleBlocks())
@@ -1173,14 +1134,10 @@ describe("applyOperations", () => {
 				},
 			])
 
-			expect(result.applied).toBe(1)
-			expect(topUids(doc)).toEqual([
-				"nested",
-				"intro",
-				"callout",
-				"head",
-			])
-			expect(blockByUid(doc, "callout").length).toBe(0)
+			expect(result.errors[0]?.message).toContain(
+				"calloutBlock would end without",
+			)
+			expect(blockByUid(doc, "callout").length).toBe(1)
 		})
 
 		it("reports an error for a position that is neither before nor after", ({
@@ -1198,7 +1155,6 @@ describe("applyOperations", () => {
 			])
 
 			expect(result).toEqual({
-				applied: 0,
 				errors: [
 					{
 						index: 0,
@@ -1228,7 +1184,6 @@ describe("applyOperations", () => {
 			])
 
 			expect(result).toEqual({
-				applied: 0,
 				errors: [
 					{
 						index: 0,
@@ -1258,7 +1213,6 @@ describe("applyOperations", () => {
 			])
 
 			expect(result).toEqual({
-				applied: 0,
 				errors: [
 					{
 						index: 0,
@@ -1288,7 +1242,6 @@ describe("applyOperations", () => {
 			])
 
 			expect(result).toEqual({
-				applied: 0,
 				errors: [
 					{
 						index: 0,
@@ -1318,7 +1271,6 @@ describe("applyOperations", () => {
 			])
 
 			expect(result).toEqual({
-				applied: 0,
 				errors: [
 					{
 						index: 0,
@@ -1346,7 +1298,7 @@ describe("applyOperations", () => {
 
 			const frag = doc.getXmlFragment("name")
 			const para = frag.get(0)
-			expect(result.applied).toBe(1)
+			expect(result.errors).toEqual([])
 			expect(frag.length).toBe(1)
 			expect(para).toBeInstanceOf(Y.XmlElement)
 
@@ -1409,116 +1361,11 @@ describe("applyOperations", () => {
 					{ kind: "set_icon", icon: input },
 				])
 
-				expect(result.applied).toBe(1)
+				expect(result.errors).toEqual([])
 				expect(serialize(doc.getText("icon"))).toBe(
 					expected,
 				)
 			},
 		)
-	})
-})
-
-describe("findByUid", () => {
-	it("returns a top-level block with the content fragment as its parent", ({
-		expect,
-	}) => {
-		const doc = docWith(sampleBlocks())
-		const frag = doc.getXmlFragment("content")
-
-		const found = findByUid(frag, "head")
-
-		expect(found?.parent).toBe(frag)
-		expect(found?.index).toBe(2)
-		expect(found?.element.nodeName).toBe("heading")
-	})
-
-	it("returns a nested block with its enclosing element as parent", ({
-		expect,
-	}) => {
-		const doc = docWith(sampleBlocks())
-		const callout = blockByUid(doc, "callout")
-
-		const found = findByUid(doc.getXmlFragment("content"), "nested")
-
-		expect(found?.parent).toBe(callout)
-		expect(found?.index).toBe(0)
-		expect(found?.element).toBe(callout.get(0))
-	})
-
-	it("returns null when no block carries the uid", ({ expect }) => {
-		const doc = docWith(sampleBlocks())
-
-		expect(
-			findByUid(doc.getXmlFragment("content"), "ghost"),
-		).toBeNull()
-	})
-
-	it("skips children that are not elements", ({ expect }) => {
-		const doc = new Y.Doc()
-		const frag = doc.getXmlFragment("content")
-		const stray = new Y.XmlText()
-		frag.insert(0, [stray])
-		stray.insert(0, "stray")
-		frag.insert(1, [paragraphWrappingElement("wrapper")])
-
-		const found = findByUid(frag, "wrapper-inner")
-
-		expect(found?.index).toBe(0)
-		expect(found?.parent).toBe(frag.get(1))
-	})
-})
-
-describe("pmBlockToY", () => {
-	it("returns a detached element carrying the block's node name, attributes and children", ({
-		expect,
-	}) => {
-		const el = pmBlockToY({
-			type: "calloutBlock",
-			attrs: { uid: "callout", icon: "lucide:zap" },
-			content: [textParagraph("nested", "Nested line")],
-		})
-
-		expect(el.nodeName).toBe("calloutBlock")
-		expect(el.doc).toBeNull()
-		expect(el.parent).toBeNull()
-
-		const live = attached(el)
-		expect(attrsOf(live)).toEqual({
-			uid: "callout",
-			icon: "lucide:zap",
-		})
-		expect(serialize(live)).toBe(
-			'<calloutblock icon="lucide:zap" uid="callout">' +
-				'<paragraph uid="nested">Nested line</paragraph>' +
-				"</calloutblock>",
-		)
-	})
-
-	it("preserves attribute values that are not strings", ({ expect }) => {
-		const el = pmBlockToY({
-			type: "metricBlock",
-			attrs: {
-				uid: "metric",
-				queries: [{ query: "up", legend: "uptime" }],
-			},
-		})
-
-		// the simulation flag is the one metric attribute whose schema
-		// default is not null, so it is written out with the block
-		expect(attrsOf(attached(el))).toEqual({
-			uid: "metric",
-			queries: [{ query: "up", legend: "uptime" }],
-			simulationActive: false,
-		})
-	})
-
-	it("throws when the transformer yields no element for the block", ({
-		expect,
-	}) => {
-		// a bare inline text node is not a block, so the transformer
-		// puts a Y.XmlText at the top of the fragment
-		expect(() =>
-			pmBlockToY({ type: "text", text: "loose" }),
-		).toThrow("pmBlockToY: transformer produced no XmlElement")
 	})
 })

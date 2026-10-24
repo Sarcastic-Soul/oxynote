@@ -83,9 +83,10 @@ test.describe("search", () => {
 		await searchFor(dialog, "marmalade", result)
 
 		// the text exists on the draft alone, so that is the branch the
-		// hit names and the one the link opens. The branch name is the last
-		// span of the result's meta line
-		await expect(result.locator("span:last-child")).toHaveText("draft")
+		// page's row names and the one the link opens
+		await expect(dialog.locator("a", { hasText: "New Page" })).toContainText(
+			t("general.branch-labels.draft-short"),
+		)
 		await result.click()
 
 		await expect(page).toHaveURL(/New-Page-[a-z0-9]{20}\?branch=[a-z0-9]{20}/)
@@ -119,23 +120,25 @@ test.describe("search", () => {
 		})
 		const listed = JSON.parse(
 			(listing.content as { text: string }[])[0]?.text ?? "{}",
-		) as { documents: { id: string; default_branch_id: string }[] }
-		const branchId = listed.documents.find(
-			(d) => d.id === id,
-		)?.default_branch_id
+		) as {
+			documents: {
+				id: string
+				branches: { id: string; default: boolean }[]
+			}[]
+		}
+		const branchId = listed.documents
+			.find((d) => d.id === id)
+			?.branches.find((b) => b.default)?.id
 		expect(branchId).toBeDefined()
 
 		const inserted = await client.callTool({
-			name: "insert_block",
+			name: "insert_blocks",
 			arguments: {
 				document_id: id,
 				branch_id: branchId,
 				position: "end",
 				// a metric lives in a grid; the root refuses a bare one
-				block: {
-					type: "metric_grid",
-					items: [{ type: "metric", attrs: { title: title } }],
-				},
+				content: `<metrics><metric>${JSON.stringify({ title })}</metric></metrics>`,
 			},
 		})
 		expect(inserted.isError, JSON.stringify(inserted.content)).toBeFalsy()
@@ -151,7 +154,9 @@ test.describe("search", () => {
 		const dialog = await openSearch(page)
 		const result = dialog.locator("a", { hasText: title })
 		await searchFor(dialog, marker, result)
-		await expect(result).toContainText("metricBlock")
+		await expect(result).toContainText(
+			t("editor.metrics.config.type-options.line-chart.title"),
+		)
 
 		const href = await result.getAttribute("href")
 		const uid = decodeURIComponent(href?.split("#")[1] ?? "")
@@ -161,6 +166,48 @@ test.describe("search", () => {
 
 		await expect(page).toHaveURL(/New-Page-[a-z0-9]{20}#/)
 		await expect(page.locator(`[id="${uid}"]`)).toBeInViewport()
+	})
+
+	test("lists a page opened from a search result as recent", async ({
+		page,
+		request,
+	}) => {
+		await signUpWithWorkspace(page, request)
+		await createDocument(page)
+		await titleEditor(page).click()
+		await page.keyboard.press("ControlOrMeta+A")
+		await page.keyboard.type("Quarterly Roadmap")
+		await expect(page).toHaveURL(/Quarterly-Roadmap-[a-z0-9]{20}$/)
+		await documentPersisted(page)
+		// both pages have been opened by now, but neither from search
+		await sidebarDocument(page, "Welcome to Oxynote!").click()
+		await expect(page).toHaveURL(/Welcome-to-Oxynote-[a-z0-9]{20}$/)
+
+		let dialog = await openSearch(page)
+		const suggested = t("sidebar.search.suggested")
+		await expect(
+			dialog.locator("a", { hasText: "Quarterly Roadmap" }),
+		).toContainText(suggested)
+		// the suggested row stays until the search answers, so the result is
+		// told apart from it
+		const result = dialog.locator("a", {
+			hasText: "Quarterly Roadmap",
+			hasNotText: suggested,
+		})
+		await searchFor(dialog, "Quarterly", result)
+		await result.click()
+		await expect(page).toHaveURL(/Quarterly-Roadmap-[a-z0-9]{20}$/)
+		await waitForEditor(page)
+
+		dialog = await openSearch(page)
+
+		await expect(dialog.getByText(t("sidebar.search.recent"))).toBeVisible()
+		await expect(
+			dialog.locator("a", { hasText: "Quarterly Roadmap" }),
+		).not.toContainText(suggested)
+		await expect(
+			dialog.locator("a", { hasText: "Welcome to Oxynote!" }),
+		).toContainText(suggested)
 	})
 
 	test("reports when nothing matches", async ({ page, request }) => {

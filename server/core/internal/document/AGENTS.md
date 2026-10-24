@@ -8,25 +8,41 @@ Cross-service storage rules (Hocuspocus, Yjs) live in
 ## Branches
 
 - **The main branch is identified by its `default` flag, not its name**: the
-  tree join and `FetchMainBranchContent` key on it, and
-  `UpdateDocumentBranch` refuses to rename it. `NewDocument` and `Duplicate`
-  set `Default: true`; forks must not.
+  tree join keys on it, and `Document.AllowsBranchRename` refuses to rename
+  it. `NewDocument` and `Duplicate` set `Default: true`; forks must not.
 - **Maintainers accumulate.** The `maintainers` field on a branch update is
   who edited in that persist; `UpsertDocumentMaintainers` only adds. There
   is no removal path.
 - **Duplication copies, never shares**: `Document.Duplicate` regenerates
-  every block uid, rewrites image/file `src` paths to the new document, and
-  returns old→new maps for files (copied server-side) and block uids (hooks
-  re-anchored; unmapped ones dropped).
-- History entries pin the files they reference, so
-  `DB_MAX_DOCUMENT_HISTORY_ENTRIES` and `DB_DOCUMENT_HISTORY_RETENTION` also
-  decide how long a removed image survives.
+  every block uid, rewrites image/file `src` paths to the new document (the
+  file id is read off the src), and returns old→new maps for files (copied
+  server-side) and block uids (hooks re-anchored; unmapped ones dropped).
+
+## History entries
+
+`document_branch_history_entries` are restorable snapshots: name, icon,
+content, hook definitions (type, block, settings; never watcher state)
+and the author. Every write goes through
+`RecordDocumentBranchHistoryEntry`, which locks the branch row, then
+reads it and its hooks, in the transaction that wrote the change.
+
+- Edits in one 30-minute bucket (by `created_at`) update the newest
+  entry and its `updated_at`. An entry equal to the newest is skipped. A
+  null author (system write) never replaces a set one.
+- Hook create, update and delete flush the branch, then record an entry
+  in their transaction. Reset does not.
+- Create, duplicate, fork and merge write a **boundary** entry that never
+  aggregates, written after `CopyHooks` so it lists the copies.
+- Entries pin the files they reference, so the `DB_*HISTORY*` limits
+  decide how long a removed image survives. Retention keeps each branch's
+  newest entry.
 
 ## Files and hooks
 
-Files live at `organizations/{org}/documents/{doc}/files/{blockUID}` (the
-file id is the block uid, so a re-upload overwrites in place), tracked in
-`document_files` with name, size and sniffed content type. `GET
+Files live at `organizations/{org}/documents/{doc}/files/{fileId}`. The id
+is a nanoid the editor mints per upload, not the block uid, and an id that
+already has a row is refused with 409, so a history entry keeps its object
+when a block's file is replaced. `GET
 /api/documents/{id}/files/{fileId}-{fileName}` cuts the 21-char nanoid off
 the front and ignores the name; `Content-Disposition` is `inline` only for
 `file.Viewable`. The key is an S3 object key or a path under the storage
@@ -43,29 +59,29 @@ request handler:
   later; NULL-FK rows skip the wait; files younger than a day are never
   touched.
 - `hook/manager` does the same for hooks, calling `Hook.Delete` before
-  dropping a row whose branch, document or org went NULL. A merge detaches
-  the target's hooks (`DetachDocumentHooksByBranchID`) rather than
-  soft-deleting them.
+  dropping a row with a NULL FK. A merge detaches the target's hooks
+  (`DetachDocumentHooksByBranchID`) rather than soft-deleting them.
 - **Organization deletion is announced**: auth-realtime's
   `beforeDeleteOrganization` calls `POST /api/x/organizations/{id}/teardown`
   while rows still exist and throws if core fails.
 - Create writes the row before the object; delete removes the object before
-  the row. `copyHooksToBranch` runs after the fork/merge/duplicate commits,
-  because `hook.NewHook` creates the watcher as a side effect; a failed
-  insert tears it down again.
+  the row.
+- **A null hook state means not set up.** Copied hooks start null, never
+  with the source's state; the operation sets them up after commit and
+  the sweep retries what fails. Hook writes and the sweep share the
+  manager's per-hook lock.
 
 ## Search
 
-- **Jobs apply in order per document**; a failed diff holds back every later
-  one for that document, and an org removal holds everything after it.
+- **A search job names a scope, not a change**: a branch, a document or an
+  org (`search.Job`). Applying it re-reads the scope's current rows, so jobs
+  may run in any order or repeat. Every branch or document change queues
+  one through the search manager's `Enqueue` in the same transaction
+  (persist, fork, rename, merge, delete); document deletion queues one per
+  id that `agent.DeleteDocument` returns.
 - **Entries are branch-scoped**: id `<branchId>-<blockUid>`
   (`<branchId>-docname` for the name), carrying `documentId`, `branchId`,
-  `branchName`, `branchDefault`. Every branch change queues its diff through
-  `search.Jobs` in the same transaction (persist, fork, rename, merge);
-  branch deletion queues a `RemovedBranches` removal, document deletion
-  clears by `documentId` using the subtree ids `agent.DeleteDocument`
-  returns. Index settings are sent only when they differ from the index;
-  every write task is awaited.
+  `branchName`, `branchDefault`.
 
 ## Tags
 

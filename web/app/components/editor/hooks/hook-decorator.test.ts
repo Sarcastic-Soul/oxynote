@@ -5,7 +5,11 @@ import type { DecorationSet } from "@tiptap/pm/view"
 import { describe, it } from "vitest"
 import { HookDecorator } from "./hook-decorator"
 import { docBuilder } from "../test-helpers"
-import { CODE_BLOCK_NAME, METRIC_BLOCK_NAME } from "../blocks/node-names"
+import {
+	CODE_BLOCK_NAME,
+	MERMAID_BLOCK_NAME,
+	METRIC_BLOCK_NAME,
+} from "../blocks/node-names"
 import { DocumentHookType, type DocumentHook } from "~/utils/api/document"
 
 // minimal schema covering every placement rule: a plain block, a
@@ -17,6 +21,7 @@ const schema = new Schema<
 	| "atomBlock"
 	| "metricGrid"
 	| typeof CODE_BLOCK_NAME
+	| typeof MERMAID_BLOCK_NAME
 	| typeof METRIC_BLOCK_NAME
 	| "text"
 >({
@@ -34,6 +39,11 @@ const schema = new Schema<
 		},
 		metricGrid: { group: "block", content: "metricBlock+" },
 		[CODE_BLOCK_NAME]: {
+			group: "block",
+			content: "text*",
+			attrs: { uid: { default: null } },
+		},
+		[MERMAID_BLOCK_NAME]: {
 			group: "block",
 			content: "text*",
 			attrs: { uid: { default: null } },
@@ -56,6 +66,10 @@ function codeBlock(uid: string | null, str: string): PMNode {
 	return schema.nodes[CODE_BLOCK_NAME].create({ uid }, schema.text(str))
 }
 
+function mermaidBlock(uid: string | null, str: string): PMNode {
+	return schema.nodes[MERMAID_BLOCK_NAME].create({ uid }, schema.text(str))
+}
+
 function atomBlock(uid: string | null): PMNode {
 	return schema.nodes.atomBlock.create({ uid })
 }
@@ -68,9 +82,21 @@ function metricBlock(uid: string | null, str: string): PMNode {
 	return schema.nodes[METRIC_BLOCK_NAME].create({ uid }, schema.text(str))
 }
 
+// a website hook whose last check failed
+function failedHook(blockId: string): DocumentHook {
+	return {
+		...hook(blockId, "100"),
+		type: DocumentHookType.URLWatcher,
+		settings: { url: "https://example.com" },
+		state: { lastCheckedAt: "2026-01-01T00:00:00Z" },
+		status: "unreachable_url",
+	}
+}
+
 function hook(blockId: string | null, score = "0"): DocumentHook {
 	return {
 		id: `hook-${blockId ?? "none"}`,
+		crossBranchId: `hook-${blockId ?? "none"}`,
 		type: DocumentHookType.ScheduledReminder,
 		documentId: "doc-1",
 		organizationId: "org-1",
@@ -82,6 +108,7 @@ function hook(blockId: string | null, score = "0"): DocumentHook {
 			schedule: "2026-01-01T00:00:00Z",
 		},
 		state: { lastActiveAt: "2026-01-01T00:00:00Z" },
+		status: "active",
 		score,
 		createdAt: "2026-01-01T00:00:00Z",
 	}
@@ -138,6 +165,23 @@ function decorationShape(
 		.sort((a, b) => a[0] - b[0] || a[1] - b[1])
 }
 
+// the status each bar shows, read off its widget key
+function barStatuses(plugin: Plugin, state: EditorState): string[] {
+	const decorations = plugin.props.decorations?.call(plugin, state)
+
+	if (!decorations) {
+		return []
+	}
+
+	return (decorations as DecorationSet)
+		.find()
+		.sort((a, b) => a.from - b.from)
+		.flatMap((deco) => {
+			const spec = deco.spec as { key?: string }
+			return spec.key ? [spec.key.replace(/^hook-decoration-\d+-/, "")] : []
+		})
+}
+
 describe("HookDecorator", () => {
 	it("decorates a matching block with a node decoration and an inner widget", ({
 		expect,
@@ -191,6 +235,36 @@ describe("HookDecorator", () => {
 		expect(decorationShape(plugin, state)).toEqual(expected)
 	})
 
+	it.for([
+		{
+			name: "marks a block with a triggered hook as triggered",
+			hooks: () => [hook("u1"), hook("u1", "100")],
+			expected: ["triggered"],
+		},
+		{
+			name: "marks a block whose hook failed its check as needing attention",
+			hooks: () => [failedHook("u1")],
+			expected: ["needs-attention"],
+		},
+		{
+			name: "marks a block with a trigger and a failed check as mixed",
+			hooks: () => [hook("u1"), failedHook("u1")],
+			expected: ["mixed"],
+		},
+		{
+			name: "keeps the kinds of two blocks apart",
+			hooks: () => [hook("u1"), failedHook("u2")],
+			expected: ["triggered", "needs-attention"],
+		},
+	])("$name", ({ hooks, expected }, { expect }) => {
+		const { plugin, state } = makeState(
+			docOf(para("u1", "hi"), para("u2", "yo")),
+			hooks,
+		)
+
+		expect(barStatuses(plugin, state)).toEqual(expected)
+	})
+
 	it("never decorates a block whose uid is empty", ({ expect }) => {
 		const { plugin, state } = makeState(docOf(para("", "hi")), () => [hook("")])
 
@@ -201,6 +275,20 @@ describe("HookDecorator", () => {
 		const { plugin, state } = makeState(
 			docOf(para(null, "x"), codeBlock("cb", "code")),
 			() => [hook("cb")],
+		)
+
+		expect(decorationShape(plugin, state)).toEqual([
+			[3, 3, "widget"],
+			[3, 9, "node"],
+		])
+	})
+
+	it("places the widget at the node position for mermaid blocks", ({
+		expect,
+	}) => {
+		const { plugin, state } = makeState(
+			docOf(para(null, "x"), mermaidBlock("mb", "code")),
+			() => [hook("mb")],
 		)
 
 		expect(decorationShape(plugin, state)).toEqual([

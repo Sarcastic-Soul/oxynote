@@ -3,8 +3,8 @@ import { toTypedSchema } from "@vee-validate/zod"
 import { useForm } from "vee-validate"
 import * as z from "zod"
 // for some reason this isn't auto imported
-import { FormField as ShadcnUiFormField } from "@/components/shadcn/ui/form"
-import { cn } from "~/lib/utils"
+import { FormField as ShadcnUiFormField } from "#layers/ui/app/components/shadcn/ui/form"
+import { cn } from "#layers/ui/app/lib/utils"
 import type { OrganizationMember } from "./workspace"
 import { showToastMessage } from "../toast"
 
@@ -15,7 +15,7 @@ const emit = defineEmits<{
 
 const { fetchOrganization, fetchAuthSession, updateOrganization } =
 	useAuthSession()
-const { isEmailEnabled } = useAuthAPI()
+const { isEmailEnabled, maxOrganizationMembers } = useAuthAPI()
 const { t } = useI18n({ useScope: "global" })
 const { uploadOrganizationLogo } = useOrganizationAPI()
 const config = useRuntimeConfig()
@@ -31,7 +31,7 @@ const formSchema = toTypedSchema(
 			.trim()
 			.min(2)
 			.max(50)
-			.regex(/^[a-zA-Z0-9-_]+$/, {
+			.regex(/^[a-zA-Z0-9-_ ]+$/, {
 				message: t("settings.workspace.errors.name-regex"),
 			})
 			.default(fetchOrganization.state.value.data?.data?.name || ""),
@@ -225,7 +225,11 @@ async function copyInvitationLink(member: OrganizationMember) {
 							:alt="$t('settings.workspace.logo-alt')"
 						/>
 						<ShadcnUiAvatarFallback class="rounded-md">
-							{{ extractInitials(form.values.name || "", 2) }}
+							<LazyDefaultAvatar
+								kind="organization"
+								:seed="fetchOrganization.state.value.data?.data?.id || ''"
+								:name="fetchOrganization.state.value.data?.data?.name"
+							/>
 						</ShadcnUiAvatarFallback>
 						<div
 							:data-loading="loading === 'logo' ? '' : undefined"
@@ -324,13 +328,23 @@ async function copyInvitationLink(member: OrganizationMember) {
 		<div class="flex w-full flex-col gap-0.75">
 			<div class="flex items-center justify-between">
 				<i18n-t
+					v-if="maxOrganizationMembers === null"
+					scope="global"
+					keypath="settings.workspace.members-label-unlimited"
+					tag="div"
+					class="text-2base"
+				>
+					<template #current>{{ members.length }}</template>
+				</i18n-t>
+				<i18n-t
+					v-else
 					scope="global"
 					keypath="settings.workspace.members-label"
 					tag="div"
 					class="text-2base"
 				>
 					<template #current>{{ members.length }}</template>
-					<template #max>{{ ORGANIZATION_MAX_MEMBERS }}</template>
+					<template #max>{{ maxOrganizationMembers }}</template>
 				</i18n-t>
 
 				<ShadcnUiButton
@@ -363,7 +377,13 @@ async function copyInvitationLink(member: OrganizationMember) {
 										:alt="$t('settings.profile.image-alt')"
 									/>
 									<ShadcnUiAvatarFallback>
-										{{ extractInitials(member.user.name || "", 2) }}
+										<LazyDefaultAvatar
+											v-if="member.userId"
+											kind="user"
+											:seed="member.userId"
+											decorative
+										/>
+										<LazyDefaultAvatar v-else kind="invited-user" decorative />
 									</ShadcnUiAvatarFallback>
 								</ShadcnUiAvatar>
 								<div class="flex min-w-0 flex-col">

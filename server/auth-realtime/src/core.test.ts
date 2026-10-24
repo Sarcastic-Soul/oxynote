@@ -343,6 +343,50 @@ describe("createCoreClient", () => {
 			)
 			expect(result.status).toBe(200)
 		})
+
+		it("keeps an id inside its own path segment", async ({
+			expect,
+		}) => {
+			const http = stubHttp({ status: 200, data: {} })
+			const headers = new AxiosHeaders()
+
+			await createCoreClient(BASE_URL, http).updateBranch(
+				"doc-1",
+				"../hooks/h1",
+				{ body: {} },
+				{ headers },
+			)
+
+			expect(http.put).toHaveBeenCalledWith(
+				"http://core:8080/api/x/documents/doc-1/branches/..%2Fhooks%2Fh1",
+				{},
+				{ headers },
+			)
+		})
+
+		it.for([
+			{ name: "the current", input: "." },
+			{ name: "the parent", input: ".." },
+		])(
+			"refuses an id naming $name path",
+			async ({ input }, { expect }) => {
+				const http = stubHttp({ status: 200, data: {} })
+
+				await expect(
+					createCoreClient(
+						BASE_URL,
+						http,
+					).updateBranch(
+						"doc-1",
+						input,
+						{ body: {} },
+						{ headers: new AxiosHeaders() },
+					),
+				).rejects.toThrow(`invalid path id "${input}"`)
+
+				expect(http.put).not.toHaveBeenCalled()
+			},
+		)
 	})
 
 	describe("deleteBranch", () => {

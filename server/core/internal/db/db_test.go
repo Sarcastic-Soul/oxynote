@@ -5,31 +5,43 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	sq "github.com/Masterminds/squirrel"
 	"github.com/dchest/uniuri"
+	"github.com/guregu/null/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jmoiron/sqlx"
 	"github.com/lann/builder"
 	"github.com/orlangure/gnomock"
 	pgDocker "github.com/orlangure/gnomock/preset/postgres"
 	"github.com/oxynote/oxynote/server/core/internal/tag"
+	"github.com/oxynote/oxynote/server/core/internal/variable"
 	"github.com/oxynote/oxynote/server/core/pkg/cryptoutil"
 	"github.com/oxynote/oxynote/server/core/pkg/errutil"
 	"github.com/oxynote/oxynote/server/core/pkg/ioutil"
 	"github.com/oxynote/oxynote/server/core/pkg/metricutil"
+	"github.com/oxynote/oxynote/server/core/pkg/testutil"
+	"github.com/rs/xid"
+	migr "github.com/rubenv/sql-migrate"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 )
 
-var _pgDSN string
+var (
+	_pgDSN string
+
+	// _pgContainerID is the Docker ID of the test Postgres container.
+	_pgContainerID string
+)
 
 const (
 	_pgUser string = "pgtest"
@@ -64,6 +76,7 @@ func TestMain(m *testing.M) {
 			_pgUser,
 			_pgPass,
 		),
+		pgDocker.WithVersion("18.6-alpine"),
 	))
 	if err != nil {
 		panic("cannot set up: " + err.Error())
@@ -77,6 +90,7 @@ func TestMain(m *testing.M) {
 	}()
 
 	_pgDSN = container.Host + ":" + strconv.Itoa(container.DefaultPort())
+	_pgContainerID = container.DockerID()
 
 	goleak.VerifyTestMain(m, goleak.IgnoreCurrent())
 }
@@ -124,127 +138,255 @@ func Test_DB_Close(t *testing.T) {
 }
 
 func Test_DetectError(t *testing.T) {
-	cc := map[string]struct {
+	type tcase struct {
 		Err    error
 		Result error
+	}
+
+	cc := map[string]func(*testing.T) tcase{
+		"Not found": func(*testing.T) tcase {
+			return tcase{
+				Err:    sql.ErrNoRows,
+				Result: errutil.ErrNotFound,
+			}
+		},
+		"Error pass through": func(*testing.T) tcase {
+			return tcase{
+				Err:    sql.ErrConnDone,
+				Result: sql.ErrConnDone,
+			}
+		},
+		"No error": func(*testing.T) tcase {
+			return tcase{}
+		},
+		"Unmatched pgx constraint": func(*testing.T) tcase {
+			return tcase{
+				Err: &pgconn.PgError{
+					Code: "123",
+				},
+				Result: &pgconn.PgError{
+					Code: "123",
+				},
+			}
+		},
+		"Unmatched constraint": func(*testing.T) tcase {
+			return tcase{
+				Err:    errors.New("b"),
+				Result: errors.New("b"),
+			}
+		},
+		"Duplicate branch name": func(t *testing.T) tcase {
+			db := prepTempDB(t)
+
+			// renaming a branch onto a sibling's name trips the unique key
+			// that DetectError has to recognise.
+			branches := prepDocumentBranches(t, db, 2, nil)
+
+			second := branches[1]
+			second.BranchName = branches[0].BranchName
+
+			err := db.UpdateDocumentBranchMetadata(context.Background(), *second)
+			require.Error(t, err)
+
+			return tcase{
+				Err:    err,
+				Result: errutil.New(http.StatusBadRequest, "document_branch.duplicate_name", "branch name is already in use"),
+			}
+		},
+		"Duplicate file id": func(t *testing.T) tcase {
+			db := prepTempDB(t)
+
+			f := prepDocumentFiles(t, db, 1, nil)[0]
+
+			err := db.InsertDocumentFile(context.Background(), f)
+			require.Error(t, err)
+
+			return tcase{
+				Err:    err,
+				Result: errutil.New(http.StatusConflict, "document_file.exists", "file id is already in use"),
+			}
+		},
+		"Duplicate tag name": func(t *testing.T) tcase {
+			db := prepTempDB(t)
+
+			existing := prepTags(t, db, 1, nil)[0]
+
+			dup := tag.NewTag(
+				tag.CreateInput{TagName: existing.TagName, Color: "#000000"},
+				existing.OrganizationID,
+				prepUsers(t, db, 1)[0],
+			)
+
+			err := db.InsertTag(context.Background(), dup)
+			require.Error(t, err)
+
+			return tcase{
+				Err:    err,
+				Result: tag.ErrDuplicateTagName,
+			}
+		},
+		"Duplicate variable group name": func(*testing.T) tcase {
+			return tcase{
+				Err:    &pgconn.PgError{Code: "23505", ConstraintName: "personal_variable_groups_fk_organization_id_group_name_key"},
+				Result: variable.ErrDuplicateGroupName,
+			}
+		},
+		"Duplicate variable key": func(*testing.T) tcase {
+			return tcase{
+				Err:    &pgconn.PgError{Code: "23505", ConstraintName: "personal_variables_fk_organization_id_variable_key_key"},
+				Result: variable.ErrDuplicateKey,
+			}
+		},
+		"Unmatched foreign key": func(*testing.T) tcase {
+			return tcase{
+				Err:    &pgconn.PgError{Code: "23503", ConstraintName: "tags_fk_organization_id_fkey"},
+				Result: &pgconn.PgError{Code: "23503", ConstraintName: "tags_fk_organization_id_fkey"},
+			}
+		},
+	}
+
+	for cn, cfn := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			c := cfn(t)
+
+			assert.Equal(t, c.Result, DetectError(c.Err))
+		})
+	}
+}
+
+func Test_DB_migrateUp(t *testing.T) {
+	db := prepTempDB(t)
+
+	organizationID := prepOrganizations(t, db, 1)[0]
+
+	// rolling back to before the variables migration (008) and up again
+	// runs its backfill over an organization that existed before it.
+	fsys, err := fs.Sub(_migrations, "migrations")
+	require.NoError(t, err)
+
+	_, err = db.migrations.ExecVersion(
+		db.sql.DB,
+		"postgres",
+		&migr.HttpFileSystemMigrationSource{FileSystem: http.FS(fsys)},
+		migr.Down,
+		7,
+	)
+	require.NoError(t, err)
+
+	require.NoError(t, db.migrateUp())
+
+	tree, err := db.FetchVariableTree(context.Background(), organizationID, "")
+	require.NoError(t, err)
+	require.Len(t, tree, 1)
+	require.Len(t, tree[0].Variables, 2)
+
+	exp := variable.SeedBuiltins(organizationID)
+
+	// option ids are random on both sides, so the list default is checked
+	// against each side's own first option and then set aside.
+	for _, g := range []variable.GroupTree{exp, tree[0]} {
+		refresh := g.Variables[1]
+		assert.Equal(t, null.StringFrom(refresh.Options[0].ID.String()), refresh.DefaultValue)
+
+		g.Variables[1].DefaultValue = null.String{}
+	}
+
+	testutil.AssertFilterEqual(t, exp, tree[0], xid.ID{}, time.Time{})
+}
+
+func Test_DB_BeginTx(t *testing.T) {
+	type test2 interface {
+		Commit() error
+	}
+
+	cc := map[string]struct {
+		CancelledContext bool
+		Dest             any
+		Panics           bool
+		PanicValue       any
+		Err              error
 	}{
-		"Not found": {
-			Err:    sql.ErrNoRows,
-			Result: errutil.ErrNotFound,
+		"Destination is not a pointer": {
+			Dest:       struct{}{},
+			Panics:     true,
+			PanicValue: "dest is not a pointer",
 		},
-		"Error pass through": {
-			Err:    sql.ErrConnDone,
-			Result: sql.ErrConnDone,
+		"Destination is nil": {
+			Dest:       (*struct{})(nil),
+			Panics:     true,
+			PanicValue: "dest is not a pointer",
 		},
-		"No error": {
-			Err:    nil,
-			Result: nil,
+		"Destination cannot hold a transaction": {
+			Dest:   &struct{}{},
+			Panics: true,
 		},
-		"Unmatched pgx constraint": {
-			Err: &pgconn.PgError{
-				Code: "123",
-			},
-			Result: &pgconn.PgError{
-				Code: "123",
-			},
+		"Cancelled context": {
+			CancelledContext: true,
+			Dest:             new(test2),
+			Err:              assert.AnError,
 		},
-		"Unmatched constraint": {
-			Err:    errors.New("b"),
-			Result: errors.New("b"),
+		"Successful begin": {
+			Dest: new(test2),
 		},
 	}
 
 	for cn, c := range cc {
 		t.Run(cn, func(t *testing.T) {
-			assert.Equal(t, c.Result, DetectError(c.Err))
+			t.Parallel()
+
+			db := prepTempDB(t)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			if c.CancelledContext {
+				cancel()
+			}
+
+			if c.Panics {
+				if c.PanicValue == nil {
+					require.Panics(t, func() {
+						require.NoError(t, db.BeginTx(ctx, c.Dest))
+					})
+
+					return
+				}
+
+				require.PanicsWithValue(t, c.PanicValue, func() {
+					require.NoError(t, db.BeginTx(ctx, c.Dest))
+				})
+
+				return
+			}
+
+			err := db.BeginTx(ctx, c.Dest)
+			testutil.RequireEqualError(t, c.Err, err)
+
+			if err != nil {
+				return
+			}
+
+			val := *c.Dest.(*test2)
+			assert.IsType(t, &Tx{}, val)
+			assert.NoError(t, val.Commit())
 		})
 	}
-
-	t.Run("Duplicate branch name", func(t *testing.T) {
-		t.Parallel()
-
-		db := prepTempDB(t)
-
-		// renaming a branch onto a sibling's name trips the unique key that
-		// DetectError has to recognise.
-		branches := prepDocumentBranches(t, db, 2, nil)
-
-		second := branches[1]
-		second.BranchName = branches[0].BranchName
-
-		err := db.UpdateDocumentBranchMetadata(context.Background(), *second)
-		require.Error(t, err)
-
-		mapped := DetectError(err)
-		assert.Equal(t, http.StatusBadRequest, errutil.StatusCode(mapped, false))
-		assert.Contains(t, mapped.Error(), "branch name is already in use")
-	})
-
-	t.Run("Duplicate tag name", func(t *testing.T) {
-		t.Parallel()
-
-		db := prepTempDB(t)
-
-		existing := prepTags(t, db, 1, nil)[0]
-
-		dup := tag.NewTag(
-			tag.CreateInput{TagName: existing.TagName, Color: "#000000"},
-			existing.OrganizationID,
-			prepUsers(t, db, 1)[0],
-		)
-
-		err := db.InsertTag(context.Background(), dup)
-		require.Error(t, err)
-
-		assert.Equal(t, tag.ErrDuplicateTagName, DetectError(err))
-	})
 }
 
-func Test_DB_BeginTx(t *testing.T) {
+func Test_Tx_SQLTx(t *testing.T) {
 	db := prepTempDB(t)
 
-	// provided destination isn't a pointer
-	require.PanicsWithValue(
-		t,
-		"dest is not a pointer",
-		func() {
-			require.NoError(t, db.BeginTx(context.Background(), struct{}{}))
-		},
-	)
+	var ntx *Tx
 
-	// provided destination is nil
-	require.PanicsWithValue(
-		t,
-		"dest is not a pointer",
-		func() {
-			require.NoError(t, db.BeginTx(context.Background(), (*struct{})(nil)))
-		},
-	)
+	require.NoError(t, db.BeginTx(context.Background(), &ntx))
 
-	// cannot fulfill destination requirements
-	require.Panics(
-		t,
-		func() {
-			require.NoError(t, db.BeginTx(context.Background(), &struct{}{}))
-		},
-	)
+	defer ntx.Rollback() //nolint:errcheck // error provides no meaningful info
 
-	type test2 interface {
-		Commit() error
-	}
-
-	var val test2
-
-	// context error
-	nctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	require.Error(t, db.BeginTx(nctx, &val))
-
-	// success
-	require.NoError(t, db.BeginTx(context.Background(), &val))
-	assert.IsType(t, &Tx{}, val)
-	assert.NoError(t, val.Commit())
+	stx := ntx.SQLTx()
+	require.NotNil(t, stx)
+	assert.Same(t, ntx.sql.Tx, stx)
 }
 
 func Test_Tx_Commit(t *testing.T) {

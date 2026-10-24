@@ -1,6 +1,8 @@
 import { describe, it } from "vitest"
 import {
 	acceptInvitationUrl,
+	isInvitationRedirect,
+	nextUrlWithHash,
 	postAuthDocumentUrl,
 	postEmailVerificationUrl,
 } from "./auth"
@@ -42,6 +44,28 @@ describe("postAuthDocumentUrl", () => {
 	})
 })
 
+describe("nextUrlWithHash", () => {
+	it.for([
+		{
+			name: "appends the encoded hash to the next path",
+			input: { next: "%2Fdocs%2Fabc%3Fbranch%3Db", hash: "#block-1" },
+			expected: "%2Fdocs%2Fabc%3Fbranch%3Db%23block-1",
+		},
+		{
+			name: "leaves the next path alone without a hash",
+			input: { next: "%2Fdocs%2Fabc", hash: "" },
+			expected: "%2Fdocs%2Fabc",
+		},
+		{
+			name: "returns nothing without a next path",
+			input: { next: undefined, hash: "#block-1" },
+			expected: undefined,
+		},
+	])("$name", ({ input, expected }, { expect }) => {
+		expect(nextUrlWithHash(input.next, input.hash)).toBe(expected)
+	})
+})
+
 describe("acceptInvitationUrl", () => {
 	it("carries everything the accept page renders, encoded", ({ expect }) => {
 		expect(
@@ -55,6 +79,22 @@ describe("acceptInvitationUrl", () => {
 		).toBe(
 			"https://app.test/accept-invite?id=inv-1&email=a%2Bb%40test.io&inviter=Ada+Lovelace&orgName=Acme+%26+Co&orgId=org-1",
 		)
+	})
+})
+
+describe("isInvitationRedirect", () => {
+	it.for([
+		{
+			name: "an encoded accept-invite path",
+			input: encodeURIComponent("/accept-invite?id=inv-1"),
+			expected: true,
+		},
+		{ name: "another page", input: "%2Fdocs%2Fabc", expected: false },
+		{ name: "a malformed encoding", input: "%E0%A4%A", expected: false },
+		{ name: "no next path", input: undefined, expected: false },
+		{ name: "a repeated query parameter", input: ["a", "b"], expected: false },
+	])("answers $expected for $name", ({ input, expected }, { expect }) => {
+		expect(isInvitationRedirect(input)).toBe(expected)
 	})
 })
 

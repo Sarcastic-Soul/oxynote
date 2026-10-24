@@ -116,20 +116,15 @@ const {
 	deleteDocument,
 	duplicateDocument,
 	useFetchDocumentBranchesByDocId,
+	recordBranchView,
 } = useDocumentAPI()
 const { deleteTag, updateTagTreeDocumentCache } = useTagAPI()
 const { fetchOrganization } = useAuthSession()
 const { t } = useI18n({ useScope: "global" })
 const { isAssistantEnabled } = useCapabilitiesAPI()
 const wsState = useWebSocketStateStore()
+const sidebarOpen = useSidebarOpenState()
 let unsubWsDocMetadataChange: (() => void) | null | undefined = null
-let lastClearedLinkNodeHighlight: string | null = null
-
-function resetLinkHighlightClearState() {
-	lastClearedLinkNodeHighlight = null
-}
-
-provide("resetLinkHighlightClearState", resetLinkHighlightClearState)
 
 // we use this to track whether all sections have loaded their initial data
 // (only applies to data that is loaded immediately after page load)
@@ -146,6 +141,7 @@ const createLoading = ref(false)
 const settingModalOpen = ref<
 	boolean | "org-members" | "github" | "metric-data-sources"
 >(false)
+const searchModalOpen = ref(false)
 const shortcutsModalOpen = ref(false)
 const pendingDocDeletion = ref<{
 	deleteDocument: () => Promise<void>
@@ -156,8 +152,16 @@ const pendingTagDeletion = ref<{
 	name: string
 } | null>(null)
 const notificationSidebarOpen = ref(false)
+const variableSidebarOpen = ref(false)
+const variableEditing = ref(false)
+// the url hash that links a block. Every replace of the url takes its hash
+// from here, because the route still holds a dropped hash until the
+// replace that dropped it lands
+const linkedBlockHash = ref(pageRoute.hash)
 const contentEditorRef = shallowRef<Editor | null>(null)
 const nameEditorRef = shallowRef<Editor | null>(null)
+const { usedVariableIds, totalCount: variableCount } =
+	useVariableUsage(contentEditorRef)
 const editorStore = useEditorStore()
 const mainArea = useTemplateRef("main")
 const { width: mainAreaWidth } = useElementSize(mainArea)
@@ -203,6 +207,8 @@ const breadcrumbs = computed(() => {
 	)
 })
 
+let recordedBranchView = ""
+
 useHead({
 	title: () =>
 		activeDocMetadata.value
@@ -240,6 +246,36 @@ watchImmediate(
 	},
 )
 
+watchImmediate(
+	[
+		() => activeDocMetadata.value?.id,
+		() => editorStore.activeBranchId,
+		() => fetchBranches.data.value,
+	],
+	([docId, branchId, branches]) => {
+		if (
+			!docId ||
+			!branchId ||
+			!branches?.some((b) => b.branchId === branchId)
+		) {
+			return
+		}
+
+		const key = `${docId}-${branchId}`
+		if (key === recordedBranchView) {
+			return
+		}
+
+		recordedBranchView = key
+
+		void recordBranchView
+			.mutateAsync({ docId: docId, branchId: branchId })
+			.catch((err: unknown) => {
+				console.error("Failed to record branch view:", err)
+			})
+	},
+)
+
 if (import.meta.dev) {
 	watchOnce(
 		() => loadedSections.value.sidebar,
@@ -256,23 +292,33 @@ if (import.meta.dev) {
 	)
 }
 
-// a ?branch=<id> query opens that branch of the document. It keys on the
-// route rather than the store so a later switch through the header is not
-// undone; an id the document does not have is ignored and the watch below
-// falls back to the default branch
+// a document url opens the branch its ?branch=<id> names, or the default
+// branch when it names none the document has. This runs only when the
+// query changes or the branch list loads for the first time. A refetch
+// of the list is skipped. The header switches the branch before the url
+// is updated, so a refetch in between would read the old branch from
+// the url and switch back to it
 watchImmediate(
 	[() => pageRoute.query.branch, fetchBranches.state],
-	([queryBranch, branchState]) => {
+	([queryBranch, branchState], [oldQueryBranch, oldBranchState]) => {
 		const branches = branchState.data
 
-		if (typeof queryBranch !== "string" || !branches?.length) {
+		if (!branches?.length) {
 			return
 		}
 
-		const branch = branches.find((b) => b.branchId === queryBranch)
-		const defaultBranch = branches.find((b) => b.default)
+		if (queryBranch === oldQueryBranch && oldBranchState?.data?.length) {
+			return
+		}
 
+		const defaultBranch = branches.find((b) => b.default)
+		const branch =
+			branches.find((b) => b.branchId === queryBranch) ?? defaultBranch
+
+		// a query naming no branch of the document is rewritten here. The
+		// watcher below only runs when the branch changes
 		if (!branch || branch.branchId === editorStore.activeBranchId) {
+			syncBranchQuery()
 			return
 		}
 
@@ -345,6 +391,27 @@ watchImmediate(
 	},
 )
 
+// the address bar names the active branch, so a copied url opens it. A
+// switch from one branch to another also drops the linked block, which
+// belongs to the branch being left
+watchImmediate(
+	() => editorStore.activeBranchId,
+	(_branchId, oldBranchId) => {
+		syncBranchQuery(!!oldBranchId)
+	},
+)
+
+// sync, so the hash is already current when a watcher above rewrites the
+// url in the same flush. A navigation to ?branch=<default>#<block> would
+// otherwise be rewritten with the hash of the route before it
+watch(
+	() => pageRoute.hash,
+	(hash) => {
+		linkedBlockHash.value = hash
+	},
+	{ flush: "sync" },
+)
+
 if (import.meta.client) {
 	watchImmediate(
 		() => activeDocMetadata.value?.id,
@@ -412,8 +479,75 @@ if (import.meta.client) {
 	)
 }
 
+// the inbox and the variables panel share one place, so opening one
+// closes the other. The variables panel stays open while it is in edit
+// mode, and the inbox waits until it leaves it.
 function toggleNotificationSidebar() {
+	if (!notificationSidebarOpen.value && variableEditing.value) {
+		showToastMessage(
+			"warning",
+			t("variable.editing-toast.title"),
+			t("variable.editing-toast.description"),
+		)
+		return
+	}
+
 	notificationSidebarOpen.value = !notificationSidebarOpen.value
+	if (notificationSidebarOpen.value) {
+		variableSidebarOpen.value = false
+	}
+}
+
+function toggleVariableSidebar() {
+	setVariableSidebarOpen(!variableSidebarOpen.value)
+}
+
+function setVariableSidebarOpen(open: boolean) {
+	if (!open && variableEditing.value) {
+		return
+	}
+
+	variableSidebarOpen.value = open
+	if (open) {
+		notificationSidebarOpen.value = false
+	}
+}
+
+// the query of this page's url with ?branch= naming the active branch.
+// The default branch is left unnamed, unless the url already names it.
+// Every replace of the url must take
+// its query from here. A replace with the route's old query would cancel
+// one that syncBranchQuery started in the same tick
+function branchQuery() {
+	const activeBranch = fetchBranches.state.value.data?.find(
+		(b) => b.branchId === editorStore.activeBranchId,
+	)
+	if (!activeBranch || pageRoute.query.branch === activeBranch.branchId) {
+		return pageRoute.query
+	}
+
+	return {
+		...pageRoute.query,
+		branch: activeBranch.default ? undefined : activeBranch.branchId,
+	}
+}
+
+function syncBranchQuery(dropLinkedBlock = false) {
+	const query = branchQuery()
+	if (query.branch === pageRoute.query.branch) {
+		return
+	}
+
+	if (dropLinkedBlock) {
+		linkedBlockHash.value = ""
+		clearTiptapScrollElementHighlightOverlays()
+	}
+
+	void pageRouter.replace({
+		path: pageRoute.path,
+		query: query,
+		hash: linkedBlockHash.value,
+	})
 }
 
 function applyDocumentNameChange(name: string) {
@@ -441,8 +575,8 @@ function applyDocumentNameChange(name: string) {
 			name,
 			activeDocMetadata.value.id,
 		)}`,
-		query: pageRoute.query,
-		hash: pageRoute.hash,
+		query: branchQuery(),
+		hash: linkedBlockHash.value,
 	})
 }
 
@@ -456,8 +590,8 @@ function refreshOrganizationRouteSlug() {
 			activeDocMetadata.value.name,
 			activeDocMetadata.value.id,
 		)}`,
-		query: pageRoute.query,
-		hash: pageRoute.hash,
+		query: branchQuery(),
+		hash: linkedBlockHash.value,
 	})
 }
 
@@ -620,39 +754,73 @@ function handleBranchMerge() {
 	editorStore.updateTargetBranchId(null)
 }
 
-function clearLinkHighlightNodeOnce() {
-	if (lastClearedLinkNodeHighlight === pageRoute.fullPath) {
+function clearLinkedBlock() {
+	if (!linkedBlockHash.value) {
 		return
 	}
 
-	lastClearedLinkNodeHighlight = pageRoute.fullPath
 	clearTiptapScrollElementHighlightOverlays()
+	linkedBlockHash.value = ""
+	void pageRouter.replace({
+		path: pageRoute.path,
+		query: branchQuery(),
+		hash: "",
+	})
 }
 </script>
 <template>
-	<ShadcnUiSidebarProvider>
+	<ShadcnUiSidebarProvider v-model:open="sidebarOpen">
 		<ShadcnUiTooltipProvider>
 			<AppSidebar
 				:all-initial-sections-loaded="allSectionsLoaded"
 				:notification-sidebar-open="notificationSidebarOpen"
+				:variable-sidebar-open="variableSidebarOpen"
+				:variable-editing="variableEditing"
+				:variable-usage="{
+					usedOnCurrentPage: usedVariableIds.size,
+					total: variableCount,
+				}"
 				@create-document="handleDocumentCreation"
 				@duplicate-document="handleDocumentDuplication"
 				@delete-document="handleDocumentDeletion"
 				@delete-tag="handleTagDeletion"
 				@open-settings="(target) => (settingModalOpen = target)"
+				@toggle-search="searchModalOpen = !searchModalOpen"
 				@toggle-settings="settingModalOpen = !settingModalOpen"
 				@toggle-shortcuts="shortcutsModalOpen = !shortcutsModalOpen"
 				@toggle-notifications="toggleNotificationSidebar"
+				@toggle-variables="toggleVariableSidebar"
 				@initial-load-complete="loadedSections.sidebar = true"
 			/>
-			<NotificationSidebar
+			<ExtraContextSidebar
 				v-model="notificationSidebarOpen"
-				@notification-navigation="resetLinkHighlightClearState"
-			/>
+				:title="t('sidebar.notification-sheet.title')"
+				:description="t('sidebar.notification-sheet.description')"
+			>
+				<template #default="{ close }">
+					<NotificationBox @close-notification-box="close" />
+				</template>
+			</ExtraContextSidebar>
+			<ExtraContextSidebar
+				:model-value="variableSidebarOpen"
+				:title="t('variable.title')"
+				:description="t('variable.sheet-description')"
+				@update:model-value="setVariableSidebarOpen"
+			>
+				<template #default="{ close }">
+					<VariablesPanel
+						v-model:editing="variableEditing"
+						class="h-full"
+						:used-variable-ids="usedVariableIds"
+						@close-variable-panel="close"
+					/>
+				</template>
+			</ExtraContextSidebar>
 			<SettingsBaseModal
 				v-model="settingModalOpen"
 				@refresh-organization-slug="refreshOrganizationRouteSlug"
 			/>
+			<SearchModal v-model="searchModalOpen" />
 			<ShortcutModal v-model="shortcutsModalOpen" />
 			<EditorBlocksMetricsConfigModalBaseModal
 				@open-settings="() => (settingModalOpen = 'metric-data-sources')"
@@ -691,7 +859,9 @@ function clearLinkHighlightNodeOnce() {
 									:key="activeDocMetadata.id"
 									:all-initial-sections-loaded="allSectionsLoaded"
 									:timestamps="timestamps"
-									@click="clearLinkHighlightNodeOnce"
+									@click="clearLinkedBlock"
+									@dragstart="clearLinkedBlock"
+									@keydown="clearLinkedBlock"
 									@updated-live-name="applyDocumentNameChange"
 									@updated-live-icon="applyIconChange"
 									@branch-merged="handleBranchMerge"

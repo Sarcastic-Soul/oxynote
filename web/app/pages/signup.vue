@@ -3,13 +3,23 @@ import { toTypedSchema } from "@vee-validate/zod"
 import { useForm } from "vee-validate"
 import * as z from "zod"
 // for some reason this isn't auto imported
-import { FormField as ShadcnUiFormField } from "@/components/shadcn/ui/form"
+import { FormField as ShadcnUiFormField } from "#layers/ui/app/components/shadcn/ui/form"
 import { showToastMessage } from "~/components/toast"
-import { cn } from "~/lib/utils"
+import { cn } from "#layers/ui/app/lib/utils"
 
 definePageMeta({
 	name: "signup",
 	skipAuth: true,
+	// a single-workspace instance has no open signup: only an invitee on
+	// the way to the invitation creates an account here.
+	middleware: async (to) => {
+		const { fetchAuthConfig } = useAuthAPI()
+		const { data } = await fetchAuthConfig.refresh()
+
+		if (data?.singleOrganization && !isInvitationRedirect(to.query.next)) {
+			return navigateTo("/", { replace: true })
+		}
+	},
 })
 
 const { t } = useI18n({ useScope: "global" })
@@ -93,10 +103,9 @@ const conditionsKeypath = computed(() => {
 	return null
 })
 const newAccountsAllowed = computed(() => {
-	return (
-		fetchOrganizationStats.state.value.data &&
-		fetchOrganizationStats.state.value.data.availableSlots > 0
-	)
+	const slots = fetchOrganizationStats.state.value.data?.availableSlots
+
+	return slots === null || (slots !== undefined && slots > 0)
 })
 
 let redirectTimeout: ReturnType<typeof setTimeout> | undefined

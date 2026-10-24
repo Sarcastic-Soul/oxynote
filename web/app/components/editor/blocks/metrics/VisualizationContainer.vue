@@ -4,12 +4,12 @@ import LineChart from "./visualizations/LineChart.vue"
 import GaugeChart from "./visualizations/GaugeChart.vue"
 import {
 	CONFIG_DEBOUNCE_MS,
-	RefreshInterval,
 	refreshIntervalToMs,
 	resolveTimeRange,
 	type MetricConfig,
 	type MetricSimulationPreset,
 } from "./utils"
+import { RefreshInterval } from "~/utils/time-range"
 import {
 	DEFAULT_SIMULATION_PRESET,
 	generateSimulatedQueryResults,
@@ -23,6 +23,7 @@ import {
 	type MultipleGaugeChartData,
 	type MultipleLineChartData,
 } from "./visualizations"
+import { useMetricVariables } from "./variables"
 
 const props = defineProps<{
 	config: MetricConfig
@@ -42,9 +43,16 @@ const { fetchDataSources, useMultipleGenericQueries } = useDataSourceAPI()
 const { checkMetricBlockSimulation } = useDocumentAPI()
 const { isEditable } = useEditorMeta()
 const editorStore = useEditorStore()
+const metricVariables = useMetricVariables()
 const isEditingDisabled = computed(() => {
 	return !isEditable.value || editorStore.reviewableDiffActive
 })
+const refreshIntervalMs = computed(() =>
+	refreshIntervalToMs(
+		metricVariables.refreshInterval(props.config.refreshInterval) ||
+			RefreshInterval.M5,
+	),
+)
 
 // a simulation stands in for a metric that has not arrived yet. A source
 // that cannot be reached is a different problem, and drawing a plausible
@@ -117,9 +125,11 @@ const fetchMetricData = useMultipleGenericQueries(
 		const queries = canUseDebouncedConfigInParams.value
 			? debouncedConfig.value.queries
 			: props.config.queries
-		const timeRange = canUseDebouncedConfigInParams.value
-			? debouncedConfig.value.timeRange
-			: props.config.timeRange
+		const timeRange = metricVariables.timeRange(
+			canUseDebouncedConfigInParams.value
+				? debouncedConfig.value.timeRange
+				: props.config.timeRange,
+		)
 		const visualizationType = canUseDebouncedConfigInParams.value
 			? debouncedConfig.value.visualizationType
 			: props.config.visualizationType
@@ -128,14 +138,23 @@ const fetchMetricData = useMultipleGenericQueries(
 			return null
 		}
 
+		const queryStrings = queries.map((q) => q.query)
+		// the values are part of the request's identity, so changing one
+		// makes the chart query again
+		const variableValues = metricVariables.queryValues(queryStrings)
+		if (!variableValues) {
+			return null
+		}
+
 		const resolvedTimeRange = resolveTimeRange(timeRange)
 
 		return {
-			queries: queries.map((q) => q.query),
+			queries: queryStrings,
 			chartType: visualizationType,
 			from: resolvedTimeRange.from,
 			to: resolvedTimeRange.to,
 			timeRangeKey: timeRange,
+			variableValues: variableValues,
 		}
 	},
 	// a simulated block draws generated data, so it must not reach the data
@@ -215,7 +234,7 @@ const data = computed<{
 			props.config.visualizationType,
 			generateSimulatedQueryResults(
 				preset,
-				props.config.timeRange,
+				metricVariables.timeRange(props.config.timeRange),
 				simulationNow.value,
 			),
 			debouncedConfig.value.decimals || null,
@@ -251,7 +270,7 @@ useIntervalFn(
 	() => {
 		void refreshData()
 	},
-	() => refreshIntervalToMs(props.config.refreshInterval || RefreshInterval.M5),
+	refreshIntervalMs,
 	{
 		immediate: true,
 		immediateCallback: false,
@@ -379,7 +398,7 @@ async function refreshData() {
 
 	editorStore.setMetricBlockNextRefreshTimestamp(
 		props.uid,
-		refreshIntervalToMs(props.config.refreshInterval || RefreshInterval.M5),
+		refreshIntervalMs.value,
 	)
 
 	if (simulationPreset.value) {
@@ -486,7 +505,7 @@ function openModal() {
 				<ShadcnUiEmpty v-if="config.dataSourceId">
 					<ShadcnUiEmptyHeader>
 						<ShadcnUiEmptyMedia variant="icon" class="size-9">
-							<Icon name="lucide:chart-line" class="size-6" />
+							<Icon :name="BLOCK_ICONS.metricBlock" class="size-6" />
 						</ShadcnUiEmptyMedia>
 						<ShadcnUiEmptyTitle>
 							{{ $t("editor.metrics.status.no-data-loaded.title") }}
@@ -530,7 +549,7 @@ function openModal() {
 				<ShadcnUiEmpty v-else>
 					<ShadcnUiEmptyHeader>
 						<ShadcnUiEmptyMedia variant="icon" class="size-9">
-							<Icon name="lucide:chart-line" class="size-6" />
+							<Icon :name="BLOCK_ICONS.metricBlock" class="size-6" />
 						</ShadcnUiEmptyMedia>
 						<ShadcnUiEmptyTitle>
 							{{ $t("editor.metrics.status.data-source-not-selected.title") }}
@@ -560,7 +579,7 @@ function openModal() {
 			<ShadcnUiEmpty v-else>
 				<ShadcnUiEmptyHeader>
 					<ShadcnUiEmptyMedia variant="icon" class="size-9">
-						<Icon name="lucide:chart-line" class="size-6" />
+						<Icon :name="BLOCK_ICONS.metricBlock" class="size-6" />
 					</ShadcnUiEmptyMedia>
 					<ShadcnUiEmptyTitle>
 						{{
@@ -596,7 +615,7 @@ function openModal() {
 			<ShadcnUiEmpty>
 				<ShadcnUiEmptyHeader>
 					<ShadcnUiEmptyMedia variant="icon" class="size-9">
-						<Icon name="lucide:chart-line" class="size-6" />
+						<Icon :name="BLOCK_ICONS.metricBlock" class="size-6" />
 					</ShadcnUiEmptyMedia>
 					<ShadcnUiEmptyTitle>
 						{{ $t("editor.metrics.status.query-error.title") }}
@@ -640,7 +659,7 @@ function openModal() {
 			<ShadcnUiEmpty>
 				<ShadcnUiEmptyHeader>
 					<ShadcnUiEmptyMedia variant="icon" class="size-9">
-						<Icon name="lucide:chart-line" class="size-6" />
+						<Icon :name="BLOCK_ICONS.metricBlock" class="size-6" />
 					</ShadcnUiEmptyMedia>
 					<ShadcnUiEmptyTitle>
 						{{ $t("editor.metrics.status.invalid-data.title") }}

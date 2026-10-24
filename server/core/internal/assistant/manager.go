@@ -45,20 +45,21 @@ const _sessionExpiration = time.Hour * 24 * 7
 
 // Manager holds dependencies shared across assistant sessions.
 type Manager struct {
-	log           *slog.Logger
-	db            tools.DB
-	search        tools.Searcher
-	searchTrigger tools.SearchTrigger
-	runners       tools.DataSourceRunners
-	model         model.ToolCallingChatModel
-	summary       model.ToolCallingChatModel
-	applier       tools.EditApplier
-	tree          tools.TreeNotifier
-	tags          tools.TagNotifier
-	hooks         tools.HookNotifier
+	log         *slog.Logger
+	db          tools.DB
+	search      tools.Searcher
+	searchQueue tools.SearchQueue
+	runners     tools.DataSourceRunners
+	model       model.ToolCallingChatModel
+	summary     model.ToolCallingChatModel
+	applier     tools.EditApplier
+	tree        tools.TreeNotifier
+	tags        tools.TagNotifier
 
 	githubMan       *github.Manager
 	webchangeClient *webchange.Client
+	hookMan         tools.HookManager
+	variableMan     tools.VariableManager
 
 	history     *persist.History
 	checkpoints *persist.Checkpoints
@@ -73,12 +74,17 @@ type Manager struct {
 	// turns tracks the conversation keys with a turn in flight. The
 	// claim lives here rather than on the session because every
 	// connection of the same (org, user) shares one history, pending
-	// record and checkpoint: two turns running at once — even from
-	// different connections — would overwrite each other's state.
+	// record and checkpoint. Two turns running at once, even from
+	// different connections, would overwrite each other's state.
 	turns struct {
 		mu sync.Mutex
 		m  map[string]struct{}
 	}
+
+	// loadToolsOnRequest keeps the grouped tools out of a conversation
+	// until the model loads them, which needs a model that expands tool
+	// references.
+	loadToolsOnRequest bool
 
 	metrics *metrics
 }
@@ -87,11 +93,15 @@ type Manager struct {
 // the provider package from the operator's configuration; summaryModel
 // backs context summarisation and may be the same model. The editClient
 // is the edit pipe to the Node hocuspocus service; the search client
-// backs the search_documents tool and searchTrigger runs the search-job
-// worker once a document write has committed; providerName labels token metrics so
-// usage stays readable across a provider change; githubMan and
-// webchangeClient are the integrations the hook tools create watchers
-// through; the tree notifier broadcasts sidebar refresh events after
+// backs the search_documents tool and searchQueue queues the
+// search jobs of document writes; providerName labels token
+// metrics so usage stays readable across a provider change.
+// loadToolsOnRequest says whether the model expands tool references, so
+// the grouped tools can load on request.
+//
+// githubMan and webchangeClient tell the hook tools which integrations
+// exist; hookMan runs hook writes and variableMan the variable reads and
+// writes. The tree notifier broadcasts sidebar refresh events after
 // document tree mutations and is wired post-construction via
 // SetTreeNotifier because the document handler that satisfies it is
 // built later, inside server.NewServer.
@@ -104,11 +114,14 @@ func NewManager(
 	fc metricutil.Factory,
 	editClient tools.EditApplier,
 	searcher tools.Searcher,
-	searchTrigger tools.SearchTrigger,
+	searchQueue tools.SearchQueue,
 	runners tools.DataSourceRunners,
 	githubMan *github.Manager,
 	webchangeClient *webchange.Client,
+	hookMan tools.HookManager,
+	variableMan tools.VariableManager,
 	providerName string,
+	loadToolsOnRequest bool,
 ) *Manager {
 	if summaryModel == nil {
 		summaryModel = chatModel
@@ -136,17 +149,19 @@ func NewManager(
 	}
 
 	m := &Manager{
-		log:           log,
-		db:            db,
-		search:        searcher,
-		searchTrigger: searchTrigger,
-		runners:       runners,
-		model:         chatModel,
-		summary:       summaryModel,
-		applier:       editClient,
+		log:         log,
+		db:          db,
+		search:      searcher,
+		searchQueue: searchQueue,
+		runners:     runners,
+		model:       chatModel,
+		summary:     summaryModel,
+		applier:     editClient,
 
 		githubMan:       githubMan,
 		webchangeClient: webchangeClient,
+		hookMan:         hookMan,
+		variableMan:     variableMan,
 
 		history:     persist.NewHistory(log, history),
 		checkpoints: persist.NewCheckpoints(log, blobs),
@@ -154,6 +169,8 @@ func NewManager(
 		offload:     persist.NewOffload(blobs),
 
 		stores: []persist.Starter{blobs, history, pendings},
+
+		loadToolsOnRequest: loadToolsOnRequest,
 
 		metrics: newMetrics(fc, providerName),
 	}
@@ -200,14 +217,6 @@ func (m *Manager) SetTagNotifier(tags tools.TagNotifier) {
 	m.tags = tags
 }
 
-// SetHookNotifier wires the hook-change notifier the assistant uses to
-// tell an open editor its hook indicators changed after hook mutations.
-// Like SetTagNotifier, call it once during startup, before serving
-// traffic.
-func (m *Manager) SetHookNotifier(hooks tools.HookNotifier) {
-	m.hooks = hooks
-}
-
 // ToolSet builds the tool registry for one (organization, user) pair
 // from the manager's shared wiring. The MCP surface uses it to serve
 // the same tools the assistant's sessions get, scoped the same way.
@@ -216,14 +225,15 @@ func (m *Manager) ToolSet(orgID, userID string) *tools.Set {
 		m.log,
 		m.db,
 		m.search,
-		m.searchTrigger,
+		m.searchQueue,
 		m.runners,
 		m.githubMan,
 		m.webchangeClient,
+		m.hookMan,
+		m.variableMan,
 		m.applier,
 		m.tree,
 		m.tags,
-		m.hooks,
 		m.offload,
 		orgID,
 		userID,
@@ -231,8 +241,8 @@ func (m *Manager) ToolSet(orgID, userID string) *tools.Set {
 }
 
 // claimTurn claims the conversation key for one turn, reporting whether
-// the claim succeeded. It fails while any session of the same key — the
-// same (org, user) on any connection — is already running one.
+// the claim succeeded. It fails while a turn of the same (org, user) runs
+// on any connection.
 func (m *Manager) claimTurn(key string) bool {
 	m.turns.mu.Lock()
 	defer m.turns.mu.Unlock()

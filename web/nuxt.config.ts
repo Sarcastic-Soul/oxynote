@@ -1,4 +1,4 @@
-import tailwindcss from "@tailwindcss/vite"
+import { blockIconList } from "./app/utils/block-icon"
 import { selectableIconList } from "./app/utils/icon"
 
 // DESKTOP_BUILD selects how `__DESKTOP_BUILD__` is materialized in the bundle:
@@ -32,7 +32,6 @@ export default defineNuxtConfig({
 				? `(typeof window !== "undefined" && window.__isElectron === true)`
 				: JSON.stringify(isDesktopBuild),
 		},
-		plugins: [tailwindcss()],
 		optimizeDeps: {
 			include: [
 				"@better-auth/electron/proxy",
@@ -43,14 +42,10 @@ export default defineNuxtConfig({
 				"@tiptap/vue-3",
 				"better-auth/client/plugins",
 				"better-auth/vue",
-				"class-variance-authority",
-				"clsx",
 				"fast-deep-equal",
 				"nanoid",
-				"reka-ui",
 				"safe-stable-stringify",
 				"slugify",
-				"tailwind-merge",
 				"vue-sonner",
 			],
 		},
@@ -71,10 +66,7 @@ export default defineNuxtConfig({
 
 	modules: [
 		"@nuxt/eslint",
-		"@nuxt/fonts",
 		"@nuxt/icon",
-		"shadcn-nuxt",
-		"@vueuse/nuxt",
 		"@nuxtjs/i18n",
 		"@pinia/nuxt",
 		"@pinia/colada-nuxt",
@@ -167,12 +159,6 @@ export default defineNuxtConfig({
 		},
 	},
 
-	fonts: {
-		defaults: {
-			weights: [400, 500, 600, 700],
-		},
-	},
-
 	icon: {
 		mode: "css",
 		cssLayer: "base",
@@ -182,7 +168,12 @@ export default defineNuxtConfig({
 			// one on first use: inlined for SSR, fetched in batches after
 			// client-side navigation. The desktop build has no server to ask
 			// and loads from disk, so it bundles them and stays offline-safe
-			icons: isDesktopBuild ? selectableIconList() : [],
+			icons: [
+				// the block icons are named in a .ts file, which the scan
+				// below does not read
+				...blockIconList(),
+				...(isDesktopBuild ? selectableIconList() : []),
+			],
 			scan: true,
 			sizeLimitKb: 256,
 		},
@@ -213,15 +204,10 @@ export default defineNuxtConfig({
 					"en/notification.json",
 					"en/apps.json",
 					"en/oauth.json",
+					"en/variable.json",
 				],
 			},
 		],
-	},
-
-	shadcn: {
-		prefix: "ShadcnUi",
-		// https://github.com/unovue/shadcn-vue/issues/763#issuecomment-2349290087
-		componentDir: "./app/components/shadcn/ui",
 	},
 
 	sentry: {

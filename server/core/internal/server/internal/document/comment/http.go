@@ -5,7 +5,6 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
-	"slices"
 
 	"github.com/oxynote/oxynote/server/core/internal/document"
 	commentCore "github.com/oxynote/oxynote/server/core/internal/document/comment"
@@ -124,17 +123,7 @@ func (h *Handler) CreateDocumentComment(w http.ResponseWriter, r *http.Request) 
 		maintainers = nil
 	}
 
-	var userIDs []string
-
-	for _, userID := range maintainers {
-		if userID == session.UserID {
-			continue
-		}
-
-		if !slices.Contains(userIDs, userID) {
-			userIDs = append(userIDs, userID)
-		}
-	}
+	userIDs := commentCore.Recipients(maintainers, session.UserID)
 
 	if len(userIDs) > 0 {
 		h.notifPub.PublishNotifications(
@@ -145,6 +134,7 @@ func (h *Handler) CreateDocumentComment(w http.ResponseWriter, r *http.Request) 
 				c.ID,
 				c.AnchorBlockID,
 				c.BranchID,
+				c.Content.Excerpt(),
 			),
 			userIDs...,
 		)
@@ -219,22 +209,6 @@ func (h *Handler) CreateDocumentCommentReply(w http.ResponseWriter, r *http.Requ
 		})
 	}
 
-	var userIDs []string
-
-	if c.UserID.Valid && !slices.Contains(userIDs, c.UserID.String) && c.UserID.String != session.UserID {
-		userIDs = append(userIDs, c.UserID.String)
-	}
-
-	for _, r := range c.Replies {
-		if !r.UserID.Valid || r.UserID.String == session.UserID {
-			continue
-		}
-
-		if !slices.Contains(userIDs, r.UserID.String) {
-			userIDs = append(userIDs, r.UserID.String)
-		}
-	}
-
 	h.notifPub.PublishNotifications(
 		session.ActiveOrganizationID,
 		notification.NewDocumentNewCommentReplyNotification(
@@ -244,8 +218,9 @@ func (h *Handler) CreateDocumentCommentReply(w http.ResponseWriter, r *http.Requ
 			reply.ID,
 			c.AnchorBlockID,
 			c.BranchID,
+			reply.Content.Excerpt(),
 		),
-		userIDs...,
+		commentCore.Recipients(c.Participants(), session.UserID)...,
 	)
 
 	httpserver.Respond(
@@ -562,6 +537,21 @@ func (h *Handler) UpdateDocumentCommentStatus(w http.ResponseWriter, r *http.Req
 			Type:      ChangeTypeUpdated,
 			CommentID: commentID,
 		})
+	}
+
+	if nc.Resolved {
+		h.notifPub.PublishNotifications(
+			session.ActiveOrganizationID,
+			notification.NewDocumentCommentResolvedNotification(
+				session.UserID,
+				documentID,
+				nc.ID,
+				nc.AnchorBlockID,
+				nc.BranchID,
+				nc.Content.Excerpt(),
+			),
+			commentCore.Recipients(nc.Participants(), session.UserID)...,
+		)
 	}
 
 	httpserver.Respond(

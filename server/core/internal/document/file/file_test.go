@@ -1,6 +1,7 @@
 package file
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/guregu/null/v5"
@@ -16,10 +17,23 @@ func TestMain(m *testing.M) {
 func Test_Location_Valid(t *testing.T) {
 	t.Parallel()
 
-	assert.True(t, LocationDocument.Valid())
-	assert.True(t, LocationComment.Valid())
-	assert.False(t, Location("attachment").Valid())
-	assert.False(t, Location("").Valid())
+	cc := map[string]struct {
+		Location Location
+		Result   bool
+	}{
+		"Document location": {Location: LocationDocument, Result: true},
+		"Comment location":  {Location: LocationComment, Result: true},
+		"Unknown location":  {Location: Location("attachment")},
+		"Empty location":    {Location: Location("")},
+	}
+
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, c.Result, c.Location.Valid())
+		})
+	}
 }
 
 func Test_NewFile(t *testing.T) {
@@ -153,16 +167,65 @@ func Test_Key(t *testing.T) {
 	)
 }
 
+func Test_CleanName(t *testing.T) {
+	cc := map[string]struct {
+		Raw    string
+		Result string
+	}{
+		"Plain name":             {Raw: "notes.zip", Result: "notes.zip"},
+		"Unix path":              {Raw: "/home/me/notes.zip", Result: "notes.zip"},
+		"Windows path":           {Raw: `C:\Users\me\notes.zip`, Result: "notes.zip"},
+		"Surrounding whitespace": {Raw: "  notes.zip  ", Result: "notes.zip"},
+		"Empty name":             {Raw: "", Result: "file"},
+		"Whitespace only":        {Raw: "   ", Result: "file"},
+		"Dot":                    {Raw: ".", Result: "file"},
+		"Root":                   {Raw: "/", Result: "file"},
+		"Non-ASCII name":         {Raw: "résumé.pdf", Result: "résumé.pdf"},
+		"Name over the rune cap": {Raw: strings.Repeat("é", 300), Result: strings.Repeat("é", 255)},
+		"Name at the rune cap":   {Raw: strings.Repeat("a", 255), Result: strings.Repeat("a", 255)},
+		"Path with a long base":  {Raw: "dir/" + strings.Repeat("b", 256), Result: strings.Repeat("b", 255)},
+	}
+
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, c.Result, CleanName(c.Raw))
+		})
+	}
+}
+
 func Test_File_Orphaned(t *testing.T) {
 	t.Parallel()
 
-	f := NewFile("file-1", LocationDocument, "key", xid.New(), "org-1", "shot.png", 1024, "image/png")
-	assert.False(t, f.Orphaned())
+	cc := map[string]struct {
+		DocumentID     null.Value[xid.ID]
+		OrganizationID null.String
+		Result         bool
+	}{
+		"Document and organization are set": {
+			DocumentID:     null.ValueFrom(xid.New()),
+			OrganizationID: null.StringFrom("org-1"),
+		},
+		"Document is unset": {
+			OrganizationID: null.StringFrom("org-1"),
+			Result:         true,
+		},
+		"Organization is unset": {
+			DocumentID: null.ValueFrom(xid.New()),
+			Result:     true,
+		},
+	}
 
-	f.DocumentID = null.Value[xid.ID]{}
-	assert.True(t, f.Orphaned())
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
 
-	f = NewFile("file-1", LocationDocument, "key", xid.New(), "org-1", "shot.png", 1024, "image/png")
-	f.OrganizationID = null.String{}
-	assert.True(t, f.Orphaned())
+			f := NewFile("file-1", LocationDocument, "key", xid.New(), "org-1", "shot.png", 1024, "image/png")
+			f.DocumentID = c.DocumentID
+			f.OrganizationID = c.OrganizationID
+
+			assert.Equal(t, c.Result, f.Orphaned())
+		})
+	}
 }

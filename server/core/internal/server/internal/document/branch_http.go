@@ -1,21 +1,15 @@
 package document
 
 import (
-	"context"
-	"errors"
-	"log/slog"
 	"net/http"
-	"slices"
 
 	"github.com/guregu/null/v5"
-	"github.com/oxynote/oxynote/server/core/internal/apps/webchange"
 	documentCore "github.com/oxynote/oxynote/server/core/internal/document"
-	"github.com/oxynote/oxynote/server/core/internal/document/hook"
+	"github.com/oxynote/oxynote/server/core/internal/document/hook/manager"
 	"github.com/oxynote/oxynote/server/core/internal/search"
 	"github.com/oxynote/oxynote/server/core/internal/server/internal/auth"
-	"github.com/oxynote/oxynote/server/core/pkg/errutil"
 	"github.com/oxynote/oxynote/server/core/pkg/httpserver"
-	"github.com/oxynote/oxynote/server/core/pkg/logutil"
+	"github.com/oxynote/oxynote/server/core/pkg/timeutil"
 	"github.com/rs/xid"
 )
 
@@ -59,10 +53,8 @@ func (h *Handler) UpdateDocumentBranch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// the main branch is found by name in the tree and content queries, and
-	// a rename would make the document look nameless and contentless.
-	if doc.Default && ui.Name.Valid && ui.Name.String != doc.BranchName {
-		httpserver.RespondError(h.log, w, ErrDefaultBranchRename)
+	if err := doc.AllowsBranchRename(ui.Name); err != nil {
+		httpserver.RespondError(h.log, w, err)
 		return
 	}
 
@@ -84,7 +76,7 @@ func (h *Handler) UpdateDocumentBranch(w http.ResponseWriter, r *http.Request) {
 
 	// the index carries the branch name on every entry of the branch.
 	if ndoc.BranchName != doc.BranchName {
-		if err := tx.InsertSearchJob(r.Context(), search.BranchScope(session.ActiveOrganizationID, ndoc.ID, ndoc.BranchID)); err != nil {
+		if err := h.searchQueue.Enqueue(r.Context(), tx, search.BranchScope(session.ActiveOrganizationID, ndoc.ID, ndoc.BranchID)); err != nil {
 			httpserver.RespondError(h.log, w, err)
 			return
 		}
@@ -94,8 +86,6 @@ func (h *Handler) UpdateDocumentBranch(w http.ResponseWriter, r *http.Request) {
 		httpserver.RespondError(h.log, w, err)
 		return
 	}
-
-	h.searchTrigger.Trigger()
 
 	if h.metadata.changeCallback != nil {
 		h.metadata.changeCallback(session.ActiveOrganizationID, ndoc)
@@ -200,23 +190,36 @@ func (h *Handler) UpdateDocumentBranchByIDUnsafe(w http.ResponseWriter, r *http.
 		return
 	}
 
+	// a persist that changes nothing, such as the Yjs seed Hocuspocus
+	// sends on first load, leaves history alone. Only a user persist
+	// naming its maintainers is attributed. Otherwise LastUpdatedBy still
+	// names an earlier editor.
+	if !doc.SnapshotEqual(ndoc) {
+		var lastUpdatedBy null.String
+		if !ui.System && len(ui.Maintainers) > 0 {
+			lastUpdatedBy = ndoc.LastUpdatedBy
+		}
+
+		err = tx.RecordDocumentBranchHistoryEntry(
+			r.Context(),
+			doc.BranchID,
+			doc.OrganizationID,
+			lastUpdatedBy,
+			false,
+		)
+		if err != nil {
+			httpserver.RespondError(h.log, w, err)
+			return
+		}
+	}
+
 	maintainers, err := tx.FetchDocumentMaintainers(r.Context(), doc.ID, doc.OrganizationID)
 	if err != nil {
 		httpserver.RespondError(h.log, w, err)
 		return
 	}
 
-	// the update carries the editors of one persist, so the set is only
-	// ever added to. Diffing it against the stored maintainers would drop
-	// everyone who happens not to be editing right now.
-	var maintainersAdded bool
-
-	for _, maintainer := range ui.Maintainers {
-		if !slices.Contains(maintainers, maintainer) {
-			maintainersAdded = true
-			break
-		}
-	}
+	maintainersAdded := ui.AddsMaintainers(maintainers)
 
 	if maintainersAdded {
 		if err = tx.UpsertDocumentMaintainers(
@@ -230,7 +233,7 @@ func (h *Handler) UpdateDocumentBranchByIDUnsafe(w http.ResponseWriter, r *http.
 		}
 	}
 
-	if err = tx.InsertSearchJob(r.Context(), search.BranchScope(doc.OrganizationID, doc.ID, doc.BranchID)); err != nil {
+	if err = h.searchQueue.Enqueue(r.Context(), tx, search.BranchScope(doc.OrganizationID, doc.ID, doc.BranchID)); err != nil {
 		httpserver.RespondError(h.log, w, err)
 		return
 	}
@@ -240,8 +243,6 @@ func (h *Handler) UpdateDocumentBranchByIDUnsafe(w http.ResponseWriter, r *http.
 		httpserver.RespondError(h.log, w, err)
 		return
 	}
-
-	h.searchTrigger.Trigger()
 
 	if h.metadata.changeCallback != nil {
 		h.metadata.changeCallback(doc.OrganizationID, ndoc)
@@ -285,11 +286,8 @@ func (h *Handler) MergeBranches(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// a self-merge would soft-delete the branch's hooks and comments and
-	// then copy the hooks back from the same, now hook-less, branch —
-	// permanently destroying both.
-	if inp.FromBranchID == inp.ToBranchID {
-		httpserver.RespondError(h.log, w, errutil.New(http.StatusBadRequest, "document.branch_self_merge", "cannot merge a branch into itself"))
+	if err = documentCore.AllowsMerge(inp.FromBranchID, inp.ToBranchID); err != nil {
+		httpserver.RespondError(h.log, w, err)
 		return
 	}
 
@@ -314,24 +312,51 @@ func (h *Handler) MergeBranches(w http.ResponseWriter, r *http.Request) {
 
 	var tx Tx
 
-	if err := h.db.BeginTx(r.Context(), &tx); err != nil {
+	if err = h.db.BeginTx(r.Context(), &tx); err != nil {
 		httpserver.RespondError(h.log, w, err)
 		return
 	}
 
 	defer tx.Rollback() //nolint:errcheck // error provides no meaningful info
 
-	if err := tx.DetachDocumentHooksByBranchID(r.Context(), toDoc.BranchID, session.ActiveOrganizationID); err != nil {
+	if err = tx.DetachDocumentHooksByBranchID(r.Context(), toDoc.BranchID, session.ActiveOrganizationID); err != nil {
 		httpserver.RespondError(h.log, w, err)
 		return
 	}
 
-	if err := tx.DeleteDocumentCommentsByBranchID(r.Context(), toDoc.BranchID, session.ActiveOrganizationID); err != nil {
+	if err = tx.DeleteDocumentCommentsByBranchID(r.Context(), toDoc.BranchID, session.ActiveOrganizationID); err != nil {
 		httpserver.RespondError(h.log, w, err)
 		return
 	}
 
-	if err := tx.UpdateDocument(r.Context(), ndoc); err != nil {
+	if err = tx.UpdateDocument(r.Context(), ndoc); err != nil {
+		httpserver.RespondError(h.log, w, err)
+		return
+	}
+
+	// the copies go in before the entry is recorded, so it lists them.
+	err = manager.CopyHooks(
+		r.Context(),
+		tx,
+		fromDoc.BranchID,
+		toDoc.BranchID,
+		toDoc.ID,
+		session.ActiveOrganizationID,
+		nil,
+	)
+	if err != nil {
+		httpserver.RespondError(h.log, w, err)
+		return
+	}
+
+	err = tx.RecordDocumentBranchHistoryEntry(
+		r.Context(),
+		toDoc.BranchID,
+		session.ActiveOrganizationID,
+		null.StringFrom(session.UserID),
+		true,
+	)
+	if err != nil {
 		httpserver.RespondError(h.log, w, err)
 		return
 	}
@@ -341,7 +366,7 @@ func (h *Handler) MergeBranches(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := tx.InsertSearchJob(r.Context(), search.BranchScope(session.ActiveOrganizationID, toDoc.ID, toDoc.BranchID)); err != nil {
+	if err := h.searchQueue.Enqueue(r.Context(), tx, search.BranchScope(session.ActiveOrganizationID, toDoc.ID, toDoc.BranchID)); err != nil {
 		httpserver.RespondError(h.log, w, err)
 		return
 	}
@@ -356,16 +381,7 @@ func (h *Handler) MergeBranches(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.searchTrigger.Trigger()
-
-	h.copyHooksToBranch(
-		r.Context(),
-		fromDoc.BranchID,
-		toDoc.BranchID,
-		toDoc.ID,
-		session.ActiveOrganizationID,
-		nil,
-	)
+	h.hookMan.SetUpBranch(r.Context(), toDoc.BranchID, session.ActiveOrganizationID)
 
 	if h.metadata.changeCallback != nil {
 		h.metadata.changeCallback(session.ActiveOrganizationID, ndoc)
@@ -466,12 +482,39 @@ func (h *Handler) CreateDocumentBranch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// the copies go in before the entry is recorded, so it lists them.
+	err = manager.CopyHooks(
+		r.Context(),
+		tx,
+		sourceDoc.BranchID,
+		newDoc.BranchID,
+		sourceDoc.ID,
+		session.ActiveOrganizationID,
+		nil,
+	)
+	if err != nil {
+		httpserver.RespondError(h.log, w, err)
+		return
+	}
+
+	err = tx.RecordDocumentBranchHistoryEntry(
+		r.Context(),
+		newDoc.BranchID,
+		session.ActiveOrganizationID,
+		null.StringFrom(session.UserID),
+		true,
+	)
+	if err != nil {
+		httpserver.RespondError(h.log, w, err)
+		return
+	}
+
 	if err := tx.CopyBranchTags(r.Context(), session.ActiveOrganizationID, sourceDoc.BranchID, newDoc.BranchID); err != nil {
 		httpserver.RespondError(h.log, w, err)
 		return
 	}
 
-	if err := tx.InsertSearchJob(r.Context(), search.BranchScope(session.ActiveOrganizationID, newDoc.ID, newDoc.BranchID)); err != nil {
+	if err := h.searchQueue.Enqueue(r.Context(), tx, search.BranchScope(session.ActiveOrganizationID, newDoc.ID, newDoc.BranchID)); err != nil {
 		httpserver.RespondError(h.log, w, err)
 		return
 	}
@@ -481,16 +524,7 @@ func (h *Handler) CreateDocumentBranch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.searchTrigger.Trigger()
-
-	h.copyHooksToBranch(
-		r.Context(),
-		sourceDoc.BranchID,
-		newDoc.BranchID,
-		sourceDoc.ID,
-		session.ActiveOrganizationID,
-		nil,
-	)
+	h.hookMan.SetUpBranch(r.Context(), newDoc.BranchID, session.ActiveOrganizationID)
 
 	httpserver.Respond(
 		h.log,
@@ -531,8 +565,8 @@ func (h *Handler) DeleteDocumentBranch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if branchDoc.Default {
-		httpserver.RespondError(h.log, w, errutil.New(http.StatusConflict, "document.default_branch", "cannot delete the default branch"))
+	if err = branchDoc.AllowsBranchDelete(); err != nil {
+		httpserver.RespondError(h.log, w, err)
 		return
 	}
 
@@ -543,7 +577,7 @@ func (h *Handler) DeleteDocumentBranch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if count <= 1 {
-		httpserver.RespondError(h.log, w, errutil.New(http.StatusConflict, "document.last_branch", "cannot delete the last branch"))
+		httpserver.RespondError(h.log, w, documentCore.ErrLastBranchDelete)
 		return
 	}
 
@@ -561,7 +595,7 @@ func (h *Handler) DeleteDocumentBranch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := tx.InsertSearchJob(r.Context(), search.BranchScope(session.ActiveOrganizationID, branchDoc.ID, branchID)); err != nil {
+	if err := h.searchQueue.Enqueue(r.Context(), tx, search.BranchScope(session.ActiveOrganizationID, branchDoc.ID, branchID)); err != nil {
 		httpserver.RespondError(h.log, w, err)
 		return
 	}
@@ -571,7 +605,67 @@ func (h *Handler) DeleteDocumentBranch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.searchTrigger.Trigger()
+	httpserver.Respond(
+		h.log,
+		w,
+		nil,
+		http.StatusNoContent,
+	)
+}
+
+// RecordDocumentBranchView handles recording that the user opened a
+// document branch, from anywhere unless the request names an origin.
+func (h *Handler) RecordDocumentBranchView(w http.ResponseWriter, r *http.Request) {
+	session, ok := auth.RequireSession(h.log, w, r)
+	if !ok {
+		return
+	}
+
+	inp := struct {
+		From search.ViewFrom `schema:"from"`
+	}{
+		From: search.ViewFromAll,
+	}
+
+	if err := httpserver.DecodeForm(r, &inp); err != nil {
+		httpserver.RespondError(h.log, w, err)
+		return
+	}
+
+	id, err := httpserver.ExtractNamedID(r, "documentId")
+	if err != nil {
+		httpserver.RespondError(h.log, w, err)
+		return
+	}
+
+	branchID, err := httpserver.ExtractNamedID(r, "branchId")
+	if err != nil {
+		httpserver.RespondError(h.log, w, err)
+		return
+	}
+
+	doc, err := h.db.FetchDocumentByBranchID(r.Context(), branchID, session.ActiveOrganizationID)
+	if err != nil {
+		httpserver.RespondError(h.log, w, err)
+		return
+	}
+
+	if doc.ID != id {
+		httpserver.RespondError(h.log, w, ErrBranchMismatch)
+		return
+	}
+
+	if err := h.db.UpsertDocumentBranchView(
+		r.Context(),
+		session.UserID,
+		session.ActiveOrganizationID,
+		branchID,
+		inp.From,
+		timeutil.Now(),
+	); err != nil {
+		httpserver.RespondError(h.log, w, err)
+		return
+	}
 
 	httpserver.Respond(
 		h.log,
@@ -581,91 +675,59 @@ func (h *Handler) DeleteDocumentBranch(w http.ResponseWriter, r *http.Request) {
 	)
 }
 
-// copyHooksToBranch fetches all hooks from fromBranchID and re-creates them on
-// toBranchID with fresh state, once the target is committed. Creating a hook
-// creates its external resource as a side effect, so the copy cannot run
-// inside the caller's transaction: a rollback cannot take a changedetection.io
-// watcher back, and the row that would have pointed at it is gone. A failed
-// insert tears the just-created resource down again for the same reason. A
-// failure stops the copy and leaves the target standing with fewer hooks than
-// its source, which the critical log reports.
-//
-// A branch whose content was duplicated carries fresh block uids, so the
-// caller passes the old-to-new uid map and a hook anchored to a block is
-// re-anchored through it; a hook whose block the map does not name has
-// nothing to point at on the target and is dropped. A nil map keeps every
-// block id as it is, which is right for a fork or a merge.
-func (h *Handler) copyHooksToBranch(
-	ctx context.Context,
-	fromBranchID, toBranchID, documentID xid.ID,
-	organizationID string,
-	uids map[string]string,
-) {
-	hooks, err := h.db.FetchDocumentHooksByBranchID(ctx, fromBranchID, organizationID)
-	if err != nil {
-		logutil.Critical(h.log, err).Error(
-			"cannot fetch the hooks to copy",
-			slog.String("branch_id", fromBranchID.String()),
-		)
-
+// SearchDocumentBranch handles the search for one page of the blocks
+// matching a query in one document branch.
+func (h *Handler) SearchDocumentBranch(w http.ResponseWriter, r *http.Request) {
+	session, ok := auth.RequireSession(h.log, w, r)
+	if !ok {
 		return
 	}
 
-	inp := hook.NewInput(organizationID, h.githubMan, h.webchangeClient)
-
-	for _, hk := range hooks {
-		blockID := hk.BlockID
-
-		if uids != nil && blockID.Valid {
-			uid, ok := uids[blockID.String]
-			if !ok {
-				continue
-			}
-
-			blockID = null.StringFrom(uid)
-		}
-
-		newHk, err := hook.NewHook(ctx, hook.CreateInput{
-			Type:     hk.Type,
-			BranchID: toBranchID,
-			BlockID:  blockID,
-			Settings: hk.Settings,
-		}, documentID, toBranchID, organizationID, inp)
-		if err != nil {
-			// a hook whose integration is not configured cannot get its
-			// external resource; dropping it from the copy beats failing
-			// the whole fork or merge over it.
-			if errors.Is(err, webchange.ErrNotConfigured) {
-				h.log.With("hook_id", hk.ID).
-					Warn("skipping hook copy: its integration is not configured")
-
-				continue
-			}
-
-			logutil.Critical(h.log, err).Error(
-				"cannot re-create the hook on the target branch",
-				slog.String("hook_id", hk.ID.String()),
-				slog.String("branch_id", toBranchID.String()),
-			)
-
-			return
-		}
-
-		if err := h.db.InsertDocumentHook(ctx, *newHk); err != nil {
-			if derr := newHk.Delete(ctx, inp); derr != nil {
-				logutil.Critical(h.log, derr).Error(
-					"cannot delete the hook external resource after a failed insert",
-					slog.String("hook_id", newHk.ID.String()),
-				)
-			}
-
-			logutil.Critical(h.log, err).Error(
-				"cannot insert the copied hook",
-				slog.String("hook_id", newHk.ID.String()),
-				slog.String("branch_id", toBranchID.String()),
-			)
-
-			return
-		}
+	var inp struct {
+		Query     string `schema:"q"`
+		Limit     int    `schema:"limit"`
+		NextToken string `schema:"nextToken"`
 	}
+
+	if err := httpserver.DecodeForm(r, &inp); err != nil {
+		httpserver.RespondError(h.log, w, err)
+		return
+	}
+
+	id, err := httpserver.ExtractNamedID(r, "documentId")
+	if err != nil {
+		httpserver.RespondError(h.log, w, err)
+		return
+	}
+
+	branchID, err := httpserver.ExtractNamedID(r, "branchId")
+	if err != nil {
+		httpserver.RespondError(h.log, w, err)
+		return
+	}
+
+	doc, err := h.db.FetchDocumentByBranchID(r.Context(), branchID, session.ActiveOrganizationID)
+	if err != nil {
+		httpserver.RespondError(h.log, w, err)
+		return
+	}
+
+	if doc.ID != id {
+		httpserver.RespondError(h.log, w, ErrBranchMismatch)
+		return
+	}
+
+	page, err := h.searcher.SearchBranch(r.Context(), search.BranchQuery{
+		OrganizationID: session.ActiveOrganizationID,
+		BranchID:       branchID,
+		Query:          inp.Query,
+		Limit:          inp.Limit,
+		PageToken:      inp.NextToken,
+	})
+	if err != nil {
+		httpserver.RespondError(h.log, w, err)
+		return
+	}
+
+	httpserver.Respond(h.log, w, search.NewBranchResponse(page), http.StatusOK)
 }

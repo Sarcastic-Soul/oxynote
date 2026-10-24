@@ -1,11 +1,14 @@
 package document
 
 import (
+	"bytes"
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
+	"reflect"
 	"strings"
 
 	"github.com/oxynote/oxynote/server/core/pkg/strutil"
@@ -17,12 +20,35 @@ import (
 // router mounts the file routes on this very format.
 const FilePathFormat = "/api/documents/%s/files/%s"
 
+// FileIDLength is the exact length of a file id, a nanoid. The id's
+// alphabet includes the dash, so a "<id>-<file name>" segment is split by
+// length, never at the first dash.
+const FileIDLength = strutil.NanoIDLength
+
 // FilePath returns the URL path a document's file is served under: the
 // file route with the id followed by a dash and the file name, so the
-// address reads as the file it is. Every uid is a 21-character nanoid,
+// address reads as the file it is. Every file id is a 21-character nanoid,
 // which is what lets the server cut the id off the front again.
 func FilePath(documentID xid.ID, id, name string) string {
 	return fmt.Sprintf(FilePathFormat, documentID, id+"-"+url.PathEscape(name))
+}
+
+// ParseFileRef cuts a "<id>-<file name>" route segment, as FilePath
+// builds it, back into its id and name, reporting whether the segment
+// has that shape. The id must be a nanoid: its charset shuts out the
+// path separators and dot segments that would otherwise let an id
+// escape its storage folder once joined into an object key.
+func ParseFileRef(ref string) (id, name string, ok bool) {
+	if len(ref) <= FileIDLength || ref[FileIDLength] != '-' {
+		return "", "", false
+	}
+
+	id = ref[:FileIDLength]
+	if !strutil.IsNanoID(id) {
+		return "", "", false
+	}
+
+	return id, ref[FileIDLength+1:], true
 }
 
 // RootBlock represents a block in a document.
@@ -47,32 +73,11 @@ func (rb RootBlock) FindByUID(uid string) (Block, bool) {
 	return Block{}, false
 }
 
-// FindParentTypeByUID recursively searches the root's subtree for the
-// block with the given uid and returns the node type of the block that
-// directly holds it. A top-level match reports BlockNodeDoc.
-func (rb RootBlock) FindParentTypeByUID(uid string) (BlockNodeType, bool) {
-	for _, b := range rb.Content {
-		if id, ok := b.UID(); ok && id == uid {
-			return BlockNodeDoc, true
-		}
-
-		if t, ok := b.FindParentTypeByUID(uid); ok {
-			return t, true
-		}
-	}
-
-	return "", false
-}
-
 // HasBlock searches for a block with the given ID in the root block.
 func (rb RootBlock) HasBlock(blockID string) bool {
-	for _, b := range rb.Content {
-		if b.HasBlock(blockID) {
-			return true
-		}
-	}
+	_, ok := rb.FindByUID(blockID)
 
-	return false
+	return ok
 }
 
 // Value transforms stopper type into a database entry.
@@ -132,35 +137,6 @@ func (b Block) UID() (string, bool) {
 	return id, ok
 }
 
-// Flatten returns the concatenated text of the block's entire
-// subtree. Adjacent text fragments are separated by a single space.
-// Used to derive a flat searchable representation from a structured
-// ProseMirror tree.
-func (b Block) Flatten() string {
-	var buf []byte
-	b.flattenInto(&buf)
-
-	return string(buf)
-}
-
-func (b Block) flattenInto(buf *[]byte) {
-	if b.Type == BlockNodeText {
-		if b.Text != "" {
-			if len(*buf) > 0 && (*buf)[len(*buf)-1] != ' ' {
-				*buf = append(*buf, ' ')
-			}
-
-			*buf = append(*buf, []byte(b.Text)...)
-		}
-
-		return
-	}
-
-	for _, c := range b.Content {
-		c.flattenInto(buf)
-	}
-}
-
 // FindByUID recursively searches the block's subtree (self included)
 // for the block with the given uid and returns it.
 func (b Block) FindByUID(uid string) (Block, bool) {
@@ -177,29 +153,29 @@ func (b Block) FindByUID(uid string) (Block, bool) {
 	return Block{}, false
 }
 
-// FindParentTypeByUID recursively searches the block's children for the
-// block with the given uid and returns the node type of the block that
-// directly holds it — b's own type for a direct child. A match on b
-// itself is not reported, since b's parent is not in view.
-func (b Block) FindParentTypeByUID(uid string) (BlockNodeType, bool) {
-	for _, cb := range b.Content {
-		if id, ok := cb.UID(); ok && id == uid {
-			return b.Type, true
-		}
-
-		if t, ok := cb.FindParentTypeByUID(uid); ok {
-			return t, true
+// FirstChild returns the block's first child of type typ, or the zero
+// block when it has none.
+func (b Block) FirstChild(typ BlockNodeType) Block {
+	for _, c := range b.Content {
+		if c.Type == typ {
+			return c
 		}
 	}
 
-	return "", false
+	return Block{}
 }
 
-// HasBlock recursively searches for a block with the given ID.
-func (b Block) HasBlock(blockID string) bool {
-	_, ok := b.FindByUID(blockID)
+// PlainText returns the text of b's text children, marks dropped.
+func (b Block) PlainText() string {
+	var sb strings.Builder
 
-	return ok
+	for _, c := range b.Content {
+		if c.Type == BlockNodeText {
+			sb.WriteString(c.Text)
+		}
+	}
+
+	return sb.String()
 }
 
 // Mark represents a mark, such as bold or italic.
@@ -209,6 +185,39 @@ type Mark struct {
 
 	// Attrs are additional attributes for the mark, such as link URL.
 	Attrs Attributes `json:"attrs,omitempty"`
+}
+
+// Equal reports whether m and o are the same mark with the same
+// attributes.
+func (m Mark) Equal(o Mark) bool {
+	return m.Type == o.Type && maps.EqualFunc(m.Attrs, o.Attrs, reflect.DeepEqual)
+}
+
+// UnmarshalJSON decodes the mark, reading attrs that are not an object
+// as none. Older documents hold marks with `true` for attrs, and one
+// failing mark would keep the whole document from being stored.
+func (m *Mark) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Type  string          `json:"type"`
+		Attrs json.RawMessage `json:"attrs"`
+	}
+
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("decoding mark: %w", err)
+	}
+
+	m.Type = raw.Type
+	m.Attrs = nil
+
+	if !bytes.HasPrefix(bytes.TrimSpace(raw.Attrs), []byte("{")) {
+		return nil
+	}
+
+	if err := json.Unmarshal(raw.Attrs, &m.Attrs); err != nil {
+		return fmt.Errorf("decoding mark attrs: %w", err)
+	}
+
+	return nil
 }
 
 // StripCommentMarks returns a copy of the RootBlock with all comment marks
@@ -351,21 +360,11 @@ func (d *duplication) regenerateUID(old any) string {
 	return uid
 }
 
-// rewriteFileRef points a duplicated image or file block at the
-// duplicate's own copy of the file and records the pair. Files served
-// from anywhere but the source document's file route are left as they
-// are: an externally hosted image has no object to copy.
+// rewriteFileRef points a duplicated block's src at the duplicate's own
+// copy of the file and records the pair. The file id is the fixed-length
+// segment after the source document's file route; a src served from
+// anywhere else has no object to copy and is left as it is.
 func (d *duplication) rewriteFileRef(attrs, newAttrs Attributes) {
-	oldID, ok := attrs[AttrUID].(string)
-	if !ok {
-		return
-	}
-
-	newID, ok := newAttrs[AttrUID].(string)
-	if !ok {
-		return
-	}
-
 	src, ok := attrs[AttrSrc].(string)
 	if !ok {
 		return
@@ -376,24 +375,26 @@ func (d *duplication) rewriteFileRef(attrs, newAttrs Attributes) {
 		return
 	}
 
-	// the id is followed by the dash and the file name.
-	oldPath := fmt.Sprintf(FilePathFormat, d.oldDocumentID, oldID)
-
-	idx := strings.Index(u.Path, oldPath)
-	if idx < 0 {
+	prefix, rest, ok := strings.Cut(u.Path, fmt.Sprintf(FilePathFormat, d.oldDocumentID, ""))
+	if !ok {
 		return
 	}
 
-	rest := u.Path[idx+len(oldPath):]
-	if !strings.HasPrefix(rest, "-") {
+	oldID, name, ok := ParseFileRef(rest)
+	if !ok {
 		return
+	}
+
+	newID, ok := d.files[oldID]
+	if !ok {
+		newID = strutil.NanoID()
+		d.files[oldID] = newID
 	}
 
 	// only the path is swapped: the src was built by the frontend from its
 	// own api base url, which need not match this server's public url.
-	u.Path = u.Path[:idx] + fmt.Sprintf(FilePathFormat, d.newDocumentID, newID) + rest
+	u.Path = prefix + fmt.Sprintf(FilePathFormat, d.newDocumentID, newID) + "-" + name
 	u.RawPath = ""
 
 	newAttrs[AttrSrc] = u.String()
-	d.files[oldID] = newID
 }

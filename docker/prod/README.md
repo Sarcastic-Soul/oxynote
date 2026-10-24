@@ -40,13 +40,13 @@ fails the boot with an error naming it.
 
 | Variable | Meaning |
 | --- | --- |
-| `OXYNOTE_DB_DSN` | an external PostgreSQL, e.g. `postgresql://user:pass@host/db?sslmode=require`. Unset, the image runs its own PostgreSQL 18 with its data under `/oxynote/data/postgres`; set, the embedded one never starts. One database serves the whole product; migrations run automatically at boot. |
+| `OXYNOTE_DB_DSN` | an external PostgreSQL, e.g. `postgresql://user:pass@host/db?sslmode=require`. Unset, the image runs its own PostgreSQL 18 with its data under `/oxynote/data/postgres`; set, the embedded one never starts. One database serves the whole product; migrations run automatically at boot. The role needs `CREATE` on the database, since core keeps its job queue in a `dbos` schema. |
 
 ### Public address
 
 | Variable | Meaning |
 | --- | --- |
-| `OXYNOTE_PUBLIC_URL` | the origin users open in the browser, e.g. `https://notes.example.com`. Scheme + host only — every public URL, the cookie domain, and the CORS rules derive from it. Defaults to `http://localhost:8080`, which is right only while the container's port 8080 is published as host port 8080; set it for a domain or any other host port. |
+| `OXYNOTE_PUBLIC_URL` | the origin users open in the browser, e.g. `https://notes.example.com`. Scheme + host only — every public URL, the cookie domain, and the CORS rules derive from it. Defaults to `http://localhost:8080`, which is right only while the container's port 8080 is published as host port 8080; set it for a domain or any other host port. The MCP server needs an `https://` origin or a loopback host; on any other `http://` origin it is off and the boot logs a warning. |
 
 ### Optional features
 
@@ -84,9 +84,36 @@ Setting `OXYNOTE_SMTP_DSN` later brings the email flows back after a
 restart. Accounts created in the meantime have unverified addresses, so
 their next login sends a verification link first.
 
+### Workspaces
+
+`OXYNOTE_MAX_ORGANIZATIONS` caps the number of workspaces and
+`OXYNOTE_MAX_ORGANIZATION_MEMBERS` the members of each. `-1` removes a
+limit. Members are unlimited by default.
+
+The workspace limit defaults to `1`, which runs the image as a single
+workspace:
+
+- The first boot creates a workspace and its admin. The workspace gets the
+  name of a place in space, such as Sea of Clouds, picked at random. Sign in
+  as `admin@example.com` with the password `oxynote-admin-1234`, then change
+  the email address, the password and the workspace name in the settings.
+  The admin's address receives no email, so a new address is confirmed by a
+  link sent to the new address only.
+- Nobody can sign up without an invitation. The signup page sends other
+  visitors to the login page, and an invited address can create its account
+  from the invitation link.
+- The last member cannot delete their account.
+
+The login page shows the default email and password until the admin
+changes the password. Anyone who can reach the instance can sign in with
+them until then, so change the password before exposing the instance.
+
+Any other value lets people sign up and create their own workspace until
+the limit is reached. After that they can still sign up, but only to join a
+workspace through an invitation.
+
 ### Tuning
 
-`OXYNOTE_MAX_ORGANIZATIONS`, `OXYNOTE_MAX_ORGANIZATION_MEMBERS`,
 `OXYNOTE_RATE_LIMIT_DISABLED` (`true`/`false`; the built-in limiter buckets
 by client IP — disable it behind a proxy that hides the original IP and rate
 limit there instead), `OXYNOTE_MAX_DOCUMENT_HISTORY_ENTRIES`,

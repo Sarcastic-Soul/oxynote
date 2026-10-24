@@ -230,7 +230,6 @@ describe("<ImageBlock>", { concurrent: false }, () => {
 	it.for([
 		{ status: "added", expected: "diff-added" },
 		{ status: "removed", expected: "diff-removed" },
-		{ status: "modified", expected: "diff-modified" },
 	])(
 		"marks a $status image with its diff overlay",
 		async ({ status, expected }, { expect }) => {
@@ -242,6 +241,21 @@ describe("<ImageBlock>", { concurrent: false }, () => {
 			expect(wrapper.get(".diff-overlay").classes()).toContain(expected)
 		},
 	)
+
+	it("counts a modified image's changes instead of tinting it", async ({
+		expect,
+	}) => {
+		const wrapper = await mountImage({
+			src: "https://cdn.test/b.png",
+			diffStatus: "modified",
+			oldNode: { attrs: { uid: "image-1", src: "https://cdn.test/a.png" } },
+		})
+
+		expect(wrapper.find(".diff-overlay").exists()).toBe(false)
+		expect(wrapper.text()).toContain(
+			t("editor.diff-change-marker.label", { removed: 1, added: 1 }),
+		)
+	})
 
 	it("shows no diff overlay on an unchanged image", async ({ expect }) => {
 		const wrapper = await mountImage({
@@ -425,8 +439,12 @@ describe("<ImageBlock>", { concurrent: false }, () => {
 		await vi.waitFor(() => {
 			expect(calls).toHaveLength(1)
 		}, WAIT_FOR_OPTIONS)
+		// the upload carries an id of its own, never the block's uid, so a
+		// replacement leaves the previous object in place
+		const fileId = String(calls[0]?.query.id)
+		expect(fileId).toMatch(/^[A-Za-z0-9_-]{21}$/)
 		expect(calls[0]?.query).toEqual({
-			id: "image-1",
+			id: fileId,
 			location: "document",
 			kind: "image",
 		})
@@ -434,36 +452,11 @@ describe("<ImageBlock>", { concurrent: false }, () => {
 		expect(updateAttributes).toHaveBeenNthCalledWith(1, { uploading: true })
 		expect(updateAttributes).toHaveBeenNthCalledWith(2, {
 			src: matchingString(
-				new RegExp(`/api/documents/${DOCUMENT_ID}/files/image-1-shot.png$`),
+				new RegExp(`/api/documents/${DOCUMENT_ID}/files/${fileId}-shot.png$`),
 			),
-			uid: "image-1",
 			uploading: false,
 		})
 		expect(toast.custom).toHaveBeenCalledTimes(0)
-	})
-
-	it("uploads under a generated id when the node has none", async ({
-		expect,
-	}) => {
-		const calls = mockEndpoint(
-			"POST",
-			`/api/documents/${DOCUMENT_ID}/files`,
-			(_call, event) => {
-				setResponseHeader(event, "location", "https://cdn.test/stored.png")
-
-				return uploadedImage()
-			},
-		)
-		const updateAttributes = vi.fn()
-		const wrapper = await mountImage({ uid: null }, updateAttributes)
-
-		await pickFile(wrapper, pngFile())
-
-		await vi.waitFor(() => {
-			expect(calls).toHaveLength(1)
-		}, WAIT_FOR_OPTIONS)
-		expect(calls[0]?.query.id).toEqual(expect.any(String))
-		expect(calls[0]?.query.id).not.toBe("")
 	})
 
 	it("does nothing when the file dialog is dismissed", async ({ expect }) => {

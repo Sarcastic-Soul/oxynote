@@ -1,3 +1,4 @@
+import { enableAutoUnmount } from "@vue/test-utils"
 import { afterEach, beforeEach, describe, it, vi } from "vitest"
 import { toast } from "vue-sonner"
 import {
@@ -17,6 +18,7 @@ import {
 	seedPersistentState,
 	settleMutations,
 	t,
+	teleportedButton,
 } from "./test-helpers"
 
 vi.mock("vue-sonner", () => ({
@@ -26,6 +28,9 @@ vi.mock("vue-sonner", () => ({
 const DOC_ID = "doc1".padEnd(20, "0")
 const MAIN_BRANCH = "main".padEnd(20, "0")
 const DRAFT_BRANCH = "draft".padEnd(20, "0")
+// a branch that is still being created has a temporary id, one character
+// longer than the id the server gives it
+const UNSAVED_DRAFT_BRANCH = "draft".padEnd(21, "0")
 // the divider between the document options and the assistant button is a
 // bare div, and the header draws no other one
 const ASSISTANT_SEPARATOR_SELECTOR = "div.w-px"
@@ -84,6 +89,10 @@ function menuItemTexts() {
 // app-wide singletons every mount in the file shares, and the menus are
 // teleported into the shared <body>
 describe("<DocumentHeader>", { concurrent: false }, () => {
+	// the reviewability modal stays mounted and patches its teleported
+	// dialog after the test
+	enableAutoUnmount(afterEach)
+
 	beforeEach(() => {
 		clearQueryCache()
 		vi.mocked(toast.custom).mockReset()
@@ -102,6 +111,7 @@ describe("<DocumentHeader>", { concurrent: false }, () => {
 	})
 
 	afterEach(() => {
+		vi.useRealTimers()
 		disposeMockEndpoints()
 		// the options menus teleport into the shared <body> and their ids
 		// repeat across mounts, so a leftover would answer the next lookup
@@ -149,6 +159,30 @@ describe("<DocumentHeader>", { concurrent: false }, () => {
 		})
 
 		expect(wrapper.text()).toContain("Edited Mar 14")
+	})
+
+	it("names an editor who is gone as a deleted user", async ({ expect }) => {
+		vi.useFakeTimers()
+		mainOnly()
+		const wrapper = await mountHeader({
+			timestamps: {
+				[MAIN_BRANCH]: {
+					updated: { at: "2026-03-14T12:00:00Z", user: null },
+					created: { at: "2026-03-01T12:00:00Z", user: null },
+				},
+			},
+		})
+		const edited = wrapper
+			.findAll("[data-slot='tooltip-trigger']")
+			.find((trigger) => trigger.text().includes("Edited"))
+
+		await edited?.trigger("pointermove")
+		await vi.advanceTimersByTimeAsync(1000)
+
+		const tooltip = document.getElementById(
+			edited?.attributes("aria-describedby") ?? "",
+		)
+		expect(tooltip?.textContent).toContain(t("general.deleted-user"))
 	})
 
 	it("omits the timestamp when the branch has none", async ({ expect }) => {
@@ -226,9 +260,20 @@ describe("<DocumentHeader>", { concurrent: false }, () => {
 
 		const wrapper = await mountHeader()
 
-		expect(wrapper.text()).toContain(
-			t("editor.navbar.document-modes.main.title"),
-		)
+		expect(wrapper.text()).toContain(t("general.branch-labels.main"))
+	})
+
+	it("offers no branch picker while the draft branch is still being created", async ({
+		expect,
+	}) => {
+		seedBranches([
+			{ branchId: MAIN_BRANCH, branch: "main", default: true },
+			{ branchId: UNSAVED_DRAFT_BRANCH, branch: "draft", default: false },
+		])
+
+		const wrapper = await mountHeader()
+
+		expect(wrapper.text()).not.toContain(t("general.branch-labels.main"))
 	})
 
 	it("names the draft version when the draft branch is active", async ({
@@ -239,9 +284,7 @@ describe("<DocumentHeader>", { concurrent: false }, () => {
 
 		const wrapper = await mountHeader()
 
-		expect(wrapper.text()).toContain(
-			t("editor.navbar.document-modes.draft.title"),
-		)
+		expect(wrapper.text()).toContain(t("general.branch-labels.draft"))
 	})
 
 	it("falls back to the main version when the active branch is unknown", async ({
@@ -252,9 +295,7 @@ describe("<DocumentHeader>", { concurrent: false }, () => {
 
 		const wrapper = await mountHeader()
 
-		expect(wrapper.text()).toContain(
-			t("editor.navbar.document-modes.main.title"),
-		)
+		expect(wrapper.text()).toContain(t("general.branch-labels.main"))
 	})
 
 	it("switches to the draft branch from the version picker", async ({
@@ -265,7 +306,7 @@ describe("<DocumentHeader>", { concurrent: false }, () => {
 		const wrapper = await mountHeader()
 		await wrapper.get("[data-slot='dropdown-menu-trigger']").trigger("click")
 
-		menuItem(t("editor.navbar.document-modes.draft.title")).click()
+		menuItem(t("general.branch-labels.draft")).click()
 		await nextTick()
 
 		expect(editorStore.activeBranchId).toBe(DRAFT_BRANCH)
@@ -281,7 +322,7 @@ describe("<DocumentHeader>", { concurrent: false }, () => {
 		const wrapper = await mountHeader()
 		await wrapper.get("[data-slot='dropdown-menu-trigger']").trigger("click")
 
-		menuItem(t("editor.navbar.document-modes.main.title")).click()
+		menuItem(t("general.branch-labels.main")).click()
 		await nextTick()
 
 		expect(editorStore.activeBranchId).toBe(MAIN_BRANCH)
@@ -405,7 +446,44 @@ describe("<DocumentHeader>", { concurrent: false }, () => {
 		expect(updated[0]?.body).toEqual({ protected: true })
 	})
 
-	it("closes the review workflow by dropping every draft and unprotecting main", async ({
+	it("asks for confirmation before dropping every draft and unprotecting main", async ({
+		expect,
+	}) => {
+		vi.useFakeTimers()
+		mainAndDraft()
+		const deleted = mockEndpoint(
+			"DELETE",
+			`http://test.local/auth-realtime/api/documents/${DOC_ID}/branches/${DRAFT_BRANCH}`,
+			() => ({}),
+		)
+		const updated = mockEndpoint(
+			"PUT",
+			`http://test.local/auth-realtime/api/documents/${DOC_ID}/branches/${MAIN_BRANCH}`,
+			() => ({}),
+		)
+		const wrapper = await mountHeader()
+		await openOptionsMenu(wrapper)
+
+		menuItem(
+			t("editor.navbar.document-options.review-workflow.disable-title"),
+		).click()
+		await nextTick()
+
+		expect(deleted).toHaveLength(0)
+
+		teleportedButton(
+			t(
+				"editor.navbar.document-options.review-workflow.disable-confirm-modal.confirm-button",
+			),
+		).click()
+		await vi.advanceTimersByTimeAsync(300)
+		await settleMutations()
+
+		expect(deleted).toHaveLength(1)
+		expect(updated[0]?.body).toEqual({ protected: false })
+	})
+
+	it("leaves every branch alone when the confirmation is cancelled", async ({
 		expect,
 	}) => {
 		mainAndDraft()
@@ -425,10 +503,17 @@ describe("<DocumentHeader>", { concurrent: false }, () => {
 		menuItem(
 			t("editor.navbar.document-options.review-workflow.disable-title"),
 		).click()
-		await settleMutations()
+		await nextTick()
 
-		expect(deleted).toHaveLength(1)
-		expect(updated[0]?.body).toEqual({ protected: false })
+		teleportedButton(
+			t(
+				"editor.navbar.document-options.review-workflow.disable-confirm-modal.cancel-button",
+			),
+		).click()
+		await nextTick()
+
+		expect.soft(deleted).toHaveLength(0)
+		expect.soft(updated).toHaveLength(0)
 	})
 
 	it("warns when the reviewability change fails", async ({ expect }) => {

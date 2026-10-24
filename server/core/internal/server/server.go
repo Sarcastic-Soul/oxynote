@@ -12,13 +12,16 @@ import (
 
 	"github.com/blang/semver/v4"
 	"github.com/coder/websocket"
+	"github.com/guregu/null/v5"
 	githubCore "github.com/oxynote/oxynote/server/core/internal/apps/github"
 	slackCore "github.com/oxynote/oxynote/server/core/internal/apps/slack"
 	"github.com/oxynote/oxynote/server/core/internal/apps/webchange"
 	assistantCore "github.com/oxynote/oxynote/server/core/internal/assistant"
 	"github.com/oxynote/oxynote/server/core/internal/buildinfo"
 	datasourceCore "github.com/oxynote/oxynote/server/core/internal/datasource"
+	hookCore "github.com/oxynote/oxynote/server/core/internal/document/hook"
 	notificationCore "github.com/oxynote/oxynote/server/core/internal/notification"
+	"github.com/oxynote/oxynote/server/core/internal/search"
 	"github.com/oxynote/oxynote/server/core/internal/server/internal/assistant"
 	"github.com/oxynote/oxynote/server/core/internal/server/internal/auth"
 	"github.com/oxynote/oxynote/server/core/internal/server/internal/block"
@@ -35,9 +38,11 @@ import (
 	"github.com/oxynote/oxynote/server/core/internal/server/internal/slack"
 	"github.com/oxynote/oxynote/server/core/internal/server/internal/tag"
 	"github.com/oxynote/oxynote/server/core/internal/server/internal/user"
+	"github.com/oxynote/oxynote/server/core/internal/server/internal/variable"
 	"github.com/oxynote/oxynote/server/core/pkg/httpserver"
 	"github.com/oxynote/oxynote/server/core/pkg/logutil"
 	"github.com/oxynote/oxynote/server/core/pkg/metricutil"
+	"github.com/oxynote/oxynote/server/core/pkg/sqlutil"
 	"github.com/oxynote/oxynote/server/core/pkg/timeutil"
 	"github.com/oxynote/wetsocks/wsserver"
 )
@@ -90,6 +95,10 @@ func (o Options) validate() error {
 		return errors.New("invalid port")
 	}
 
+	if !o.MCP.Enabled() {
+		return nil
+	}
+
 	return o.MCP.Validate()
 }
 
@@ -112,6 +121,7 @@ type Server struct {
 		organization *org.Handler
 		document     *document.Handler
 		tag          *tag.Handler
+		variable     *variable.Handler
 		comment      *comment.Handler
 		files        *files.Handler
 		hook         *hook.Handler
@@ -142,8 +152,10 @@ func NewServer(
 	githubMan *githubCore.Manager,
 	slackMan *slackCore.Manager,
 	webchangeClient *webchange.Client,
+	hookMan HookManager,
+	variableMan VariableManager,
 	searcher document.Searcher,
-	searchTrigger SearchTrigger,
+	searchQueue SearchQueue,
 	notifier Notifier,
 	emailSender email.Sender,
 	client *http.Client,
@@ -162,24 +174,26 @@ func NewServer(
 			Slack:           slackMan.Configured(),
 			AIAssistant:     opts.Assistant,
 			ChangeDetection: webchangeClient.Configured(),
+			MCP:             opts.MCP.Enabled(),
 		},
 	}
 
-	srv.handlers.user = user.NewHandler(log, db, storageClient, opts.PublicURL+_userImageLocationFormat)
+	srv.handlers.user = user.NewHandler(log, db, storageClient, opts.PublicURL)
 	srv.handlers.organization = org.NewHandler(
 		log,
 		db,
 		storageClient,
 		githubMan,
 		webchangeClient,
-		searchTrigger,
-		opts.PublicURL+_organizationLogoLocation,
+		searchQueue,
+		opts.PublicURL,
 	)
-	srv.handlers.document = document.NewHandler(log, db, githubMan, webchangeClient, searcher, searchTrigger, notifier, storageClient)
+	srv.handlers.document = document.NewHandler(log, db, hookMan, searcher, searchQueue, notifier, storageClient)
 	srv.handlers.tag = tag.NewHandler(log, db)
+	srv.handlers.variable = variable.NewHandler(log, variableMan)
 	srv.handlers.comment = comment.NewHandler(log, db, notifier)
 	srv.handlers.files = files.NewHandler(log, db, storageClient, opts.PublicURL)
-	srv.handlers.hook = hook.NewHandler(log, db, githubMan, webchangeClient)
+	srv.handlers.hook = hook.NewHandler(log, db, hookMan)
 
 	// The assistant's CRUD tools mutate the document tree directly
 	// via the DB layer, bypassing the HTTP handlers that normally
@@ -188,21 +202,27 @@ func NewServer(
 	// rename/set-icon.
 	assistantMan.SetTreeNotifier(srv.handlers.document)
 	assistantMan.SetTagNotifier(srv.handlers.tag)
-	assistantMan.SetHookNotifier(srv.handlers.hook)
+	hookMan.BindHookChange(func(h hookCore.Hook) {
+		srv.handlers.hook.NotifyHooksChange(h.OrganizationID.String, h.DocumentID, h.BranchID)
+	})
+	variableMan.BindChange(srv.handlers.variable.NotifyChange)
 
 	// the MCP handler serves the assistant's tool registry over the
 	// Model Context Protocol; it must be built after the tree notifier
 	// is wired so MCP-driven mutations notify sidebars too.
-	mcpHandler, err := mcp.NewHandler(log, assistantMan, db, client, opts.MCP)
-	if err != nil {
-		return nil, fmt.Errorf("building mcp handler: %w", err)
+	if opts.MCP.Enabled() {
+		mcpHandler, err := mcp.NewHandler(log, assistantMan, db, client, opts.MCP)
+		if err != nil {
+			return nil, fmt.Errorf("building mcp handler: %w", err)
+		}
+
+		srv.handlers.mcp = mcpHandler
 	}
 
-	srv.handlers.mcp = mcpHandler
 	srv.handlers.github = github.NewHandler(log, db, githubMan)
 	srv.handlers.slack = slack.NewHandler(log, db, client, slackMan)
 	srv.handlers.notification = notification.NewHandler(log, db, notifier)
-	srv.handlers.datasource = datasource.NewHandler(log, db, datasourceMan)
+	srv.handlers.datasource = datasource.NewHandler(log, db, datasourceMan, variableMan)
 	srv.handlers.block = block.NewHandler(log, blockRunner)
 	srv.handlers.email = email.NewHandler(log, emailSender)
 
@@ -361,6 +381,31 @@ type DB interface {
 	tag.DB
 }
 
+// HookManager runs the hook writes and sets up the hooks a branch operation
+// copied.
+//
+//go:generate ../../scripts/codegen/mock -t internal HookManager hook_manager
+type HookManager interface {
+	hook.Manager
+	document.HookManager
+
+	// BindHookChange should set the function called with every hook the
+	// manager stores, changes or deletes.
+	BindHookChange(fn func(hookCore.Hook))
+}
+
+// VariableManager runs the variable writes and announces them.
+//
+//go:generate ../../scripts/codegen/mock -t internal VariableManager variable_manager
+type VariableManager interface {
+	variable.Manager
+
+	// BindChange should set the function called after every write, with
+	// the user whose own value changed or a null user for a change of the
+	// organization's variables.
+	BindChange(fn func(organizationID string, userID null.String))
+}
+
 // Storer is an interface that defines methods for uploading and retrieving objects.
 //
 //go:generate ../../scripts/codegen/mock -t internal Storer
@@ -371,13 +416,13 @@ type Storer interface {
 	document.Storer
 }
 
-// SearchTrigger runs the search-job worker once a job has committed; the
-// handlers call it after their commits.
+// SearchQueue queues search jobs.
 //
-//go:generate ../../scripts/codegen/mock -t internal SearchTrigger search_trigger
-type SearchTrigger interface {
-	// Trigger should run a search-job pass right away.
-	Trigger()
+//go:generate ../../scripts/codegen/mock -t internal SearchQueue search_queue
+type SearchQueue interface {
+	// Enqueue should queue the job on the transaction, to run once it
+	// commits.
+	Enqueue(ctx context.Context, tx sqlutil.Tx, j search.Job) error
 }
 
 // Notifier is an interface that combines notificationCore.Notifier and

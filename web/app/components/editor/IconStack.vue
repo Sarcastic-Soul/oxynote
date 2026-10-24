@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { compareAsc } from "date-fns"
-import { cn } from "~/lib/utils"
+import { cn } from "#layers/ui/app/lib/utils"
 
 export interface IconMetadata {
 	id: string
@@ -8,7 +8,7 @@ export interface IconMetadata {
 	url?: string
 	icon?: string
 	approved?: boolean
-	staleHook?: boolean
+	triggeredHook?: boolean
 	hookUpdatedAt?: Date | string
 }
 
@@ -24,9 +24,9 @@ const visible = computed(() => {
 	const icons = props.icons
 	return icons
 		.sort((a, b) => {
-			if (a.staleHook && !b.staleHook) {
+			if (a.triggeredHook && !b.triggeredHook) {
 				return -1
-			} else if (!a.staleHook && b.staleHook) {
+			} else if (!a.triggeredHook && b.triggeredHook) {
 				return 1
 			}
 
@@ -79,12 +79,18 @@ const extra = computed(() => Math.max(0, props.icons.length - 3))
 								<ShadcnUiAvatarFallback v-if="im.icon">
 									<Icon
 										:name="im.icon"
-										:data-hook-stale="im.staleHook ? 'stale' : undefined"
+										:data-hook-triggered="
+											im.triggeredHook ? 'triggered' : undefined
+										"
 										class="size-3.5"
 									/>
 								</ShadcnUiAvatarFallback>
 								<ShadcnUiAvatarFallback v-else class="rounded-md text-2xs">
-									{{ extractInitials(im.name || "", 2) }}
+									<LazyDefaultAvatar
+										kind="user"
+										:seed="im.id"
+										:name="im.name"
+									/>
 								</ShadcnUiAvatarFallback>
 							</ShadcnUiAvatar>
 						</div>

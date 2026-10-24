@@ -383,14 +383,54 @@ export const DragHandlePlugin = ({
 	const resolvedPluginKey: PluginKey<DragHandlePluginState> =
 		typeof pluginKey === "string" ? new PluginKey(pluginKey) : pluginKey
 
+	// the opacity is what fades. Visibility only flips once the fade has
+	// run, if the handle's class transitions it too
 	function hideHandle() {
 		element.style.visibility = "hidden"
+		element.style.opacity = "0"
 		element.style.pointerEvents = "none"
 	}
 
 	function showHandle() {
 		element.style.visibility = ""
+		element.style.opacity = ""
 		element.style.pointerEvents = "auto"
+	}
+
+	// the handle is a single element, so moving it to another node would
+	// jump. A copy stays behind on the old node and fades out, and the
+	// handle starts from nothing so that showHandle fades it in
+	function leaveFadingCopy() {
+		if (element.style.visibility === "hidden") {
+			return
+		}
+
+		const copy = element.cloneNode(true) as HTMLElement
+		copy.inert = true
+		copy.setAttribute("aria-hidden", "true")
+		copy.style.pointerEvents = "none"
+		// a quick move can catch the handle still fading in
+		copy.style.opacity = getComputedStyle(element).opacity
+		wrapper.appendChild(copy)
+
+		// the handle drops to 0 at once, with its transition off, and
+		// showHandle fades it back in from there
+		const transition = element.style.transition
+		element.style.transition = "none"
+		element.style.opacity = "0"
+		// the browser only fades from a style it has already applied.
+		// Measuring makes it apply the styles set so far: the handle at 0
+		// and the copy at its starting opacity
+		element.getBoundingClientRect()
+		element.style.transition = transition
+
+		copy.style.opacity = "0"
+		// the copy goes once its fade has run, or at once without one
+		void Promise.allSettled(
+			copy.getAnimations().map((animation) => animation.finished),
+		).then(() => {
+			copy.remove()
+		})
 	}
 
 	function repositionDragHandle(dom: Element, currentNodePos: number) {
@@ -515,6 +555,10 @@ export const DragHandlePlugin = ({
 			return
 		}
 
+		if (result.pos !== currentNodePos) {
+			leaveFadingCopy()
+		}
+
 		currentNode = result.node
 		currentNodePos = result.pos
 		currentNodeRelPos = findRelativePos(editor.view.state, currentNodePos)
@@ -551,12 +595,32 @@ export const DragHandlePlugin = ({
 		forgetNode()
 	}
 
+	// the handle sits in the margin, outside the editor, so the editor's own
+	// mouseleave keeps it when the pointer moves onto it. Leaving the handle
+	// for anywhere but the editor has to take it away instead
+	function onHandleMouseLeave(e: MouseEvent) {
+		if (locked) {
+			return
+		}
+
+		const target = e.relatedTarget as globalThis.Node | null
+		if (
+			target &&
+			(editor.view.dom.contains(target) || wrapper.contains(target))
+		) {
+			return
+		}
+
+		forgetNode()
+	}
+
 	function trackMouse(e: MouseEvent) {
 		lastMouseCoords = { x: e.clientX, y: e.clientY }
 	}
 
 	element.addEventListener("dragstart", onDragStart)
 	element.addEventListener("dragend", onDragEnd)
+	element.addEventListener("mouseleave", onHandleMouseLeave)
 
 	wrapper.appendChild(element)
 	hideHandle()
@@ -565,6 +629,7 @@ export const DragHandlePlugin = ({
 		unbind() {
 			element.removeEventListener("dragstart", onDragStart)
 			element.removeEventListener("dragend", onDragEnd)
+			element.removeEventListener("mouseleave", onHandleMouseLeave)
 
 			if (animationFrameId) {
 				cancelAnimationFrame(animationFrameId)
@@ -804,6 +869,8 @@ export const DragHandlePlugin = ({
 							// false positives when the same logical node gets a new object
 							// reference after document updates
 							if (nodePos !== currentNodePos) {
+								leaveFadingCopy()
+
 								currentNode = node
 								currentNodePos = nodePos
 								currentNodeRelPos = findRelativePos(view.state, currentNodePos)

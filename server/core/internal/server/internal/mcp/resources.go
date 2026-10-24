@@ -5,12 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
-	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/oxynote/oxynote/server/core/internal/assistant/tools"
 	"github.com/oxynote/oxynote/server/core/pkg/errutil"
-	"github.com/rs/xid"
 )
 
 // _documentMIMEType is the media type of a document resource body: the
@@ -32,9 +30,9 @@ func (h *Handler) addResources(
 	srv.AddResourceTemplate(&mcp.ResourceTemplate{
 		Name:        "document-branch",
 		Title:       "Oxynote document branch",
-		Description: "One branch of an Oxynote document, by document and branch id: its metadata, branches and blocks in canonical JSON form.",
+		Description: "One branch of an Oxynote document, by document and branch id: its metadata, its branches and its content as XML markup, one element per block.",
 		MIMEType:    _documentMIMEType,
-		URITemplate: _resourceURIPrefix + "{id}" + _resourceBranchSegment + "{branch_id}",
+		URITemplate: _resourceURITemplate,
 	}, read)
 
 	tree, err := h.db.FetchDocumentTree(ctx, session.OrganizationID)
@@ -55,7 +53,7 @@ func (h *Handler) addResources(
 	// reader lands on without picking one.
 	for _, s := range tree.Descendants() {
 		srv.AddResource(&mcp.Resource{
-			URI:      _resourceURIPrefix + s.ID.String() + _resourceBranchSegment + s.DefaultBranchID.String(),
+			URI:      resourceURI(s.ID, s.DefaultBranchID),
 			Name:     s.DocumentName,
 			MIMEType: _documentMIMEType,
 		}, read)
@@ -67,24 +65,14 @@ func (h *Handler) addResources(
 // output shape stay identical to a tool call.
 func (h *Handler) readDocument(set *tools.Set) mcp.ResourceHandler {
 	return func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
-		rest, ok := strings.CutPrefix(req.Params.URI, _resourceURIPrefix)
-		if !ok || rest == "" {
-			return nil, mcp.ResourceNotFoundError(req.Params.URI)
-		}
-
 		// a resource names a document and one of its branches; anything
-		// short of that, or a branch segment that is not an id, names
-		// nothing.
-		id, branchID, ok := strings.Cut(rest, _resourceBranchSegment)
-		if !ok || id == "" || branchID == "" {
+		// short of that names nothing.
+		id, branchID, ok := parseResourceURI(req.Params.URI)
+		if !ok {
 			return nil, mcp.ResourceNotFoundError(req.Params.URI)
 		}
 
-		if _, err := xid.FromString(branchID); err != nil {
-			return nil, mcp.ResourceNotFoundError(req.Params.URI)
-		}
-
-		raw, err := json.Marshal(map[string]string{"document_id": id, "branch_id": branchID})
+		raw, err := json.Marshal(map[string]string{"document_id": id.String(), "branch_id": branchID.String()})
 		if err != nil {
 			// NOCOV: two string fields always marshal.
 			return nil, err
@@ -96,7 +84,7 @@ func (h *Handler) readDocument(set *tools.Set) mcp.ResourceHandler {
 			return nil, errors.New("get_document tool not registered")
 		}
 
-		res, err := get.Tool.Run(ctx, json.RawMessage(raw))
+		out, err := get.Tool.Run(ctx, json.RawMessage(raw))
 		if err != nil {
 			if errutil.IsNotFound(err) || errors.Is(err, tools.ErrUnknownDocument) || errors.Is(err, tools.ErrUnknownBranch) {
 				return nil, mcp.ResourceNotFoundError(req.Params.URI)
@@ -111,7 +99,7 @@ func (h *Handler) readDocument(set *tools.Set) mcp.ResourceHandler {
 			Contents: []*mcp.ResourceContents{{
 				URI:      req.Params.URI,
 				MIMEType: _documentMIMEType,
-				Text:     res.Output,
+				Text:     out,
 			}},
 		}, nil
 	}

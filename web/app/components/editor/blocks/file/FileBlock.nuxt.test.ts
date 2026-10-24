@@ -361,7 +361,6 @@ describe("<FileBlock>", { concurrent: false }, () => {
 	it.for([
 		{ status: "added", expected: "diff-added" },
 		{ status: "removed", expected: "diff-removed" },
-		{ status: "modified", expected: "diff-modified" },
 	])(
 		"marks a $status file with its diff overlay",
 		async ({ status, expected }, { expect }) => {
@@ -371,6 +370,26 @@ describe("<FileBlock>", { concurrent: false }, () => {
 			expect(wrapper.get("a").classes()).toContain("diff-overlay-anchor")
 		},
 	)
+
+	it("counts a modified file's changes instead of tinting it", async ({
+		expect,
+	}) => {
+		const wrapper = await mountFile(
+			storedZip({
+				diffStatus: "modified",
+				oldNode: { attrs: storedZip({ uid: "file-1", size: 1 }) },
+			}),
+		)
+
+		const label = t("editor.diff-change-marker.label", {
+			removed: 1,
+			added: 1,
+		})
+		expect(wrapper.find(".diff-overlay").exists()).toBe(false)
+		expect(wrapper.text()).toContain(label)
+		// hovering a marker inside the card would set off the card's hover
+		expect(wrapper.get("a").text()).not.toContain(label)
+	})
 
 	it("shows no diff overlay on an unchanged file", async ({ expect }) => {
 		const wrapper = await mountFile(storedZip({ diffStatus: "unchanged" }))
@@ -457,8 +476,12 @@ describe("<FileBlock>", { concurrent: false }, () => {
 		await vi.waitFor(() => {
 			expect(calls).toHaveLength(1)
 		}, WAIT_FOR_OPTIONS)
+		// the upload carries an id of its own, never the block's uid, so a
+		// replacement leaves the previous object in place
+		const fileId = String(calls[0]?.query.id)
+		expect(fileId).toMatch(/^[A-Za-z0-9_-]{21}$/)
 		expect(calls[0]?.query).toEqual({
-			id: "file-1",
+			id: fileId,
 			location: "document",
 			kind: "file",
 		})
@@ -470,39 +493,14 @@ describe("<FileBlock>", { concurrent: false }, () => {
 		})
 		expect(updateAttributes).toHaveBeenNthCalledWith(2, {
 			src: matchingString(
-				new RegExp(`/api/documents/${DOCUMENT_ID}/files/file-1-notes.zip$`),
+				new RegExp(`/api/documents/${DOCUMENT_ID}/files/${fileId}-notes.zip$`),
 			),
-			uid: "file-1",
 			name: "notes.zip",
 			size: 6,
 			contentType: "application/zip",
 			uploading: false,
 		})
 		expect(toast.custom).toHaveBeenCalledTimes(0)
-	})
-
-	it("uploads under a generated id when the node has none", async ({
-		expect,
-	}) => {
-		const calls = mockEndpoint(
-			"POST",
-			`/api/documents/${DOCUMENT_ID}/files`,
-			(_call, event) => {
-				setResponseHeader(event, "location", "https://cdn.test/stored.zip")
-
-				return uploadedZip()
-			},
-		)
-		const updateAttributes = vi.fn()
-		const wrapper = await mountFile({ uid: null }, updateAttributes)
-
-		await pickFile(wrapper, zipFile())
-
-		await vi.waitFor(() => {
-			expect(calls).toHaveLength(1)
-		}, WAIT_FOR_OPTIONS)
-		expect(calls[0]?.query.id).toEqual(expect.any(String))
-		expect(calls[0]?.query.id).not.toBe("")
 	})
 
 	it("does nothing when the file dialog is dismissed", async ({ expect }) => {

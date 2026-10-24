@@ -6,8 +6,6 @@ import (
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/schema"
-	"github.com/oxynote/oxynote/server/core/internal/assistant/block"
-	"github.com/oxynote/oxynote/server/core/internal/document"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -15,79 +13,72 @@ import (
 func Test_buildSystemPrompt(t *testing.T) {
 	t.Parallel()
 
-	// no active document returns the base prompt verbatim
-	assert.Equal(t, _basePrompt, buildSystemPrompt("", ""))
+	cc := map[string]struct {
+		DocumentID  string
+		BranchID    string
+		Result      string
+		Contains    []string
+		NotContains []string
+	}{
+		"No active document returns the base prompt verbatim": {
+			Result: _basePrompt,
+		},
+		"Active document appends the current context section": {
+			DocumentID: "doc-123",
+			Contains: []string{
+				_basePrompt,
+				"## Current context",
+				"`doc-123`",
 
-	// an active document appends the current-context section
-	got := buildSystemPrompt("doc-123", "")
-	assert.Contains(t, got, _basePrompt)
-	assert.Contains(t, got, "## Current context")
-	assert.Contains(t, got, "`doc-123`")
-	assert.NotContains(t, got, "on branch")
+				// the model reads and writes content as markup, keeping
+				// ids.
+				"replace_blocks, keeping the id of every element that stays",
+				"branch_id",
 
-	// a branch other than the default one is named, and the model is
-	// told to read and write with it.
-	branched := buildSystemPrompt("doc-123", "draft")
-	assert.Contains(t, branched, "`doc-123` on branch `draft`")
-	assert.Contains(t, branched, "write with branch_id `draft`")
-	assertHouseStyle(t, branched)
-
-	// documents have branches, and the prompt says so.
-	assert.Contains(t, got, "Documents have branches")
-	assert.Contains(t, got, "assign_tag and unassign_tag take a branch_id")
-	assert.Contains(t, got, "create_hook takes the branch_id like the content tools")
-
-	// width is the one metric enum the prompt is still the only source
-	// for: attrs is a single field shared by every block type, and
-	// width means something else on an image, so the tool schema cannot
-	// publish it. The rest moved there, where Test_attrProps pins them.
-	for _, v := range block.MetricEnums()[document.AttrWidth] {
-		assert.Contains(t, got, v, "width value %q is missing from the prompt", v)
+				// the rubber duck stance needs its counterweight: an
+				// explicit request for text is written, not interviewed
+				// about.
+				"When someone asks for text, write it",
+			},
+			NotContains: []string{"on branch"},
+		},
+		"Active branch is named": {
+			// a branch other than the default one is named, and the
+			// model is told to read and write with it.
+			DocumentID: "doc-123",
+			BranchID:   "draft",
+			Contains: []string{
+				"`doc-123` on branch `draft`",
+				"write with branch_id `draft`",
+			},
+		},
 	}
 
-	for _, attr := range []string{
-		document.AttrDataSourceID,
-		document.AttrVisualizationType,
-		document.AttrQueries,
-		document.AttrTimeRange,
-		document.AttrRefreshInterval,
-		document.AttrThresholds,
-		document.AttrBaseThresholdColor,
-		document.AttrDecimals,
-		document.AttrUnitType,
-		document.AttrUnitCustom,
-		document.AttrAxisBoundsMin,
-		document.AttrAxisBoundsMax,
-		document.AttrSimulationPreset,
-	} {
-		assert.Contains(t, got, attr, "attr %q is missing from the prompt", attr)
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			got := buildSystemPrompt(c.DocumentID, c.BranchID)
+
+			if c.Result != "" {
+				assert.Equal(t, c.Result, got)
+			}
+
+			for _, want := range c.Contains {
+				assert.Contains(t, got, want)
+			}
+
+			for _, unwanted := range c.NotContains {
+				assert.NotContains(t, got, unwanted)
+			}
+
+			// the model copies the prompt's own punctuation, so the text
+			// carries no em dash, and it spells organisation the way the
+			// product does.
+			assert.NotContains(t, got, "\u2014")
+			assert.NotContains(t, got, "organization")
+		})
 	}
-
-	// the model authors metric blocks now, so the prompt must not still
-	// tell it not to.
-	assert.NotContains(t, got, "do not author")
-
-	// the block model is the only schema the chat model sees, so every
-	// type the tools accept has to be in it.
-	for _, bt := range block.Types() {
-		assert.Contains(t, _blockModelSection, "| "+bt+" |", "block type %q is missing from the prompt", bt)
-	}
-
-	// the rubber duck stance needs its counterweight: an explicit
-	// request for text is written, not interviewed about.
-	assert.Contains(t, got, "When someone asks for text, write it")
-
-	assertHouseStyle(t, got)
-}
-
-// assertHouseStyle checks the rules every model-facing text follows:
-// the model copies the prompt's own punctuation, so the text carries
-// no em dash, and it spells organisation the way the product does.
-func assertHouseStyle(t *testing.T, text string) {
-	t.Helper()
-
-	assert.NotContains(t, text, "\u2014")
-	assert.NotContains(t, text, "organization")
 }
 
 func Test_MCPInstructions(t *testing.T) {
@@ -96,66 +87,146 @@ func Test_MCPInstructions(t *testing.T) {
 	got := MCPInstructions()
 
 	// the shared sections ship verbatim, so the two surfaces describe
-	// the same block model, etiquette, and aesthetics.
+	// the same workflow, content model, etiquette and style.
+	assert.Contains(t, got, _workflowSection)
 	assert.Contains(t, got, _blockModelSection)
 	assert.Contains(t, got, _etiquetteSection)
 	assert.Contains(t, got, _aestheticsSection)
 
-	// reordering is the etiquette rule the surface exists to teach.
-	assert.Contains(t, got, "move_block")
+	// Claude Code shows the first 2 KB of a server's instructions and
+	// drops the rest.
+	assert.Less(t, len(got), 2000)
 
 	// an MCP client learns about branches and the protected rule here.
-	assert.Contains(t, got, "Documents have branches")
-	assert.Contains(t, got, "assign_tag and unassign_tag take a branch_id")
-	assert.Contains(t, got, "create_hook takes the branch_id like the content tools")
+	assert.Contains(t, got, "names a branch by branch_id")
 	assert.Contains(t, got, "protected branch is read-only")
+
+	// metrics follow the built-in variables on both surfaces.
+	assert.Contains(t, got, "Metrics follow the built-in metric_range and metric_refresh variables")
 
 	// the persona and its confirmation flow are the chat surface's;
 	// telling an MCP client about either would be a lie.
 	assert.NotContains(t, got, "Rubber Duck")
 	assert.NotContains(t, got, "confirmation")
 
-	assertHouseStyle(t, got)
+	// the house style holds here as in the chat prompt.
+	assert.NotContains(t, got, "—")
+	assert.NotContains(t, got, "organization")
 }
 
 func Test_genModelInput(t *testing.T) {
 	t.Parallel()
 
-	msgs, err := genModelInput(context.Background(), "", &adk.AgentInput{
-		Messages: []*schema.Message{schema.UserMessage("hello")},
-	})
-	require.NoError(t, err)
-	require.Len(t, msgs, 2)
-
-	// the prompt is prepended to every run rather than stored in the
-	// conversation, so it cannot be summarised or cleared away.
-	assert.Equal(t, schema.System, msgs[0].Role)
-	assert.NotEmpty(t, msgs[0].Content)
-	assert.Equal(t, "hello", msgs[1].Content)
-
-	// a restored conversation carries the system prompts previous runs
-	// prepended; only the fresh one may reach the model, or the prompt
-	// stacks up a copy per turn.
-	msgs, err = genModelInput(context.Background(), "", &adk.AgentInput{
-		Messages: []*schema.Message{
-			schema.SystemMessage("stale prompt"),
-			schema.UserMessage("hello"),
-			schema.AssistantMessage("hi", nil),
-			schema.SystemMessage("another stale prompt"),
+	// Result lists the content of every message after the system
+	// prompt.
+	cc := map[string]struct {
+		Messages []*schema.Message
+		Result   []string
+	}{
+		"Prompt is prepended to the conversation": {
+			// the prompt is prepended to every run rather than stored in
+			// the conversation, so it cannot be summarised or cleared
+			// away.
+			Messages: []*schema.Message{schema.UserMessage("hello")},
+			Result:   []string{"hello"},
 		},
-	})
-	require.NoError(t, err)
-	require.Len(t, msgs, 3)
+		"Stale system prompts are dropped": {
+			// a restored conversation carries the system prompts
+			// previous runs prepended; only the fresh one may reach the
+			// model, or the prompt stacks up a copy per turn.
+			Messages: []*schema.Message{
+				schema.SystemMessage("stale prompt"),
+				schema.UserMessage("hello"),
+				schema.AssistantMessage("hi", nil),
+				schema.SystemMessage("another stale prompt"),
+			},
+			Result: []string{"hello", "hi"},
+		},
+	}
 
-	assert.Equal(t, schema.System, msgs[0].Role)
-	assert.NotEqual(t, "stale prompt", msgs[0].Content)
-	assert.Equal(t, "hello", msgs[1].Content)
-	assert.Equal(t, "hi", msgs[2].Content)
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			msgs, err := genModelInput(context.Background(), "", &adk.AgentInput{
+				Messages: c.Messages,
+			})
+			require.NoError(t, err)
+			require.Len(t, msgs, len(c.Result)+1)
+
+			assert.Equal(t, schema.System, msgs[0].Role)
+			assert.NotEmpty(t, msgs[0].Content)
+			assert.NotEqual(t, "stale prompt", msgs[0].Content)
+
+			for i, want := range c.Result {
+				assert.Equal(t, want, msgs[i+1].Content)
+			}
+		})
+	}
 }
 
 func Test_sessionString(t *testing.T) {
 	t.Parallel()
 
-	// outside a run there is no session, so nothing is stored.
-	assert.Empty(t, sessionString(context.Background(), _sessionKeyActiveDocument))
+	cc := map[string]struct {
+		InRun  bool
+		Values map[string]any
+		Result string
+	}{
+		"Outside a run nothing is stored": {},
+		"Run without the key stores nothing": {
+			InRun: true,
+		},
+		"Stored string is returned": {
+			InRun:  true,
+			Values: map[string]any{_sessionKeyActiveDocument: "doc-1"},
+			Result: "doc-1",
+		},
+		"Stored value of another type is ignored": {
+			InRun:  true,
+			Values: map[string]any{_sessionKeyActiveDocument: 42},
+		},
+	}
+
+	for cn, c := range cc {
+		t.Run(cn, func(t *testing.T) {
+			t.Parallel()
+
+			if !c.InRun {
+				assert.Equal(t, c.Result, sessionString(context.Background(), _sessionKeyActiveDocument))
+
+				return
+			}
+
+			// adk keeps session values on a context only a run builds,
+			// so the value is read from inside one.
+			var got string
+
+			agent, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
+				Name:        _agentName,
+				Description: _agentDescription,
+				Model:       stubChatModel(),
+				GenModelInput: func(ctx context.Context, _ string, input *adk.AgentInput) ([]*schema.Message, error) {
+					got = sessionString(ctx, _sessionKeyActiveDocument)
+
+					return input.Messages, nil
+				},
+			})
+			require.NoError(t, err)
+
+			iter := adk.NewRunner(context.Background(), adk.RunnerConfig{Agent: agent}).Run(
+				context.Background(),
+				[]*schema.Message{schema.UserMessage("hi")},
+				adk.WithSessionValues(c.Values),
+			)
+
+			for {
+				if _, ok := iter.Next(); !ok {
+					break
+				}
+			}
+
+			assert.Equal(t, c.Result, got)
+		})
+	}
 }

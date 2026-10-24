@@ -1,3 +1,4 @@
+import { flushPromises } from "@vue/test-utils"
 import { setResponseHeader } from "h3"
 import { afterEach, beforeEach, describe, it, vi } from "vitest"
 import { toast } from "vue-sonner"
@@ -152,6 +153,27 @@ describe("<WorkspaceSection>", { concurrent: false }, () => {
 		})
 	})
 
+	it("saves a name made of several words", async ({ expect }) => {
+		seedWorkspace()
+		const calls = mockAuthEndpoint("organization/update", () => ({
+			id: "org-1",
+		}))
+		const { wrapper } = await mountSection()
+
+		await nameInput(wrapper).setValue("Sea of Clouds")
+		await nameInput(wrapper).trigger("blur")
+
+		// the save chains vee-validate's validation, the update request and
+		// a refetch, none of which the component signals the end of
+		await vi.waitFor(() => {
+			expect(calls).toHaveLength(1)
+		}, WAIT_FOR_OPTIONS)
+		expect(calls[0]?.body).toEqual({
+			data: { name: "Sea of Clouds" },
+			organizationId: "org-1",
+		})
+	})
+
 	it("saves nothing when the name is unchanged", async ({ expect }) => {
 		seedWorkspace()
 		const calls = mockAuthEndpoint("organization/update", () => ({
@@ -178,7 +200,9 @@ describe("<WorkspaceSection>", { concurrent: false }, () => {
 		await nameInput(wrapper).trigger("blur")
 
 		await vi.waitFor(() => {
-			expect(wrapper.text()).toContain("Only letters, numbers, hyphens")
+			expect(wrapper.text()).toContain(
+				t("settings.workspace.errors.name-regex"),
+			)
 		}, WAIT_FOR_OPTIONS)
 		expect(calls).toHaveLength(0)
 	})
@@ -300,7 +324,10 @@ describe("<WorkspaceSection>", { concurrent: false }, () => {
 	})
 
 	describe("member list", { concurrent: false }, () => {
-		beforeEach(clearTeleportedOverlays)
+		beforeEach(() => {
+			clearTeleportedOverlays()
+			seedAuthConfig()
+		})
 
 		it("lists the joined members", async ({ expect }) => {
 			seedWorkspace({ members: [member("u1", "ada"), member("u2", "linus")] })
@@ -310,6 +337,19 @@ describe("<WorkspaceSection>", { concurrent: false }, () => {
 			expect(wrapper.text()).toContain("ada")
 			expect(wrapper.text()).toContain("linus@oxynote.test")
 			expect(wrapper.text()).toContain("Members (2/5)")
+		})
+
+		it("counts the members without a maximum when there is no limit", async ({
+			expect,
+		}) => {
+			seedAuthConfig({ maxOrganizationMembers: null })
+			seedWorkspace({ members: [member("u1", "ada"), member("u2", "linus")] })
+
+			const { wrapper } = await mountSection()
+
+			expect(wrapper.text()).toContain(
+				t("settings.workspace.members-label-unlimited", { current: 2 }),
+			)
 		})
 
 		it("shows when a member joined", async ({ expect }) => {
@@ -341,6 +381,32 @@ describe("<WorkspaceSection>", { concurrent: false }, () => {
 			expect(wrapper.text()).toContain("grace@oxynote.test")
 			expect(wrapper.text()).toContain(t("settings.workspace.invited-label"))
 			expect(wrapper.text()).toContain("Members (2/5)")
+		})
+
+		it("gives a pending invitation the shared invited-user avatar", async ({
+			expect,
+		}) => {
+			seedWorkspace({
+				invitations: [
+					{
+						id: "inv-1",
+						organizationId: "org-1",
+						status: "pending",
+						email: "grace@oxynote.test",
+						role: "member",
+					},
+				],
+			})
+
+			const { wrapper } = await mountSection()
+			await flushPromises()
+
+			const row = wrapper
+				.findAll("tr")
+				.find((r) => r.text().includes("grace@oxynote.test"))
+			expect(
+				row?.get("[data-slot='avatar-fallback'] img").attributes("src"),
+			).toBe(defaultAvatar("invited-user"))
 		})
 
 		it("leaves an accepted invitation out of the list", async ({ expect }) => {

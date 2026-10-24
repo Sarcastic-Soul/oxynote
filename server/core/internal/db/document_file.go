@@ -8,17 +8,13 @@ import (
 	"github.com/guregu/null/v5"
 	"github.com/jmoiron/sqlx"
 	"github.com/oxynote/oxynote/server/core/internal/document/file"
-	"github.com/oxynote/oxynote/server/core/pkg/errutil"
 	"github.com/rs/xid"
 )
 
-// InsertDocumentFile inserts a new document file into the database.
-// Re-uploading into the same block reuses the file id, so the insert
-// refreshes the existing row instead of failing: created_at is bumped
-// to re-arm the retention grace period for what is a new object, and
-// the unreferenced mark is cleared. A row owned by another organization
-// is left alone and reported as errutil.ErrNotFound, since the id is
-// client-chosen and must not reassign a file across organizations.
+// InsertDocumentFile inserts a new document file into the database. The id
+// is client-chosen and unique across organizations: an id that already has
+// a row is refused, so an object a history entry points at is never
+// overwritten in place.
 func (a *agent) InsertDocumentFile(ctx context.Context, f file.File) error {
 	q, args := a.builder.Insert("document_files").
 		SetMap(map[string]any{
@@ -33,29 +29,11 @@ func (a *agent) InsertDocumentFile(ctx context.Context, f file.File) error {
 			"created_at":         f.CreatedAt,
 			"unreferenced_at":    f.UnreferencedAt,
 		}).
-		Suffix("ON CONFLICT (id) DO UPDATE SET " +
-			"location = excluded.location, storage_key = excluded.storage_key, " +
-			"fk_document_id = excluded.fk_document_id, fk_organization_id = excluded.fk_organization_id, " +
-			"name = excluded.name, size = excluded.size, content_type = excluded.content_type, " +
-			"created_at = excluded.created_at, unreferenced_at = NULL " +
-			"WHERE document_files.fk_organization_id = excluded.fk_organization_id").
 		MustSql()
 
-	res, err := a.sql.ExecContext(ctx, q, args...)
-	if err != nil {
-		return err
-	}
+	_, err := a.sql.ExecContext(ctx, q, args...)
 
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-
-	if n == 0 {
-		return errutil.ErrNotFound
-	}
-
-	return nil
+	return err
 }
 
 // FetchDocumentFile retrieves a document file by its block ID from the database.
@@ -160,12 +138,18 @@ func (a *agent) CheckDocumentFileReferenced(ctx context.Context, id string, docu
 }
 
 // DeleteExpiredDocumentBranchHistoryEntries removes history entries created
-// before the given time. Age trimming happens here rather than on insert
-// because an idle branch never inserts again, and its entries would
-// otherwise pin the files they reference forever.
+// before the given time, except the newest entry of each branch. Age
+// trimming runs here, not on insert, because an idle branch never inserts
+// again. The newest entry is kept because it pins only files the live
+// content holds.
 func (a *agent) DeleteExpiredDocumentBranchHistoryEntries(ctx context.Context, before time.Time) error {
-	q, args := a.builder.Delete("document_branch_history_entries").
-		Where(sq.Lt{"created_at": before}).
+	q, args := a.builder.Delete("document_branch_history_entries e").
+		Where(sq.Lt{"e.created_at": before}).
+		Where(`EXISTS (
+			SELECT 1 FROM document_branch_history_entries n
+			WHERE n.fk_branch_id = e.fk_branch_id
+			AND (n.created_at, n.id) > (e.created_at, e.id)
+		)`).
 		MustSql()
 
 	_, err := a.sql.ExecContext(ctx, q, args...)

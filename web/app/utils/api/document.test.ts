@@ -112,7 +112,6 @@ describe("defaultDocumentHookState", () => {
 		try {
 			expect(defaultDocumentHookState(DocumentHookType.URLWatcher)).toEqual({
 				lastCheckedAt: new Date("2024-06-15T12:00:00Z"),
-				status: "active",
 			})
 		} finally {
 			vi.useRealTimers()
@@ -122,7 +121,6 @@ describe("defaultDocumentHookState", () => {
 	it("returns an empty checksum state for github tracking", ({ expect }) => {
 		expect(defaultDocumentHookState(DocumentHookType.GitHubTracking)).toEqual({
 			pathsChecksums: {},
-			status: "active",
 		})
 	})
 
@@ -132,8 +130,38 @@ describe("defaultDocumentHookState", () => {
 		expect(
 			defaultDocumentHookState(DocumentHookType.ContainerImageWatcher),
 		).toEqual({
-			status: "active",
 			digest: "",
 		})
+	})
+})
+
+describe("documentBranchLabel", () => {
+	it.for([
+		{
+			name: "calls the default branch the main one, whatever its name",
+			input: { name: "trunk", default: true },
+			expected: [
+				"general.branch-labels.main",
+				"general.branch-labels.main-short",
+			],
+		},
+		{
+			name: "calls the review workflow's branch the draft",
+			input: { name: DOCUMENT_DRAFT_BRANCH_NAME, default: false },
+			expected: [
+				"general.branch-labels.draft",
+				"general.branch-labels.draft-short",
+			],
+		},
+		{
+			name: "shows any other branch by its own name",
+			input: { name: "feature-x", default: false },
+			expected: ["feature-x", "feature-x"],
+		},
+	])("$name, in its long and short form", ({ input, expected }, { expect }) => {
+		expect([
+			documentBranchLabel(input, (key) => key),
+			documentBranchLabel(input, (key) => key, true),
+		]).toEqual(expected)
 	})
 })

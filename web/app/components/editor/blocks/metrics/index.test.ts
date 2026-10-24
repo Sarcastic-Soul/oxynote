@@ -20,7 +20,8 @@ import {
 	MetricGrid,
 	setUpMetricBlock,
 } from "."
-import { MetricBlockWidth, RefreshInterval, TimeRangePreset } from "./utils"
+import { MetricBlockWidth } from "./utils"
+import { RefreshInterval, TimeRangePreset } from "~/utils/time-range"
 
 // the block attribute defaults come from defaultMetricConfig, which
 // resolves CSS variables through a canvas — unavailable in node

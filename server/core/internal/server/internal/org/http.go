@@ -11,34 +11,22 @@ import (
 	"github.com/oxynote/oxynote/server/core/internal/apps/github"
 	"github.com/oxynote/oxynote/server/core/internal/apps/webchange"
 	"github.com/oxynote/oxynote/server/core/internal/datasource"
-	"github.com/oxynote/oxynote/server/core/internal/datasource/demo"
-	"github.com/oxynote/oxynote/server/core/internal/datasource/processor"
 	"github.com/oxynote/oxynote/server/core/internal/document"
 	"github.com/oxynote/oxynote/server/core/internal/document/hook"
+	orgCore "github.com/oxynote/oxynote/server/core/internal/org"
 	"github.com/oxynote/oxynote/server/core/internal/search"
 	"github.com/oxynote/oxynote/server/core/internal/server/internal/auth"
 	"github.com/oxynote/oxynote/server/core/internal/storage"
 	"github.com/oxynote/oxynote/server/core/internal/tag"
+	"github.com/oxynote/oxynote/server/core/internal/variable"
 	"github.com/oxynote/oxynote/server/core/pkg/errutil"
 	"github.com/oxynote/oxynote/server/core/pkg/httpserver"
 	"github.com/oxynote/oxynote/server/core/pkg/sqlutil"
-	"github.com/oxynote/oxynote/server/core/pkg/timeutil"
 	"github.com/rs/xid"
 )
 
-// _organizationsLogoFolderFormat is the folder where organization logos are stored.
-const _organizationsLogoFolderFormat = "organizations/%s/logo"
-
 // ErrNoOrganizationMembers is returned when an organization has no members.
 var ErrNoOrganizationMembers = errutil.New(http.StatusBadRequest, "organization.no_members", "organization has no members")
-
-// _seedTags are the tags a fresh organization starts with, in display
-// order. The welcome document goes under the first of them.
-var _seedTags = []tag.CreateInput{
-	{TagName: "Production", Color: "#00a63e"},
-	{TagName: "Staging", Color: "#f54a00"},
-	{TagName: "Incidents", Color: "#155dfc"},
-}
 
 // Handler holds dependencies required for organization-related operations.
 type Handler struct {
@@ -47,19 +35,20 @@ type Handler struct {
 	storer          Storer
 	githubMan       *github.Manager
 	webchangeClient *webchange.Client
-	searchTrigger   SearchTrigger
-	logoLocation    string
+	searchQueue     SearchQueue
+	publicURL       string
 }
 
-// NewHandler creates a new handler instance with the provided logger and database.
+// NewHandler creates a new handler instance with the provided logger and
+// database. publicURL is the origin the Location of a logo is built on.
 func NewHandler(
 	log *slog.Logger,
 	db DB,
 	storer Storer,
 	githubMan *github.Manager,
 	webchangeClient *webchange.Client,
-	searchTrigger SearchTrigger,
-	logoLocationFormat string,
+	searchQueue SearchQueue,
+	publicURL string,
 ) *Handler {
 	return &Handler{
 		log:             log,
@@ -67,8 +56,8 @@ func NewHandler(
 		storer:          storer,
 		githubMan:       githubMan,
 		webchangeClient: webchangeClient,
-		searchTrigger:   searchTrigger,
-		logoLocation:    logoLocationFormat,
+		searchQueue:     searchQueue,
+		publicURL:       publicURL,
 	}
 }
 
@@ -95,8 +84,18 @@ func (h *Handler) InitializeOrganization(w http.ResponseWriter, r *http.Request)
 	// failed statement aborts a Postgres transaction, so logging and
 	// carrying on inside one would only move the failure to the commit.
 	// The welcome document drops its charts when the source is missing
-	// rather than pointing them at an id that was never stored.
-	dataSourceID := h.insertDemoDataSource(r.Context(), id)
+	// rather than pointing them at an id that was never stored. The
+	// failure is logged rather than returned: the demo content is a
+	// nicety, and an organization without it is still fully initialized.
+	var dataSourceID null.Value[xid.ID]
+
+	ds := datasource.NewDemoDataSource(id)
+
+	if err = h.db.InsertDataSource(r.Context(), ds); err != nil {
+		h.log.Error("inserting demo data source", slog.String("error", err.Error()))
+	} else {
+		dataSourceID = null.ValueFrom(ds.ID)
+	}
 
 	var tx Tx
 
@@ -108,18 +107,11 @@ func (h *Handler) InitializeOrganization(w http.ResponseWriter, r *http.Request)
 
 	defer tx.Rollback() //nolint:errcheck // error provides no meaningful info
 
-	doc := document.NewDocument(document.CreateInput{
-		Name: "Welcome to Oxynote!",
-		Icon: "mingcute:flag-4-fill",
-	}, id, members[0])
-
-	content, err := document.InitialDocumentContent(dataSourceID)
+	doc, err := document.NewWelcomeDocument(id, members[0], dataSourceID)
 	if err != nil {
 		httpserver.RespondError(h.log, w, err)
 		return
 	}
-
-	doc.Content = content
 
 	if err = tx.InsertDocument(r.Context(), doc); err != nil {
 		httpserver.RespondError(h.log, w, err)
@@ -133,7 +125,7 @@ func (h *Handler) InitializeOrganization(w http.ResponseWriter, r *http.Request)
 
 	var productionID xid.ID
 
-	for i, inp := range _seedTags {
+	for i, inp := range tag.SeedTags() {
 		t := tag.NewTag(inp, id, members[0])
 
 		if i == 0 {
@@ -151,7 +143,21 @@ func (h *Handler) InitializeOrganization(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if err = tx.InsertSearchJob(r.Context(), search.BranchScope(id, doc.ID, doc.BranchID)); err != nil {
+	builtins := variable.SeedBuiltins(id)
+
+	if err = tx.CreateVariableGroup(r.Context(), builtins.Group); err != nil {
+		httpserver.RespondError(h.log, w, err)
+		return
+	}
+
+	for _, v := range builtins.Variables {
+		if err = tx.CreateVariable(r.Context(), v.Variable); err != nil {
+			httpserver.RespondError(h.log, w, err)
+			return
+		}
+	}
+
+	if err = h.searchQueue.Enqueue(r.Context(), tx, search.BranchScope(id, doc.ID, doc.BranchID)); err != nil {
 		httpserver.RespondError(h.log, w, err)
 		return
 	}
@@ -161,8 +167,6 @@ func (h *Handler) InitializeOrganization(w http.ResponseWriter, r *http.Request)
 		httpserver.RespondError(h.log, w, err)
 		return
 	}
-
-	h.searchTrigger.Trigger()
 
 	httpserver.Respond(
 		h.log,
@@ -192,26 +196,9 @@ func (h *Handler) UploadOrganizationLogo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	logoFolder := fmt.Sprintf(_organizationsLogoFolderFormat, session.ActiveOrganizationID)
-
-	err = h.storer.Upload(r.Context(), logoFolder, session.ActiveOrganizationID, data, contentType)
+	logoLocation, err := h.storeLogo(r.Context(), session.ActiveOrganizationID, data, contentType)
 	if err != nil {
 		httpserver.RespondError(h.log, w, err)
-		return
-	}
-
-	// Append a timestamp to the URL to prevent caching issues.
-	logoLocation := h.logoLocation + "?v=" + timeutil.Now().Format("20060102150405")
-
-	err = h.db.UpdateOrganizationLogo(r.Context(), session.ActiveOrganizationID, logoLocation)
-	if err != nil {
-		derr := h.storer.Delete(r.Context(), logoFolder, session.ActiveOrganizationID)
-		if derr != nil {
-			h.log.Error("deleting object after DB failure", slog.String("error", derr.Error()))
-		}
-
-		httpserver.RespondError(h.log, w, err)
-
 		return
 	}
 
@@ -224,6 +211,30 @@ func (h *Handler) UploadOrganizationLogo(w http.ResponseWriter, r *http.Request)
 	)
 }
 
+// storeLogo stores the organization's logo and points the organization at
+// it, returning the logo's location. The object is removed again when the
+// organization cannot be updated.
+func (h *Handler) storeLogo(ctx context.Context, organizationID string, data []byte, contentType string) (string, error) {
+	logoFolder := orgCore.LogoFolder(organizationID)
+
+	if err := h.storer.Upload(ctx, logoFolder, organizationID, data, contentType); err != nil {
+		return "", fmt.Errorf("uploading logo: %w", err)
+	}
+
+	logoLocation := httpserver.CacheBust(h.publicURL + orgCore.LogoPath)
+
+	if err := h.db.UpdateOrganizationLogo(ctx, organizationID, logoLocation); err != nil {
+		derr := h.storer.Delete(ctx, logoFolder, organizationID)
+		if derr != nil {
+			h.log.Error("deleting object after DB failure", slog.String("error", derr.Error()))
+		}
+
+		return "", fmt.Errorf("updating organization logo: %w", err)
+	}
+
+	return logoLocation, nil
+}
+
 // RetrieveOrganizationLogo handles the retrieval of an organization's logo.
 func (h *Handler) RetrieveOrganizationLogo(w http.ResponseWriter, r *http.Request) {
 	session, ok := auth.RequireSession(h.log, w, r)
@@ -231,7 +242,7 @@ func (h *Handler) RetrieveOrganizationLogo(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	logoFolder := fmt.Sprintf(_organizationsLogoFolderFormat, session.ActiveOrganizationID)
+	logoFolder := orgCore.LogoFolder(session.ActiveOrganizationID)
 
 	obj, found, err := h.storer.Retrieve(r.Context(), logoFolder, session.ActiveOrganizationID)
 	if err != nil {
@@ -293,7 +304,7 @@ func (h *Handler) TeardownOrganization(w http.ResponseWriter, r *http.Request) {
 
 	defer tx.Rollback() //nolint:errcheck // error provides no meaningful info
 
-	if err = tx.InsertSearchJob(r.Context(), search.OrganizationScope(id)); err != nil {
+	if err = h.searchQueue.Enqueue(r.Context(), tx, search.OrganizationScope(id)); err != nil {
 		httpserver.RespondError(h.log, w, err)
 		return
 	}
@@ -314,12 +325,10 @@ func (h *Handler) TeardownOrganization(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.searchTrigger.Trigger()
-
 	// the logo is the organization's own object; the documents' files are
 	// left to the file manager, which reclaims them once the cascade nulls
 	// their foreign keys.
-	err = h.storer.Delete(r.Context(), fmt.Sprintf(_organizationsLogoFolderFormat, id), id)
+	err = h.storer.Delete(r.Context(), orgCore.LogoFolder(id), id)
 	if err != nil {
 		httpserver.RespondError(h.log, w, err)
 		return
@@ -331,26 +340,6 @@ func (h *Handler) TeardownOrganization(w http.ResponseWriter, r *http.Request) {
 		nil,
 		http.StatusNoContent,
 	)
-}
-
-// insertDemoDataSource inserts the demo Prometheus data source and reports
-// its id. A failure is logged rather than returned: the demo content is a
-// nicety, and an organization without it is still fully initialized.
-func (h *Handler) insertDemoDataSource(ctx context.Context, organizationID string) null.Value[xid.ID] {
-	ds := datasource.NewDataSource(datasource.CreateInput{
-		Type:        datasource.TypePrometheus,
-		Name:        "Demo",
-		URL:         demo.URL,
-		Credentials: processor.NewCredentials([]byte(`{}`)),
-	}, organizationID)
-
-	if err := h.db.InsertDataSource(ctx, ds); err != nil {
-		h.log.Error("inserting demo data source", slog.String("error", err.Error()))
-
-		return null.Value[xid.ID]{}
-	}
-
-	return null.ValueFrom(ds.ID)
 }
 
 // extractOrganizationParameter extracts the document ID from the request parameters.
@@ -366,12 +355,13 @@ type DB interface {
 	DBAgent
 }
 
-// SearchTrigger runs the search-job worker once a job has committed.
+// SearchQueue queues search jobs.
 //
-//go:generate ../../../../scripts/codegen/mock -t internal SearchTrigger search_trigger
-type SearchTrigger interface {
-	// Trigger should run a search-job pass right away.
-	Trigger()
+//go:generate ../../../../scripts/codegen/mock -t internal SearchQueue search_queue
+type SearchQueue interface {
+	// Enqueue should queue the job on the transaction, to run once it
+	// commits.
+	Enqueue(ctx context.Context, tx sqlutil.Tx, j search.Job) error
 }
 
 // Tx is an interface that combines sqlutil.Tx and DBAgent.
@@ -384,16 +374,13 @@ type Tx interface {
 
 // DBAgent is an interface that handles communication with the document database.
 type DBAgent interface {
-	TagsDBAgent
+	SeedDBAgent
 
 	// InsertDataSource inserts a data source into the database.
 	InsertDataSource(ctx context.Context, ds *datasource.DataSource) error
 
 	// InsertDocument should insert the document.
 	InsertDocument(ctx context.Context, doc document.Document) error
-
-	// InsertSearchJob should queue the search job's scope.
-	InsertSearchJob(ctx context.Context, job search.Job) error
 
 	// FetchDocumentHooksByOrganizationID should return every hook of the
 	// organization.
@@ -417,14 +404,22 @@ type DBAgent interface {
 	UpsertDocumentMaintainers(ctx context.Context, documentID xid.ID, organizationID string, maintainerIDs []string) error
 }
 
-// TagsDBAgent is an interface that handles communication with the tag
-// database, covering what seeding an organization needs.
-type TagsDBAgent interface {
+// SeedDBAgent is an interface that handles communication with the tag and
+// variable database, covering what seeding an organization needs.
+type SeedDBAgent interface {
 	// InsertTag should store a new tag at the end of its organization's tags.
 	InsertTag(ctx context.Context, t tag.Tag) error
 
 	// AssignBranchTag should make a document's branch carry a tag.
 	AssignBranchTag(ctx context.Context, organizationID string, documentID, branchID, tagID xid.ID) error
+
+	// CreateVariableGroup should store a new group at the end of its
+	// organization's groups.
+	CreateVariableGroup(ctx context.Context, g variable.Group) error
+
+	// CreateVariable should store a new variable at the end of its group,
+	// with its options.
+	CreateVariable(ctx context.Context, v variable.Variable) error
 }
 
 // Storer is an interface that defines methods for uploading and retrieving objects.
