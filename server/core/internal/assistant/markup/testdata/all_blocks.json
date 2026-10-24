@@ -435,6 +435,8 @@
       ],
       "simulationActive": true,
       "simulationPreset": "cpu_usage",
+      "timeRange": "last_1_hour",
+      "refreshInterval": "1m",
       "width": "standard",
       "title": null
      }

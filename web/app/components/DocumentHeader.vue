@@ -1,5 +1,5 @@
 <script lang="ts" setup>
-import { cn } from "~/lib/utils"
+import { cn } from "#layers/ui/app/lib/utils"
 import type { DocumentBreadcrumb } from "./sidebar"
 import { showToastMessage } from "./toast"
 
@@ -176,7 +176,7 @@ function activateBranch(branch: "default" | "draft") {
 						side="bottom"
 						:shortcut="SHORTCUT_ACTIONS.toggleSidebar"
 					>
-						<ShadcnUiSidebarTrigger />
+						<ShadcnUiSidebarTrigger :label="$t('sidebar.toggle-sidebar')" />
 					</ShortcutTooltip>
 					<HeaderBreadcrumbs
 						v-if="editorStore.activeDocumentId && props.breadcrumbs"

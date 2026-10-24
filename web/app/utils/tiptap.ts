@@ -1,7 +1,7 @@
 import { InputRule } from "@tiptap/core"
 import type { EditorState } from "@tiptap/pm/state"
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model"
-import { cn } from "~/lib/utils"
+import { cn } from "#layers/ui/app/lib/utils"
 import { ListItem } from "@tiptap/extension-list"
 import { ImageBlock } from "~/components/editor/blocks/image"
 

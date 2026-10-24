@@ -6,9 +6,9 @@ import { stubChartColorContext } from "./test-helpers"
 import {
 	MetricBlockWidth,
 	MetricSimulationPreset,
-	TimeRangePreset,
 	type MetricConfig,
 } from "./utils"
+import { TimeRangePreset } from "~/utils/time-range"
 import {
 	makeEditor,
 	makeNode,

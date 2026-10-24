@@ -3,13 +3,12 @@ import {
 	buildConfigFromNodeAttrs,
 	defaultMetricConfig,
 	MetricSimulationPreset,
-	RefreshInterval,
 	refreshIntervalToMs,
 	resolveTimeRange,
-	TimeRangePreset,
 	VisualizationDataUnit,
 	VisualizationTimeUnit,
 } from "./utils"
+import { RefreshInterval, TimeRangePreset } from "~/utils/time-range"
 
 // chartStyles resolves CSS variables through a canvas, which needs a real
 // DOM — the default threshold color is all defaultMetricConfig reads

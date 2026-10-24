@@ -1,5 +1,5 @@
 <script lang="ts" setup>
-import { cn } from "~/lib/utils"
+import { cn } from "#layers/ui/app/lib/utils"
 import ConfigField from "../ConfigField.vue"
 import { VISUALIZATION_MAX_DECIMALS, type MetricConfig } from "../utils"
 import ThresholdInput from "./ThresholdInput.vue"

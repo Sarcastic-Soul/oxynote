@@ -1,6 +1,15 @@
 <script lang="ts" setup>
-import { cn } from "~/lib/utils"
-import { RefreshInterval, TimeRangePreset, type MetricConfig } from "../utils"
+import { cn } from "#layers/ui/app/lib/utils"
+import type {
+	MetricConfig,
+	MetricRefreshInterval,
+	MetricTimeRange,
+} from "../utils"
+import { RefreshInterval, TimeRangePreset } from "~/utils/time-range"
+import {
+	METRIC_REFRESH_INTERVAL_REFERENCE,
+	METRIC_TIME_RANGE_REFERENCE,
+} from "~/utils/variable"
 import VisualizationContainer from "../VisualizationContainer.vue"
 import BottomConfig from "./BottomConfig.vue"
 import ConfigSidebar from "./ConfigSidebar.vue"
@@ -11,6 +20,7 @@ const emit = defineEmits<{
 }>()
 
 const editorStore = useEditorStore()
+const { t } = useI18n({ useScope: "global" })
 const isMinWidth1024px = useMediaQuery("(min-width: 1024px)")
 const { isEditable } = useEditorMeta()
 
@@ -83,6 +93,24 @@ const isRefreshIntervalModified = computed(() => {
 const chartTopOptionElem = useTemplateRef<HTMLDivElement>("chart-top-options")
 const { width: chartTopOptionWidth } = useElementSize(chartTopOptionElem)
 const simulationVisible = ref(false)
+
+// a chart that uses a built-in variable has no value of its own to name,
+// so the label says the shared setting decides
+function timeRangeLabel(value: MetricTimeRange | null) {
+	if (value === METRIC_TIME_RANGE_REFERENCE) {
+		return t("editor.metrics.config.variable-time-range")
+	}
+
+	return value ? t(`general.time-range-options.${value}`) : ""
+}
+
+function refreshIntervalLabel(value: MetricRefreshInterval | null) {
+	if (value === METRIC_REFRESH_INTERVAL_REFERENCE) {
+		return t("editor.metrics.config.variable-refresh-interval")
+	}
+
+	return value ? t(`general.refresh-interval-options-short.${value}`) : ""
+}
 
 function updateOpenStatus(v: boolean) {
 	if (v) {
@@ -191,25 +219,23 @@ function openSettings() {
 												"
 											>
 												<Icon name="lucide:clock-9" class="size-3.5" />
-												{{
-													$t(
-														`editor.metrics.config.time-range-options.${config.timeRange}`,
-													)
-												}}
+												{{ timeRangeLabel(config.timeRange) }}
 											</ShadcnUiButton>
 										</ShadcnUiSelectTrigger>
 										<ShadcnUiSelectContent class="max-h-[40dvh]" inside-modal>
+											<ShadcnUiSelectItem :value="METRIC_TIME_RANGE_REFERENCE">
+												<span class="text-2sm text-popover-foreground">
+													{{ $t("editor.metrics.config.variable-time-range") }}
+												</span>
+											</ShadcnUiSelectItem>
+											<ShadcnUiSelectSeparator />
 											<ShadcnUiSelectItem
 												v-for="timeRange in Object.values(TimeRangePreset)"
 												:key="timeRange"
 												:value="timeRange"
 											>
 												<span class="text-2sm text-popover-foreground">
-													{{
-														$t(
-															`editor.metrics.config.time-range-options.${timeRange}`,
-														)
-													}}
+													{{ $t(`general.time-range-options.${timeRange}`) }}
 												</span>
 											</ShadcnUiSelectItem>
 										</ShadcnUiSelectContent>
@@ -228,11 +254,7 @@ function openSettings() {
 										"
 									>
 										<Icon name="lucide:clock-9" class="size-3.5" />
-										{{
-											$t(
-												`editor.metrics.config.time-range-options.${oldConfig.timeRange}`,
-											)
-										}}
+										{{ timeRangeLabel(oldConfig.timeRange) }}
 									</ShadcnUiButton>
 								</div>
 								<div class="flex flex-col items-end gap-0.5 md:gap-1">
@@ -256,14 +278,22 @@ function openSettings() {
 												"
 											>
 												<Icon name="lucide:refresh-ccw" class="size-3.5" />
-												{{
-													$t(
-														`editor.metrics.config.refresh-interval-options-short.${config.refreshInterval}`,
-													)
-												}}
+												{{ refreshIntervalLabel(config.refreshInterval) }}
 											</ShadcnUiButton>
 										</ShadcnUiSelectTrigger>
 										<ShadcnUiSelectContent class="max-h-[40dvh]" inside-modal>
+											<ShadcnUiSelectItem
+												:value="METRIC_REFRESH_INTERVAL_REFERENCE"
+											>
+												<span class="text-2sm text-popover-foreground">
+													{{
+														$t(
+															"editor.metrics.config.variable-refresh-interval",
+														)
+													}}
+												</span>
+											</ShadcnUiSelectItem>
+											<ShadcnUiSelectSeparator />
 											<ShadcnUiSelectItem
 												v-for="refreshInterval in Object.values(
 													RefreshInterval,
@@ -274,7 +304,7 @@ function openSettings() {
 												<span class="text-2sm text-popover-foreground">
 													{{
 														$t(
-															`editor.metrics.config.refresh-interval-options.${refreshInterval}`,
+															`general.refresh-interval-options.${refreshInterval}`,
 														)
 													}}
 												</span>
@@ -295,11 +325,7 @@ function openSettings() {
 										"
 									>
 										<Icon name="lucide:refresh-ccw" class="size-3.5" />
-										{{
-											$t(
-												`editor.metrics.config.refresh-interval-options-short.${oldConfig.refreshInterval}`,
-											)
-										}}
+										{{ refreshIntervalLabel(oldConfig.refreshInterval) }}
 									</ShadcnUiButton>
 								</div>
 							</div>

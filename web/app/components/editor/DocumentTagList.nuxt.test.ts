@@ -11,7 +11,7 @@ import {
 import useDocumentAPI from "~/composables/api/useDocumentAPI"
 import DocumentTagList from "./DocumentTagList.vue"
 import TagPill from "./TagPill.vue"
-import ColorSelect from "./ColorSelect.vue"
+import ColorSelect from "../ColorSelect.vue"
 import {
 	stubThemeColorContext,
 	stubSelectableColors,

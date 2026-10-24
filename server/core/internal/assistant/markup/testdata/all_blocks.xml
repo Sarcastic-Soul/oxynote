@@ -32,7 +32,7 @@
 <figma id="fig1" src="https://figma.com/x" width="800"/>
 <file id="file1" src="/api/documents/d/files/f" name="a.pdf" contentType="application/pdf" size="1234"/>
 <metrics id="g1">
-  <metric id="mb1">{"dataSourceId":"ds1","queries":[{"legendFormat":"","name":"Q","query":"up"}],"simulationPreset":"cpu_usage","visualizationType":"line_chart","width":"standard"}</metric>
+  <metric id="mb1">{"dataSourceId":"ds1","queries":[{"legendFormat":"","name":"Q","query":"up"}],"refreshInterval":"1m","simulationPreset":"cpu_usage","timeRange":"last_1_hour","visualizationType":"line_chart","width":"standard"}</metric>
 </metrics>
 <split_doc id="sd1" inversed="true">
   <left>
